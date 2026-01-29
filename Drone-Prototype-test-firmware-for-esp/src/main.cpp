@@ -26,6 +26,10 @@
 #define UART_GPS_RX 26
 #define UART_GPS_TX 27
 
+//--- I2C SAMD21 ---//
+#define SAMD_I2C_ADDR 0x08
+#define SAMD_I2C_PING 0xA5
+
 //--- Shared State ---//
 struct SharedState {
   // IMU
@@ -46,12 +50,16 @@ struct SharedState {
   float lat;
   float lon;
 
+  // SAMD21 (I2C)
+  bool samdOk;
+
   // NRF/Comms
   bool nrfInitOk;
   uint32_t pktCount;
   uint32_t lastTxMs;
   uint32_t txOk;
   uint32_t txFail;
+  char nrfMsg[32];
 };
 
 static SharedState gState;
@@ -78,6 +86,7 @@ static const uint16_t UI_HEAD = TFT_MAGENTA;
 static const uint16_t UI_ACCENT = TFT_DARKGREY;
 static const uint16_t UI_OK = TFT_GREEN;
 static const uint16_t UI_FAIL = TFT_RED;
+static const uint16_t UI_MSG = TFT_YELLOW;
 
 static const int UI_LEFT = 2;
 static const int UI_VAL_X = 26;
@@ -92,9 +101,11 @@ static char prevEnv[32] = "";
 static char prevAlt[32] = "";
 static char prevDst[32] = "";
 static char prevGps[32] = "";
+static char prevSamd[32] = "";
 static char prevNrf[32] = "";
 static char prevTx[32] = "";
 static char prevCnt[32] = "";
+static char prevMsg[32] = "";
 
 static void lockState(SharedState &out) {
   if (xSemaphoreTake(gStateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
@@ -144,12 +155,17 @@ static void drawStaticUi() {
   drawLabelRow(y, "DST");
   y += UI_ROW_H;
   drawLabelRow(y, "GPS");
+  y += UI_ROW_H;
+  drawLabelRow(y, "SAMD");
 
   // COMMS box (separate from sensor data)
   tft.drawRect(0, 98, 128, 62, TFT_MAGENTA);
   tft.setTextColor(UI_LABEL, UI_BG);
   tft.setCursor(UI_LEFT, 100);
   tft.print("NRF STATUS");
+  drawLabelRow(112, "OK");
+  drawLabelRow(124, "PKT");
+  drawLabelRow(136, "MSG");
 }
 
 static void updateDynamicUi(const SharedState &s) {
@@ -185,6 +201,17 @@ static void updateDynamicUi(const SharedState &s) {
   else snprintf(buf, sizeof(buf), "%.4f %.4f", s.lat, s.lon);
   updateField(y, buf, prevGps, sizeof(prevGps));
 
+  y += UI_ROW_H;
+  if (s.samdOk) {
+    tft.setTextColor(UI_OK, UI_BG);
+    snprintf(buf, sizeof(buf), "CONNECTED");
+  } else {
+    tft.setTextColor(UI_FAIL, UI_BG);
+    snprintf(buf, sizeof(buf), "NO LINK");
+  }
+  updateField(y, buf, prevSamd, sizeof(prevSamd));
+  tft.setTextColor(UI_FG, UI_BG);
+
   // COMMS rows
   int cy = 112;
   snprintf(buf, sizeof(buf), "%s", s.nrfInitOk ? "OK" : "FAIL");
@@ -198,6 +225,11 @@ static void updateDynamicUi(const SharedState &s) {
   cy += UI_ROW_H;
   snprintf(buf, sizeof(buf), "PKT %lu", s.pktCount);
   updateField(cy, buf, prevCnt, sizeof(prevCnt));
+  cy += UI_ROW_H;
+  tft.setTextColor(UI_MSG, UI_BG);
+  snprintf(buf, sizeof(buf), "%s", s.nrfMsg[0] ? s.nrfMsg : "-");
+  updateField(cy, buf, prevMsg, sizeof(prevMsg));
+  tft.setTextColor(UI_FG, UI_BG);
 }
 
 //--- Sensor + Comms Task (Core 0) ---//
@@ -216,14 +248,16 @@ void SensorCommTask(void *pv) {
     radio.setPALevel(RF24_PA_MAX);
     radio.setDataRate(RF24_1MBPS);
     radio.setRetries(3, 5);
-    radio.openWritingPipe(NRF_ADDR);
-    radio.stopListening();
+    radio.enableDynamicPayloads();
+    radio.openReadingPipe(1, NRF_ADDR);
+    radio.startListening();
   }
 
   randomSeed(esp_random());
 
   for (;;) {
     SharedState local = {};
+    lockState(local);
 
     // IMU
     sensors_event_t accel, gyro, temp;
@@ -268,20 +302,28 @@ void SensorCommTask(void *pv) {
       local.gpsFix = false;
     }
 
-    // NRF TX test
+    // SAMD21 I2C probe (request a known byte)
+    local.samdOk = false;
+    if (Wire.requestFrom(SAMD_I2C_ADDR, 1) == 1 && Wire.available()) {
+      uint8_t b = Wire.read();
+      local.samdOk = (b == SAMD_I2C_PING);
+    }
+
+    // NRF RX
     local.nrfInitOk = nrfOk;
     if (nrfOk) {
-      uint32_t payload = (uint32_t)random(0xFFFFFFFF);
-      bool ok = radio.write(&payload, sizeof(payload));
-      local.pktCount = gState.pktCount + 1;
-      local.lastTxMs = millis();
-      if (ok) local.txOk = gState.txOk + 1;
-      else    local.txFail = gState.txFail + 1;
-    } else {
-      local.pktCount = gState.pktCount;
-      local.lastTxMs = gState.lastTxMs;
-      local.txOk = gState.txOk;
-      local.txFail = gState.txFail;
+      while (radio.available()) {
+        char msg[32];
+        uint8_t len = radio.getDynamicPayloadSize();
+        if (len == 0 || len > 31) {
+          len = 31;
+        }
+        radio.read(msg, len);
+        msg[len] = '\0';
+        local.pktCount += 1;
+        strncpy(local.nrfMsg, msg, sizeof(local.nrfMsg) - 1);
+        local.nrfMsg[sizeof(local.nrfMsg) - 1] = '\0';
+      }
     }
 
     if (xSemaphoreTake(gStateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
