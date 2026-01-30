@@ -248,6 +248,7 @@ void SensorCommTask(void *pv) {
     radio.setPALevel(RF24_PA_MAX);
     radio.setDataRate(RF24_1MBPS);
     radio.setRetries(3, 5);
+    radio.setChannel(76);
     radio.enableDynamicPayloads();
     radio.openReadingPipe(1, NRF_ADDR);
     radio.startListening();
