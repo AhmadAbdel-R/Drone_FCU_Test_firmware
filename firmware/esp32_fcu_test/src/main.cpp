@@ -255,6 +255,7 @@ void SensorCommTask(void *pv) {
   }
 
   randomSeed(esp_random());
+  uint32_t lastGpsByteMs = 0;
 
   for (;;) {
     SharedState local = {};
@@ -290,8 +291,9 @@ void SensorCommTask(void *pv) {
     while (Serial1.available() > 0) {
       gps.encode(Serial1.read());
       hasData = true;
+      lastGpsByteMs = millis();
     }
-    local.gpsHasData = hasData;
+    local.gpsHasData = hasData || ((millis() - lastGpsByteMs) < 2000);
     float flat = 0, flon = 0;
     unsigned long age = 0;
     gps.f_get_position(&flat, &flon, &age);

@@ -1,25 +1,26 @@
 # Drone FCU Test Firmware
 
-This repo contains FCU-side integration test firmware for ESP32.
+Integration-heavy FCU test firmware for ESP32.
 
-The active firmware project is now organized under:
+## Active Firmware Folder
 
 - `firmware/esp32_fcu_test/`
 
-## What It Covers
+## What This Test Build Covers
 
-- Sensor readout (IMU, barometer, distance)
+- IMU, barometer, and distance sensor reads
 - GPS parsing
-- nRF24 receive path
-- Basic HMI status rendering
-- SAMD21 I2C ping check
+- nRF receive path
+- SAMD21 I2C health check
+- simple on-device status UI
+
+## Purpose
+
+This is a test harness, not final flight firmware.
+It helps validate subsystem behavior before splitting code into stricter production modules.
 
 ## Build
 
 1. Open `firmware/esp32_fcu_test` in PlatformIO.
 2. Build and upload.
-3. Monitor serial for sensor and link output.
-
-## Purpose
-
-This is a test harness for FCU subsystem integration before full production firmware split.
+3. Watch serial + screen output for sensor/comms state.
