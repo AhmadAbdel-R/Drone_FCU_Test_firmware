@@ -396,6 +396,8 @@ struct BenchState {
   bool ctrlInitDiagnosticDone = false;
   bool telemInitDiagnosticDone = false;
   uint8_t telemetrySequence = 0;
+  uint32_t telemetryPrimaryTxCount = 0;
+  uint32_t telemetryAuxTxCount = 0;
   std::array<uint16_t, 4> motorRaw = {0, 0, 0, 0};
 };
 
@@ -1996,6 +1998,7 @@ void sendTelemetry(uint32_t nowMs) {
 
 #if FCU_PIN_TELM_CE >= 0 && FCU_PIN_TELM_CSN >= 0
     (void)gTelmRadio.write(&packet, sizeof(packet));
+    gState.telemetryPrimaryTxCount++;
 #else
     (void)packet;
 #endif
@@ -2042,6 +2045,7 @@ void sendTelemetry(uint32_t nowMs) {
 
 #if FCU_PIN_TELM_CE >= 0 && FCU_PIN_TELM_CSN >= 0
     (void)gTelmRadio.write(&aux, sizeof(aux));
+    gState.telemetryAuxTxCount++;
 #else
     (void)aux;
 #endif
@@ -2177,10 +2181,16 @@ void setup() {
   Serial.printf("[BENCH] speed caps: radio=%luHz imu<=%luHz\n",
                 static_cast<unsigned long>(RADIO_SPI_HZ),
                 static_cast<unsigned long>(IMU_SPI_HZ));
-  Serial.printf("[RADIO] pairing ctrl_rx=%s ch=%u telem=%s\n",
+  Serial.printf("[RADIO] build: CTRL=ENABLED  TELM=%s\n",
+                TELEMETRY_RADIO_ENABLED ? "ENABLED" : "DISABLED (FCU_ENABLE_TELEMETRY_RADIO=0)");
+  Serial.printf("[RADIO] pairing ctrl_rx=%s ch=%u telem_tx=%s ch=%u\n",
                 reinterpret_cast<const char*>(CTRL_RX_ADDRESS),
                 static_cast<unsigned>(CONTROL_RADIO_CHANNEL),
-                TELEMETRY_RADIO_ENABLED ? "enabled" : "disabled");
+                TELEMETRY_RADIO_ENABLED ? reinterpret_cast<const char*>(TELM_TX_ADDRESS) : "-",
+                TELEMETRY_RADIO_ENABLED ? static_cast<unsigned>(TELEMETRY_RADIO_CHANNEL) : 0U);
+  if (!TELEMETRY_RADIO_ENABLED) {
+    Serial.println("[RADIO][TELM] compiled out — remote will report 'no telemetry' indefinitely");
+  }
   Serial.printf("[RADIO] pins SPI SCK=%d MISO=%d MOSI=%d CTRL_CE=%d CTRL_CSN=%d CTRL_IRQ=%d TELM_CE=%d TELM_CSN=%d TELM_IRQ=%d\n",
                 PIN_NRF_SCK,
                 PIN_NRF_MISO,
@@ -2258,7 +2268,9 @@ void setup() {
   Serial.printf("[FCU] validation_hash=0x%08lX verified=%u\n",
                 static_cast<unsigned long>(hash),
                 static_cast<unsigned>(verified));
-  Serial.println("[FCU] failsafe starts active; control link drives throttle, telemetry radio disabled");
+  Serial.printf("[FCU] failsafe starts active; control link drives throttle, telemetry %s\n",
+                TELEMETRY_RADIO_ENABLED ? (gState.telemRadioReady ? "ready" : "init pending")
+                                        : "disabled (build flag)");
   Serial.flush();
 
   // Spawn the radio task first so its handle is valid before the CTRL IRQ can fire.
@@ -2309,9 +2321,11 @@ void loop() {
     pidYaw = gState.pid.yawTerms.output;
     portEXIT_CRITICAL(&gFlightMux);
 
-    Serial.printf("[FCU] ctrl=%u telem=%u esc_hold=%u link=%u failsafe=%u packets=%lu thr=%u m=%u/%u/%u/%u att=%.1f/%.1f/%.1f tof=%u gps_fix=%u sat=%u pid=%.1f/%.1f/%.1f\n",
+    Serial.printf("[FCU] ctrl=%u telem=%u tx_pri=%lu tx_aux=%lu esc_hold=%u link=%u failsafe=%u rx_pkts=%lu thr=%u m=%u/%u/%u/%u att=%.1f/%.1f/%.1f tof=%u gps_fix=%u sat=%u pid=%.1f/%.1f/%.1f\n",
                   static_cast<unsigned>(gState.ctrlRadioReady),
                   static_cast<unsigned>(gState.telemRadioReady),
+                  static_cast<unsigned long>(gState.telemetryPrimaryTxCount),
+                  static_cast<unsigned long>(gState.telemetryAuxTxCount),
                   static_cast<unsigned>(escStartupSettleActive(nowMs)),
                   static_cast<unsigned>(linkActive),
                   static_cast<unsigned>(failsafeActive),
