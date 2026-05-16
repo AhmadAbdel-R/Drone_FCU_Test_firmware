@@ -18,6 +18,28 @@
 
 #include "control_protocol.h"
 #include "fcu_pid.h"
+#include "tof_altitude.h"
+#include "altitude_controller.h"
+#include "auto_takeoff.h"
+#include "autonomy_uart.h"
+#include "failsafe_manager.h"
+
+// Compile-time feature flags. Override from platformio.ini if needed.
+#ifndef FCU_ENABLE_TOF
+#define FCU_ENABLE_TOF 1
+#endif
+#ifndef FCU_ENABLE_AUTO_TAKEOFF
+#define FCU_ENABLE_AUTO_TAKEOFF 1
+#endif
+#ifndef FCU_ENABLE_AUTONOMY_UART
+#define FCU_ENABLE_AUTONOMY_UART 1
+#endif
+#ifndef FCU_ENABLE_ALTITUDE_HOLD
+#define FCU_ENABLE_ALTITUDE_HOLD 1
+#endif
+#ifndef FCU_ENABLE_DEBUG_TELEMETRY
+#define FCU_ENABLE_DEBUG_TELEMETRY 1
+#endif
 
 // -----------------------------
 // Board / wiring configuration
@@ -101,16 +123,35 @@ static constexpr int PIN_BMP_SCL = FCU_PIN_BMP_SCL;
 #define FCU_PIN_GPS_RX 34
 #endif
 #ifndef FCU_PIN_PI_TX
-// Placeholder UART for future Raspberry Pi autonomy packets.
+// UART for Raspberry Pi autonomy packets.
 #define FCU_PIN_PI_TX 17
 #endif
 #ifndef FCU_PIN_PI_RX
 #define FCU_PIN_PI_RX 18
 #endif
+#ifndef FCU_PIN_BATT_ADC
+// Battery monitor ADC pin. -1 disables; harness wires VBAT through a divider.
+#define FCU_PIN_BATT_ADC -1
+#endif
+#ifndef FCU_BATT_DIVIDER_GAIN
+// Multiplier from ADC voltage to pack voltage. Default assumes 4:1 divider
+// (top resistor 30k, bottom 10k) -> pack ~= adc_volts * 4.
+#define FCU_BATT_DIVIDER_GAIN 4.0f
+#endif
+#ifndef FCU_BATT_LOW_VOLTS
+#define FCU_BATT_LOW_VOLTS 10.5f
+#endif
+#ifndef FCU_TILT_UNSAFE_DEG
+#define FCU_TILT_UNSAFE_DEG 60.0f
+#endif
 static constexpr int PIN_GPS_TX = FCU_PIN_GPS_TX;
 static constexpr int PIN_GPS_RX = FCU_PIN_GPS_RX;
 static constexpr int PIN_PI_TX = FCU_PIN_PI_TX;
 static constexpr int PIN_PI_RX = FCU_PIN_PI_RX;
+static constexpr int PIN_BATT_ADC = FCU_PIN_BATT_ADC;
+static constexpr float BATT_DIVIDER_GAIN = FCU_BATT_DIVIDER_GAIN;
+static constexpr float BATT_LOW_VOLTS = FCU_BATT_LOW_VOLTS;
+static constexpr float TILT_UNSAFE_DEG = FCU_TILT_UNSAFE_DEG;
 
 // DShot motor pins. Keep these explicit so logs and arming map directly to the frame harness.
 static constexpr int MOTOR0_GPIO = 39;
@@ -265,6 +306,37 @@ struct PiAutonomyState {
   uint8_t status = 0;
 };
 
+struct BatteryState {
+  bool enabled = false;
+  float volts = 0.0f;
+  float emaVolts = 0.0f;
+  uint32_t lastSampleMs = 0;
+  bool low = false;
+};
+
+struct AltitudeState {
+  uint16_t targetDm = 0;        // last decoded target altitude from remote (decimeters)
+  uint16_t measuredMm = 0;      // filtered ToF altitude in mm
+  int16_t errorMm = 0;
+  float pidOutPct = 0.0f;
+  bool holdActive = false;
+  bool measurementValid = false;
+};
+
+struct AutonomyState {
+  bool enabled = false;         // remote allows Pi to influence control
+  bool manualOverride = false;  // user touched sticks/throttle while autonomy on
+  uint8_t lastCommand = control_protocol::kPiCmdNone;
+  uint32_t lastCommandAgeMs = 0xFFFFFFFFU;
+};
+
+struct LoopRateState {
+  uint32_t ticks = 0;
+  uint32_t lastSampleMs = 0;
+  uint16_t lastHz = 0;          // most recent flight-loop rate measurement
+  uint32_t lastFlightTickMs = 0;
+};
+
 struct BenchState {
   bool escReady = false;
   bool motor0Ready = false;
@@ -298,6 +370,14 @@ struct BenchState {
   TofState tof;
   GpsState gps;
   PiAutonomyState pi;
+  BatteryState battery;
+  AltitudeState altitude;
+  AutonomyState autonomy;
+  LoopRateState loopRate;
+  uint8_t failsafeReason = control_protocol::kFailsafeNone;
+  uint8_t lastAutoTakeoffState = control_protocol::kAutoTakeoffIdle;
+  bool altHoldRequested = false;
+  uint8_t telemetryAuxSequence = 0;
 
   uint32_t zeroSentCount = 0;
   uint32_t zeroSendFailCount = 0;
@@ -361,6 +441,12 @@ esc::EasyEscMotor gMotor2(static_cast<gpio_num_t>(MOTOR2_GPIO), GPIO_NUM_NC, FCU
 esc::EasyEscMotor gMotor3(static_cast<gpio_num_t>(MOTOR3_GPIO), GPIO_NUM_NC, FCU_DSHOT_MODE, 350, 2,
                           0.0f, 33.0f, false, false, FCU_RMT_TX_BUFFER_SYMBOLS);
 BenchState gState;
+
+TofAltitudeFilter gTofFilter;
+AltitudeController gAltCtrl;
+AutoTakeoff gAutoTakeoff;
+AutonomyUart gPiAutonomy;
+FailsafeManager gFailsafe;
 
 // -----------------------------
 // FreeRTOS synchronization + tasks
@@ -924,13 +1010,25 @@ bool initTof() {
 }
 
 void pollTof(uint32_t nowMs) {
-  if (!gState.tof.ready || !gState.tof.ranging || (nowMs - gState.tof.lastReadMs < TOF_READ_PERIOD_MS)) {
+#if !FCU_ENABLE_TOF
+  (void)nowMs;
+  return;
+#else
+  if (!gState.tof.ready || !gState.tof.ranging) {
+    gTofFilter.serviceTimeout(nowMs);
+    portENTER_CRITICAL(&gFlightMux);
+    gState.altitude.measurementValid = false;
+    portEXIT_CRITICAL(&gFlightMux);
+    return;
+  }
+  if (nowMs - gState.tof.lastReadMs < TOF_READ_PERIOD_MS) {
     return;
   }
 
   gState.tof.lastReadMs = nowMs;
   uint8_t dataReady = 0;
   if (gTof.VL53L1X_CheckForDataReady(&dataReady) != VL53L1X_ERROR_NONE || dataReady == 0U) {
+    gTofFilter.serviceTimeout(nowMs);
     return;
   }
 
@@ -939,13 +1037,23 @@ void pollTof(uint32_t nowMs) {
   if (gTof.VL53L1X_GetRangeStatus(&rangeStatus) != VL53L1X_ERROR_NONE ||
       gTof.VL53L1X_GetDistance(&distance) != VL53L1X_ERROR_NONE) {
     (void)gTof.VL53L1X_ClearInterrupt();
+    gTofFilter.serviceTimeout(nowMs);
     return;
   }
   (void)gTof.VL53L1X_ClearInterrupt();
 
+  // Always record the raw distance for diagnostics. Whether we trust it is up
+  // to the filter, which the flight task reads.
   if (rangeStatus == 0U) {
     gState.tof.distanceMm = distance;
   }
+  gTofFilter.ingest(rangeStatus, distance, nowMs);
+
+  portENTER_CRITICAL(&gFlightMux);
+  gState.altitude.measurementValid = gTofFilter.ready();
+  gState.altitude.measuredMm = gTofFilter.filteredMm();
+  portEXIT_CRITICAL(&gFlightMux);
+#endif
 }
 
 bool initGpsUart() {
@@ -1049,16 +1157,51 @@ void pollGps(uint32_t nowMs) {
   }
 }
 
-void pollPiAutonomyPlaceholder() {
+void pollPiAutonomy(uint32_t nowMs) {
+#if !FCU_ENABLE_AUTONOMY_UART
+  // Even with autonomy disabled at compile time, drain RX so the buffer can't fill.
+  if (gState.pi.uartReady) {
+    while (gPiSerial.available() > 0) {
+      (void)gPiSerial.read();
+    }
+  }
+  (void)nowMs;
+#else
   if (!gState.pi.uartReady) {
     return;
   }
+  gPiAutonomy.poll(nowMs);
 
-  // Future autonomy packet handling belongs here. For now, drain bytes so the
-  // placeholder UART cannot build up an unread RX backlog.
-  while (gPiSerial.available() > 0) {
-    (void)gPiSerial.read();
+  portENTER_CRITICAL(&gFlightMux);
+  gState.autonomy.lastCommand = gPiAutonomy.lastCommand();
+  gState.autonomy.lastCommandAgeMs = gPiAutonomy.ageMs(nowMs);
+  portEXIT_CRITICAL(&gFlightMux);
+#endif
+}
+
+void pollBattery(uint32_t nowMs) {
+  if (PIN_BATT_ADC < 0) {
+    return;
   }
+  // Sample at 10Hz max; cheap analog read.
+  if (gState.battery.lastSampleMs != 0 && (nowMs - gState.battery.lastSampleMs) < 100U) {
+    return;
+  }
+  gState.battery.lastSampleMs = nowMs;
+
+  const int raw = analogRead(PIN_BATT_ADC);
+  // ESP32-S3 ADC: 12-bit default, but be defensive.
+  const float adcVolts = (static_cast<float>(raw) / 4095.0f) * 3.3f;
+  const float packVolts = adcVolts * BATT_DIVIDER_GAIN;
+
+  if (gState.battery.emaVolts <= 0.01f) {
+    gState.battery.emaVolts = packVolts;
+  } else {
+    gState.battery.emaVolts = 0.2f * packVolts + 0.8f * gState.battery.emaVolts;
+  }
+  gState.battery.volts = gState.battery.emaVolts;
+  gState.battery.enabled = true;
+  gState.battery.low = gState.battery.volts < BATT_LOW_VOLTS;
 }
 
 bool initControlRadio(uint8_t& raw0, uint8_t& raw1, bool runDiagnostic) {
@@ -1407,8 +1550,27 @@ void processControlPacket(const control_protocol::ControlPacket& packet, uint32_
   portEXIT_CRITICAL(&gControlMux);
 
   portENTER_CRITICAL(&gFlightMux);
-  configurePidFromPacket(packet);
+  // Only push remote PID gains into the rate controllers in PID-tune mode.
+  // Otherwise pidSelectedField carries the takeoff altitude and the PID gain
+  // fields may legitimately be zero — don't overwrite our defaults with zero.
+  if (control_protocol::flagIsSet(packet.flags, control_protocol::kFlagPidModeSwitchOn)) {
+    configurePidFromPacket(packet);
+  }
+  gState.autonomy.enabled =
+      control_protocol::flagIsSet(packet.flags, control_protocol::kFlagAutonomyEnabled);
+  gState.altHoldRequested =
+      control_protocol::flagIsSet(packet.flags, control_protocol::kFlagAutoTakeoffArm);
+  gState.altitude.targetDm = control_protocol::desiredTakeoffAltDm(packet);
   portEXIT_CRITICAL(&gFlightMux);
+
+  // Clearing the auto-takeoff arm flag is the canonical "abort takeoff" signal.
+  // The auto_takeoff state machine handles that transition itself when armRequest=false.
+  // Once the remote no longer reports a failsafe condition, allow the latched
+  // FailsafeManager to clear so future flights can resume.
+  if (gFailsafe.active() &&
+      gState.failsafeReason == control_protocol::kFailsafeControlLinkTimeout) {
+    gFailsafe.reset();
+  }
 
   if (control_protocol::flagIsSet(packet.flags, control_protocol::kFlagImuCalibrateRequest)) {
     // TODO: connect this request to the final IMU calibration routine when available.
@@ -1447,8 +1609,12 @@ void pollControlRadio(uint32_t nowMs) {
 void applyFailsafeIfNeeded(uint32_t nowMs) {
   bool justEntered = false;
   bool isTimeout = false;
+  bool linkActiveLocal;
+  uint32_t lastPacketMsLocal;
   portENTER_CRITICAL(&gControlMux);
   const bool wasFailsafe = gState.control.failsafeActive;
+  linkActiveLocal = gState.control.linkActive;
+  lastPacketMsLocal = gState.control.lastPacketMs;
   if (!gState.control.linkActive) {
     if (!wasFailsafe) {
       gState.control.failsafeActive = true;
@@ -1460,12 +1626,85 @@ void applyFailsafeIfNeeded(uint32_t nowMs) {
     gState.control.lastPacket.throttlePercent = 0;
     justEntered = !wasFailsafe;
     isTimeout = true;
+    linkActiveLocal = false;
   }
   portEXIT_CRITICAL(&gControlMux);
 
+  // Evaluate full failsafe manager (ToF, battery, tilt, IMU, loop overrun, Pi cmd timeout).
+  FailsafeManager::Inputs fsIn;
+  fsIn.linkActive = linkActiveLocal;
+  fsIn.lastControlPacketMs = lastPacketMsLocal;
+  fsIn.nowMs = nowMs;
+  fsIn.controlTimeoutMs = CONTROL_FAILSAFE_TIMEOUT_MS;
+  fsIn.autonomyEnabled = gState.autonomy.enabled;
+  fsIn.piLastCommandMs = gPiAutonomy.lastCommandMs();
+  fsIn.piTimeoutMs = AutonomyUart::kCommandTimeoutMs;
+  fsIn.tofReady = gTofFilter.ready();
+  fsIn.altitudeHoldActive = gState.altitude.holdActive;
+  fsIn.batteryVolts = gState.battery.volts;
+  fsIn.batteryLowVolts = BATT_LOW_VOLTS;
+  fsIn.batteryEnabled = gState.battery.enabled;
+  // Tilt magnitude = max(|roll|, |pitch|) in degrees.
+  AttitudeSample attSnap;
+  portENTER_CRITICAL(&gFlightMux);
+  attSnap = gState.attitude;
+  const bool imuValidSnap = gState.imuSampleValid;
+  const uint32_t lastFlightTickMs = gState.loopRate.lastFlightTickMs;
+  portEXIT_CRITICAL(&gFlightMux);
+  const float tiltMag = fmaxf(fabsf(attSnap.rollDeg), fabsf(attSnap.pitchDeg));
+  fsIn.tiltMagDeg = tiltMag;
+  fsIn.tiltUnsafeDeg = TILT_UNSAFE_DEG;
+  fsIn.imuValid = imuValidSnap;
+  fsIn.armed = (gState.control.appliedThrottlePercent > 0);
+  fsIn.lastFlightLoopMs = lastFlightTickMs;
+  fsIn.loopTimeoutMs = 30;
+
+  const uint8_t reason = gFailsafe.evaluate(fsIn);
+  if (reason != control_protocol::kFailsafeNone && !justEntered) {
+    portENTER_CRITICAL(&gControlMux);
+    if (!gState.control.failsafeActive) {
+      gState.control.failsafeActive = true;
+      justEntered = true;
+    }
+    portEXIT_CRITICAL(&gControlMux);
+  }
+  gState.failsafeReason = reason;
+
   if (justEntered) {
     forceMotorStop();
-    Serial.printf("[CTRL] failsafe entered (%s); throttle=0\n", isTimeout ? "timeout" : "no_link");
+    Serial.printf("[CTRL] failsafe entered (%s reason=%u); throttle=0\n",
+                  isTimeout ? "timeout" : "no_link", static_cast<unsigned>(reason));
+  }
+}
+
+// Translate the current Pi command into incremental stick deflections (-100..+100)
+// that the inner loop interprets as angle setpoints. Manual stick movement
+// always wins (handled by the manualOverride gate in updateControlLoop).
+static constexpr float kAutonomyTiltStickPct = 40.0f;  // 40% stick = ~8 deg with 20 deg cap
+static constexpr float kAutonomyLandRateMps = 0.4f;    // descend at 0.4 m/s during LAND
+
+void autonomyCommandToSticks(uint8_t cmd, float& outStickX, float& outStickY,
+                              bool& outRequestLand, bool& outRequestStop) {
+  outStickX = 0.0f;
+  outStickY = 0.0f;
+  outRequestLand = false;
+  outRequestStop = false;
+  switch (cmd) {
+    case control_protocol::kPiCmdForward:  outStickY = +kAutonomyTiltStickPct; break;
+    case control_protocol::kPiCmdBackward: outStickY = -kAutonomyTiltStickPct; break;
+    case control_protocol::kPiCmdLeft:     outStickX = -kAutonomyTiltStickPct; break;
+    case control_protocol::kPiCmdRight:    outStickX = +kAutonomyTiltStickPct; break;
+    case control_protocol::kPiCmdYawLeft:
+    case control_protocol::kPiCmdYawRight:
+      // Yaw rate isn't wired into this rev's inner loop (angle-only). TODO when
+      // a yaw-rate stick is plumbed through. For now treat as HOVER.
+      break;
+    case control_protocol::kPiCmdLand: outRequestLand = true; break;
+    case control_protocol::kPiCmdStop: outRequestStop = true; break;
+    case control_protocol::kPiCmdHover:
+    case control_protocol::kPiCmdNone:
+    default:
+      break;
   }
 }
 
@@ -1478,6 +1717,15 @@ void updateControlLoop(uint32_t nowMs) {
       (gState.pid.lastUpdateMs == 0U) ? (CONTROL_LOOP_PERIOD_MS / 1000.0f)
                                       : static_cast<float>(nowMs - gState.pid.lastUpdateMs) / 1000.0f;
   gState.pid.lastUpdateMs = nowMs;
+  gState.loopRate.ticks++;
+  if (nowMs - gState.loopRate.lastSampleMs >= 1000U) {
+    const uint32_t deltaMs = nowMs - gState.loopRate.lastSampleMs;
+    gState.loopRate.lastHz = (deltaMs > 0)
+        ? static_cast<uint16_t>((gState.loopRate.ticks * 1000UL) / deltaMs)
+        : 0;
+    gState.loopRate.ticks = 0;
+    gState.loopRate.lastSampleMs = nowMs;
+  }
 
   if (gState.imuReady) {
     ImuSample sample;
@@ -1496,10 +1744,28 @@ void updateControlLoop(uint32_t nowMs) {
 
   control_protocol::ControlPacket packet;
   bool failsafe;
+  bool linkActiveSnap;
   portENTER_CRITICAL(&gControlMux);
   packet = gState.control.lastPacket;
   failsafe = gState.control.failsafeActive;
+  linkActiveSnap = gState.control.linkActive;
   portEXIT_CRITICAL(&gControlMux);
+
+  // Snapshot flight-task-visible state. The radio task writes these under the
+  // same mux from processControlPacket(), so we must read them here too.
+  bool altHoldRequestedSnap;
+  bool autonomyEnabledSnap;
+  uint16_t altitudeTargetDmSnap;
+  AttitudeSample attitudeSnap;
+  bool imuValidSnap;
+  portENTER_CRITICAL(&gFlightMux);
+  gState.loopRate.lastFlightTickMs = nowMs;
+  altHoldRequestedSnap = gState.altHoldRequested;
+  autonomyEnabledSnap = gState.autonomy.enabled;
+  altitudeTargetDmSnap = gState.altitude.targetDm;
+  attitudeSnap = gState.attitude;
+  imuValidSnap = gState.imuSampleValid;
+  portEXIT_CRITICAL(&gFlightMux);
 
   if (escStartupSettleActive(nowMs)) {
     forceMotorStop();
@@ -1510,20 +1776,122 @@ void updateControlLoop(uint32_t nowMs) {
   const bool flightSwitchOn = control_protocol::flagIsSet(packet.flags, control_protocol::kFlagFlightSwitchOn);
   const bool safeBoot = control_protocol::flagIsSet(packet.flags, control_protocol::kFlagSafeBootComplete);
   const bool allowFlight = flightMode && flightSwitchOn && safeBoot && !failsafe;
-  const uint8_t effectiveThrottle =
-      allowFlight ? static_cast<uint8_t>(constrain(packet.throttlePercent, 0, 100)) : 0;
+
+  // Manual override detection: any meaningful stick deflection or throttle input
+  // overrides autonomy/auto-takeoff instantly. Use slightly hysteretic thresholds.
+  const bool manualStickMoved =
+      (abs(packet.stickXPercent) > 20) || (abs(packet.stickYPercent) > 20) ||
+      (packet.throttlePercent > 5);
+
+#if FCU_ENABLE_AUTO_TAKEOFF
+  // Auto-takeoff state machine: independent of inner-loop period to avoid
+  // jitter. The state machine produces a "want" throttle base that we use
+  // when armed, and a flag to ignore the remote throttle.
+  AutoTakeoff::Inputs atkIn;
+  atkIn.armRequest = altHoldRequestedSnap;
+  atkIn.flightSwitchOn = flightSwitchOn;
+  atkIn.safeBootComplete = safeBoot;
+  atkIn.linkActive = linkActiveSnap;
+  atkIn.failsafeActive = failsafe;
+  atkIn.tofReady = gTofFilter.ready();
+  atkIn.imuValid = imuValidSnap;
+  atkIn.tiltSafe = (fmaxf(fabsf(attitudeSnap.rollDeg),
+                          fabsf(attitudeSnap.pitchDeg)) < TILT_UNSAFE_DEG);
+  atkIn.batterySafe = (!gState.battery.enabled || !gState.battery.low);
+  atkIn.manualStickMoved = manualStickMoved;
+  atkIn.targetAltDm = static_cast<uint8_t>(constrain(static_cast<int>(altitudeTargetDmSnap), 0,
+                                                     static_cast<int>(control_protocol::kMaxTakeoffAltDm)));
+  atkIn.measuredMeters = gTofFilter.filteredMeters();
+  atkIn.nowMs = nowMs;
+  AutoTakeoff::Snapshot atk = gAutoTakeoff.update(atkIn);
+  gState.lastAutoTakeoffState = atk.state;
+#else
+  AutoTakeoff::Snapshot atk;
+#endif
+
+  // Compose the effective throttle: ATK overrides remote throttle when active.
+  uint8_t effectiveThrottle = 0;
+  bool altHoldActive = false;
+  if (allowFlight && atk.active) {
+    effectiveThrottle = static_cast<uint8_t>(constrain(static_cast<int>(atk.throttlePct + 0.5f), 0, 100));
+    altHoldActive = (atk.state == control_protocol::kAutoTakeoffAscend ||
+                     atk.state == control_protocol::kAutoTakeoffAltHold);
+  } else if (allowFlight) {
+    effectiveThrottle = static_cast<uint8_t>(constrain(static_cast<int>(packet.throttlePercent), 0, 100));
+  }
+
+#if FCU_ENABLE_ALTITUDE_HOLD
+  // Altitude controller: only run when ATK requests altitude hold AND ToF is valid.
+  if (altHoldActive && gTofFilter.ready()) {
+    gAltCtrl.setTarget(atk.targetMeters);
+    AltitudeController::Output altOut = gAltCtrl.update(gTofFilter.filteredMeters(), dtSeconds);
+    const int biasedThrottle = static_cast<int>(effectiveThrottle) +
+                                static_cast<int>(altOut.throttleBiasPct + 0.5f);
+    effectiveThrottle = static_cast<uint8_t>(constrain(biasedThrottle, 0, 100));
+    portENTER_CRITICAL(&gFlightMux);
+    gState.altitude.holdActive = true;
+    gState.altitude.errorMm = static_cast<int16_t>(constrain(static_cast<int>(altOut.errorMeters * 1000.0f),
+                                                              -32768, 32767));
+    gState.altitude.pidOutPct = altOut.pidOutPct;
+    portEXIT_CRITICAL(&gFlightMux);
+  } else {
+    gAltCtrl.reset();
+    portENTER_CRITICAL(&gFlightMux);
+    gState.altitude.holdActive = false;
+    gState.altitude.errorMm = 0;
+    gState.altitude.pidOutPct = 0.0f;
+    portEXIT_CRITICAL(&gFlightMux);
+  }
+#endif
 
   portENTER_CRITICAL(&gControlMux);
   gState.control.appliedThrottlePercent = effectiveThrottle;
   portEXIT_CRITICAL(&gControlMux);
 
-  if (effectiveThrottle == 0 || !gState.imuSampleValid) {
+  if (effectiveThrottle == 0 || !imuValidSnap) {
     forceMotorStop();
     return;
   }
 
-  const float rollSetpoint = (static_cast<float>(packet.stickXPercent) / 100.0f) * MAX_ANGLE_SETPOINT_DEG;
-  const float pitchSetpoint = (static_cast<float>(packet.stickYPercent) / 100.0f) * MAX_ANGLE_SETPOINT_DEG;
+  // Compose stick setpoints. Manual stick always wins; autonomy only steers
+  // when enabled AND user hasn't moved sticks/throttle.
+  float effStickX = static_cast<float>(packet.stickXPercent);
+  float effStickY = static_cast<float>(packet.stickYPercent);
+  bool autonomyLand = false;
+  bool autonomyStop = false;
+#if FCU_ENABLE_AUTONOMY_UART
+  if (autonomyEnabledSnap && !manualStickMoved) {
+    float aX = 0.0f;
+    float aY = 0.0f;
+    autonomyCommandToSticks(gPiAutonomy.lastCommand(), aX, aY, autonomyLand, autonomyStop);
+    effStickX = aX;
+    effStickY = aY;
+    portENTER_CRITICAL(&gFlightMux);
+    gState.autonomy.manualOverride = false;
+    portEXIT_CRITICAL(&gFlightMux);
+  } else if (autonomyEnabledSnap && manualStickMoved) {
+    portENTER_CRITICAL(&gFlightMux);
+    gState.autonomy.manualOverride = true;
+    portEXIT_CRITICAL(&gFlightMux);
+  }
+#endif
+
+  if (autonomyStop) {
+    forceMotorStop();
+    return;
+  }
+  if (autonomyLand) {
+    // Land: gradually descend by lowering effective throttle. Simple ramp; the
+    // altitude controller (when active) keeps attitude stable.
+    const int landThrottle = static_cast<int>(effectiveThrottle) - 5;
+    effectiveThrottle = static_cast<uint8_t>(constrain(landThrottle, 0, 100));
+    portENTER_CRITICAL(&gControlMux);
+    gState.control.appliedThrottlePercent = effectiveThrottle;
+    portEXIT_CRITICAL(&gControlMux);
+  }
+
+  const float rollSetpoint = (effStickX / 100.0f) * MAX_ANGLE_SETPOINT_DEG;
+  const float pitchSetpoint = (effStickY / 100.0f) * MAX_ANGLE_SETPOINT_DEG;
   const float yawSetpoint = 0.0f;
 
   FcuPidTerms rollT;
@@ -1581,6 +1949,8 @@ void sendTelemetry(uint32_t nowMs) {
   FcuPidTerms yawT;
   bool pidActive;
   bool imuValid;
+  AltitudeState altSnap;
+  AutonomyState autSnap;
   portENTER_CRITICAL(&gFlightMux);
   att = gState.attitude;
   rollT = gState.pid.rollTerms;
@@ -1588,56 +1958,94 @@ void sendTelemetry(uint32_t nowMs) {
   yawT = gState.pid.yawTerms;
   pidActive = gState.pid.active;
   imuValid = gState.imuSampleValid;
+  altSnap = gState.altitude;
+  autSnap = gState.autonomy;
   portEXIT_CRITICAL(&gFlightMux);
 
-  control_protocol::TelemetryPacket packet;
-  packet.sequence = gState.telemetrySequence++;
-  packet.flightMode = flightMode;
-  packet.throttlePercent = throttlePercent;
-  packet.rollCdeg = floatToCdeg(att.rollDeg);
-  packet.pitchCdeg = floatToCdeg(att.pitchDeg);
-  packet.yawCdeg = floatToCdeg(att.yawDeg);
-  packet.pidRollCenti = floatToCenti(rollT.output);
-  packet.pidPitchCenti = floatToCenti(pitchT.output);
-  packet.pidYawCenti = floatToCenti(yawT.output);
-  packet.tofMm = gState.tof.distanceMm;
-  packet.gpsLatE7 = gState.gps.latE7;
-  packet.gpsLonE7 = gState.gps.lonE7;
-  packet.gpsAltDm = gState.gps.altDm;
-  packet.gpsSatellites = gState.gps.satellites;
-  packet.gpsFixQuality = gState.gps.fixQuality;
-  packet.piStatus = gState.pi.status;
+  // Decide which slot to send this cycle. Alternate primary / aux so both
+  // refresh at half the base telemetry rate (~5 Hz each at 100 ms period).
+  const bool sendAux = (gState.telemetrySequence & 0x01U) != 0U;
 
-  if (linkActive) {
-    packet.flags |= control_protocol::kTelemetryFlagControlLinkActive;
-  }
-  if (failsafeActive) {
-    packet.flags |= control_protocol::kTelemetryFlagFailsafeActive;
-  }
-  if (gState.tof.ready) {
-    packet.flags |= control_protocol::kTelemetryFlagTofReady;
-  }
-  if (gState.gps.hasFix) {
-    packet.flags |= control_protocol::kTelemetryFlagGpsHasFix;
-  }
-  if (gState.pi.uartReady) {
-    packet.flags |= control_protocol::kTelemetryFlagPiUartReady;
-  }
-  if (pidActive) {
-    packet.flags |= control_protocol::kTelemetryFlagPidActive;
-  }
-  if (gState.imuReady && imuValid) {
-    packet.flags |= control_protocol::kTelemetryFlagImuReady;
-  }
-  if (gState.gps.uartReady) {
-    packet.flags |= control_protocol::kTelemetryFlagGpsUartReady;
-  }
+  if (!sendAux) {
+    control_protocol::TelemetryPacket packet;
+    packet.sequence = gState.telemetrySequence++;
+    packet.flightMode = flightMode;
+    packet.throttlePercent = throttlePercent;
+    packet.rollCdeg = floatToCdeg(att.rollDeg);
+    packet.pitchCdeg = floatToCdeg(att.pitchDeg);
+    packet.yawCdeg = floatToCdeg(att.yawDeg);
+    packet.pidRollCenti = floatToCenti(rollT.output);
+    packet.pidPitchCenti = floatToCenti(pitchT.output);
+    packet.pidYawCenti = floatToCenti(yawT.output);
+    packet.tofMm = gTofFilter.ready() ? gTofFilter.filteredMm() : gState.tof.distanceMm;
+    packet.gpsLatE7 = gState.gps.latE7;
+    packet.gpsLonE7 = gState.gps.lonE7;
+    packet.gpsAltDm = gState.gps.altDm;
+    packet.gpsSatellites = gState.gps.satellites;
+    packet.gpsFixQuality = gState.gps.fixQuality;
+    packet.piStatus = gState.pi.status;
+
+    if (linkActive) packet.flags |= control_protocol::kTelemetryFlagControlLinkActive;
+    if (failsafeActive) packet.flags |= control_protocol::kTelemetryFlagFailsafeActive;
+    if (gTofFilter.ready()) packet.flags |= control_protocol::kTelemetryFlagTofReady;
+    if (gState.gps.hasFix) packet.flags |= control_protocol::kTelemetryFlagGpsHasFix;
+    if (gState.pi.uartReady) packet.flags |= control_protocol::kTelemetryFlagPiUartReady;
+    if (pidActive) packet.flags |= control_protocol::kTelemetryFlagPidActive;
+    if (gState.imuReady && imuValid) packet.flags |= control_protocol::kTelemetryFlagImuReady;
+    if (gState.gps.uartReady) packet.flags |= control_protocol::kTelemetryFlagGpsUartReady;
 
 #if FCU_PIN_TELM_CE >= 0 && FCU_PIN_TELM_CSN >= 0
-  (void)gTelmRadio.write(&packet, sizeof(packet));
+    (void)gTelmRadio.write(&packet, sizeof(packet));
 #else
-  (void)packet;
+    (void)packet;
 #endif
+  } else {
+    control_protocol::TelemetryAuxPacket aux;
+    aux.sequence = gState.telemetryAuxSequence++;
+    gState.telemetrySequence++;
+    aux.autoTakeoffState = gState.lastAutoTakeoffState;
+    aux.altTargetDm = static_cast<uint8_t>(constrain(static_cast<int>(altSnap.targetDm), 0,
+                                                     static_cast<int>(control_protocol::kMaxTakeoffAltDm)));
+    aux.batteryDeciV = static_cast<uint8_t>(constrain(static_cast<int>(gState.battery.volts * 10.0f + 0.5f),
+                                                       0, 255));
+    aux.failsafeReason = gState.failsafeReason;
+    aux.piCommand = autSnap.lastCommand;
+    aux.loopRateHz10 = static_cast<uint8_t>(constrain(static_cast<int>(gState.loopRate.lastHz / 10), 0, 255));
+    aux.piCmdAgeMs10 = (autSnap.lastCommandAgeMs == 0xFFFFFFFFU)
+        ? 255U
+        : static_cast<uint8_t>(constrain(static_cast<int>(autSnap.lastCommandAgeMs / 10), 0, 255));
+    aux.tofConfidence = gTofFilter.confidence();
+    aux.altMeasuredMm = static_cast<int16_t>(constrain(static_cast<int>(altSnap.measuredMm), -32768, 32767));
+    aux.altErrorMm = altSnap.errorMm;
+    aux.altPidOutMilli = static_cast<int16_t>(constrain(static_cast<int>(altSnap.pidOutPct * 1000.0f),
+                                                         -32768, 32767));
+    const float tiltMag = fmaxf(fabsf(att.rollDeg), fabsf(att.pitchDeg));
+    aux.tiltDeg10 = static_cast<uint8_t>(constrain(static_cast<int>(tiltMag * 10.0f + 0.5f), 0, 255));
+
+    if (altSnap.holdActive) aux.flags2 |= control_protocol::kTelemetry2FlagAltHoldActive;
+    if (autSnap.enabled) aux.flags2 |= control_protocol::kTelemetry2FlagAutonomyEnabled;
+    const bool atkActive = (aux.autoTakeoffState != control_protocol::kAutoTakeoffIdle &&
+                            aux.autoTakeoffState != control_protocol::kAutoTakeoffComplete &&
+                            aux.autoTakeoffState != control_protocol::kAutoTakeoffAbort &&
+                            aux.autoTakeoffState != control_protocol::kAutoTakeoffFailsafe);
+    if (atkActive) aux.flags2 |= control_protocol::kTelemetry2FlagAutoTakeoffActive;
+    if (autSnap.manualOverride) aux.flags2 |= control_protocol::kTelemetry2FlagManualOverride;
+    if (gState.battery.enabled && gState.battery.low) aux.flags2 |= control_protocol::kTelemetry2FlagBatteryLow;
+    if (tiltMag > TILT_UNSAFE_DEG) aux.flags2 |= control_protocol::kTelemetry2FlagTiltUnsafe;
+    if (autSnap.lastCommand != control_protocol::kPiCmdNone &&
+        autSnap.lastCommandAgeMs < AutonomyUart::kCommandTimeoutMs) {
+      aux.flags2 |= control_protocol::kTelemetry2FlagPiCmdValid;
+    }
+    if (aux.autoTakeoffState == control_protocol::kAutoTakeoffAbort) {
+      aux.flags2 |= control_protocol::kTelemetry2FlagAbortRequested;
+    }
+
+#if FCU_PIN_TELM_CE >= 0 && FCU_PIN_TELM_CSN >= 0
+    (void)gTelmRadio.write(&aux, sizeof(aux));
+#else
+    (void)aux;
+#endif
+  }
 #endif
 }
 
@@ -1751,7 +2159,8 @@ void sensorTask(void* /*arg*/) {
     const uint32_t nowMs = millis();
     pollTof(nowMs);
     pollGps(nowMs);
-    pollPiAutonomyPlaceholder();
+    pollPiAutonomy(nowMs);
+    pollBattery(nowMs);
     vTaskDelayUntil(&lastWake, period);
   }
 }
@@ -1805,9 +2214,25 @@ void setup() {
   gState.i2cReady = initI2c();
   gState.bmpReady = gState.i2cReady && initBmp(gState.bmpChipId, gState.bmpAddr);
   gState.tof.ready = initTof();
+  gTofFilter.reset();
   gState.gps.uartReady = initGpsUart();
   gState.pi.uartReady = initPiUart();
   gState.pi.status = gState.pi.uartReady ? 1 : 0;
+  if (gState.pi.uartReady) {
+    gPiAutonomy.begin(gPiSerial);
+  }
+
+  // Configure altitude controller, auto-takeoff state machine, failsafe manager.
+  gAltCtrl.configure();
+  gAltCtrl.reset();
+  gAutoTakeoff.reset();
+  gFailsafe.reset();
+  gFailsafe.configure(BATT_LOW_VOLTS, TILT_UNSAFE_DEG, CONTROL_FAILSAFE_TIMEOUT_MS,
+                      AutonomyUart::kCommandTimeoutMs, 30U);
+  if (PIN_BATT_ADC >= 0) {
+    pinMode(PIN_BATT_ADC, INPUT);
+    analogReadResolution(12);
+  }
   // Bit-bang both nRFs once, before any SPI peripheral init touches the bus pins.
   runRadioBitBangDiagnostics();
 
