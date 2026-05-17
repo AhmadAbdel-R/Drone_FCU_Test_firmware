@@ -1,4 +1,5 @@
 ﻿#include <Arduino.h>
+#include <Adafruit_BMP280.h>
 #include <Adafruit_ICM20948.h>
 #include <Adafruit_ICM20X.h>
 #include <Adafruit_VL53L1X.h>
@@ -17,6 +18,7 @@
 #include <cstring>
 
 #include "control_protocol.h"
+#include "DynamicNotchFilter.h"
 #include "fcu_pid.h"
 #include "tof_altitude.h"
 #include "altitude_controller.h"
@@ -39,6 +41,63 @@
 #endif
 #ifndef FCU_ENABLE_DEBUG_TELEMETRY
 #define FCU_ENABLE_DEBUG_TELEMETRY 1
+#endif
+#ifndef FCU_I2C_HZ
+#define FCU_I2C_HZ 100000UL
+#endif
+#ifndef FCU_I2C_TIMEOUT_MS
+#define FCU_I2C_TIMEOUT_MS 10U
+#endif
+#ifndef FCU_LINK_LOSS_HOLD_MS
+#define FCU_LINK_LOSS_HOLD_MS 5000UL
+#endif
+#ifndef FCU_LINK_LOSS_RAMPDOWN_MS
+#define FCU_LINK_LOSS_RAMPDOWN_MS 6000UL
+#endif
+#ifndef FCU_IMU_BODY_X_AXIS
+#define FCU_IMU_BODY_X_AXIS 1
+#endif
+#ifndef FCU_IMU_BODY_X_SIGN
+#define FCU_IMU_BODY_X_SIGN 1.0f
+#endif
+#ifndef FCU_IMU_BODY_Y_AXIS
+#define FCU_IMU_BODY_Y_AXIS 0
+#endif
+#ifndef FCU_IMU_BODY_Y_SIGN
+#define FCU_IMU_BODY_Y_SIGN -1.0f
+#endif
+#ifndef FCU_IMU_BODY_Z_AXIS
+#define FCU_IMU_BODY_Z_AXIS 2
+#endif
+#ifndef FCU_IMU_BODY_Z_SIGN
+#define FCU_IMU_BODY_Z_SIGN 1.0f
+#endif
+#ifndef ENABLE_DYNAMIC_NOTCH
+#define ENABLE_DYNAMIC_NOTCH 0
+#endif
+#ifndef DYN_NOTCH_MIN_HZ
+#define DYN_NOTCH_MIN_HZ 50.0f
+#endif
+#ifndef DYN_NOTCH_MAX_HZ
+#define DYN_NOTCH_MAX_HZ 250.0f
+#endif
+#ifndef DYN_NOTCH_Q
+#define DYN_NOTCH_Q 6.0f
+#endif
+#ifndef DYN_NOTCH_UPDATE_HZ
+#define DYN_NOTCH_UPDATE_HZ 100.0f
+#endif
+#ifndef DYN_NOTCH_USE_SECOND_HARMONIC
+#define DYN_NOTCH_USE_SECOND_HARMONIC 1
+#endif
+#ifndef DYN_NOTCH_LOW_CMD_HZ
+#define DYN_NOTCH_LOW_CMD_HZ 50.0f
+#endif
+#ifndef DYN_NOTCH_HIGH_CMD_HZ
+#define DYN_NOTCH_HIGH_CMD_HZ 220.0f
+#endif
+#ifndef DYN_NOTCH_DEBUG
+#define DYN_NOTCH_DEBUG 0
 #endif
 
 // -----------------------------
@@ -131,15 +190,15 @@ static constexpr int PIN_BMP_SCL = FCU_PIN_BMP_SCL;
 #endif
 #ifndef FCU_PIN_BATT_ADC
 // Battery monitor ADC pin. -1 disables; harness wires VBAT through a divider.
-#define FCU_PIN_BATT_ADC -1
+#define FCU_PIN_BATT_ADC 2
 #endif
 #ifndef FCU_BATT_DIVIDER_GAIN
-// Multiplier from ADC voltage to pack voltage. Default assumes 4:1 divider
-// (top resistor 30k, bottom 10k) -> pack ~= adc_volts * 4.
-#define FCU_BATT_DIVIDER_GAIN 4.0f
+// Multiplier from ADC voltage to pack voltage. Default assumes the 4S monitor
+// divider is 100k top / 22k bottom: (100k + 22k) / 22k = 5.54545.
+#define FCU_BATT_DIVIDER_GAIN 5.545455f
 #endif
 #ifndef FCU_BATT_LOW_VOLTS
-#define FCU_BATT_LOW_VOLTS 10.5f
+#define FCU_BATT_LOW_VOLTS 14.0f
 #endif
 #ifndef FCU_TILT_UNSAFE_DEG
 #define FCU_TILT_UNSAFE_DEG 60.0f
@@ -152,12 +211,36 @@ static constexpr int PIN_BATT_ADC = FCU_PIN_BATT_ADC;
 static constexpr float BATT_DIVIDER_GAIN = FCU_BATT_DIVIDER_GAIN;
 static constexpr float BATT_LOW_VOLTS = FCU_BATT_LOW_VOLTS;
 static constexpr float TILT_UNSAFE_DEG = FCU_TILT_UNSAFE_DEG;
+static constexpr uint32_t I2C_HZ = FCU_I2C_HZ;
+static constexpr uint16_t I2C_TIMEOUT_MS = FCU_I2C_TIMEOUT_MS;
+static constexpr uint32_t LINK_LOSS_HOLD_MS = FCU_LINK_LOSS_HOLD_MS;
+static constexpr uint32_t LINK_LOSS_RAMPDOWN_MS = FCU_LINK_LOSS_RAMPDOWN_MS;
+static constexpr int IMU_BODY_X_AXIS = FCU_IMU_BODY_X_AXIS;
+static constexpr int IMU_BODY_Y_AXIS = FCU_IMU_BODY_Y_AXIS;
+static constexpr int IMU_BODY_Z_AXIS = FCU_IMU_BODY_Z_AXIS;
+static constexpr float IMU_BODY_X_SIGN = FCU_IMU_BODY_X_SIGN;
+static constexpr float IMU_BODY_Y_SIGN = FCU_IMU_BODY_Y_SIGN;
+static constexpr float IMU_BODY_Z_SIGN = FCU_IMU_BODY_Z_SIGN;
 
-// DShot motor pins. Keep these explicit so logs and arming map directly to the frame harness.
-static constexpr int MOTOR0_GPIO = 39;
-static constexpr int MOTOR1_GPIO = 40;
-static constexpr int MOTOR2_GPIO = 37;
-static constexpr int MOTOR3_GPIO = 42;
+// DShot motor pins. Output arrays use verified motor-number order:
+// M1 rear-right, M2 front-right, M3 rear-left, M4 front-left.
+static constexpr int MOTOR0_GPIO = 39;  // M1
+static constexpr int MOTOR1_GPIO = 40;  // M2
+static constexpr int MOTOR2_GPIO = 37;  // M3
+static constexpr int MOTOR3_GPIO = 42;  // M4
+
+#ifndef FCU_MIX_ROLL_SIGN
+#define FCU_MIX_ROLL_SIGN 1.0f
+#endif
+#ifndef FCU_MIX_PITCH_SIGN
+#define FCU_MIX_PITCH_SIGN 1.0f
+#endif
+#ifndef FCU_MIX_YAW_SIGN
+#define FCU_MIX_YAW_SIGN 1.0f
+#endif
+static constexpr float MIX_ROLL_SIGN = FCU_MIX_ROLL_SIGN;
+static constexpr float MIX_PITCH_SIGN = FCU_MIX_PITCH_SIGN;
+static constexpr float MIX_YAW_SIGN = FCU_MIX_YAW_SIGN;
 
 // -----------------------------
 // Bus speeds (requested caps)
@@ -195,11 +278,18 @@ static constexpr float ATTITUDE_FILTER_TAU_S = 0.5f;           // complementary 
 static constexpr float MAX_PID_KP_MILLI = 5000;                // safety clamps for radio-supplied PID gains
 static constexpr float MAX_PID_KI_MILLI = 3000;
 static constexpr float MAX_PID_KD_MILLI = 1000;
+static constexpr int16_t MAX_ANGLE_KP_MILLI = 10000;
 static constexpr uint32_t TELEMETRY_SEND_PERIOD_MS = 100;
 static constexpr uint32_t RADIO_INIT_BACKOFF_BASE_MS = 500;
 static constexpr uint32_t RADIO_INIT_BACKOFF_CAP_MS = 15000;
 static constexpr uint16_t RADIO_INIT_MAX_ATTEMPTS = 20;
+static constexpr uint8_t CONTROL_RADIO_MAX_PACKETS_PER_WAKE = 8;
+static constexpr uint32_t TELEMETRY_SPI_WARN_US = 5000;
 static constexpr uint32_t TOF_READ_PERIOD_MS = 50;
+static constexpr uint32_t BMP_READ_PERIOD_MS = 40;
+static constexpr uint32_t BATT_READ_PERIOD_MS = 200;
+static constexpr uint8_t BATT_OVERSAMPLE_COUNT = 16;
+static constexpr float BATT_EMA_ALPHA = 0.10f;
 static constexpr uint32_t GPS_BAUD = 9600;
 static constexpr uint32_t PI_UART_BAUD = 115200;
 static constexpr uint8_t TOF_I2C_ADDRESS = 0x29;
@@ -207,17 +297,31 @@ static constexpr uint16_t TOF_EXPECTED_SENSOR_ID = 0xEACC;
 static constexpr uint16_t TOF_ALT_SENSOR_ID = 0xEEAC;
 static constexpr uint16_t MOTOR_OUTPUT_MAX_RAW = 1500;
 static constexpr uint16_t MOTOR_OUTPUT_MIN_ACTIVE_RAW = 48;
-static constexpr float MAX_ANGLE_SETPOINT_DEG = 20.0f;
+static constexpr bool DYNAMIC_NOTCH_ENABLED = (ENABLE_DYNAMIC_NOTCH != 0);
+static constexpr float DYNAMIC_NOTCH_MIN_HZ = DYN_NOTCH_MIN_HZ;
+static constexpr float DYNAMIC_NOTCH_MAX_HZ = DYN_NOTCH_MAX_HZ;
+static constexpr float DYNAMIC_NOTCH_Q = DYN_NOTCH_Q;
+static constexpr float DYNAMIC_NOTCH_UPDATE_HZ = DYN_NOTCH_UPDATE_HZ;
+static constexpr bool DYNAMIC_NOTCH_USE_SECOND_HARMONIC = (DYN_NOTCH_USE_SECOND_HARMONIC != 0);
+static constexpr float DYNAMIC_NOTCH_LOW_CMD_HZ = DYN_NOTCH_LOW_CMD_HZ;
+static constexpr float DYNAMIC_NOTCH_HIGH_CMD_HZ = DYN_NOTCH_HIGH_CMD_HZ;
+static constexpr bool DYNAMIC_NOTCH_DEBUG_ENABLED = (DYN_NOTCH_DEBUG != 0);
+static constexpr float MAX_ANGLE_SETPOINT_DEG = 15.0f;
+static constexpr float MAX_ANGLE_RATE_SETPOINT_DPS = 120.0f;
+static constexpr float MAX_YAW_RATE_SETPOINT_DPS = 100.0f;
 static constexpr float PID_OUTPUT_LIMIT_RAW = 120.0f;
-static constexpr int16_t DEFAULT_RATE_ROLL_P_MILLI = 140;
-static constexpr int16_t DEFAULT_RATE_ROLL_I_MILLI = 90;
-static constexpr int16_t DEFAULT_RATE_ROLL_D_MILLI = 5;
-static constexpr int16_t DEFAULT_RATE_PITCH_P_MILLI = 140;
-static constexpr int16_t DEFAULT_RATE_PITCH_I_MILLI = 90;
-static constexpr int16_t DEFAULT_RATE_PITCH_D_MILLI = 5;
-static constexpr int16_t DEFAULT_RATE_YAW_P_MILLI = 220;
+static constexpr int16_t DEFAULT_RATE_ROLL_P_MILLI = 280;
+static constexpr int16_t DEFAULT_RATE_ROLL_I_MILLI = 80;
+static constexpr int16_t DEFAULT_RATE_ROLL_D_MILLI = 0;
+static constexpr int16_t DEFAULT_RATE_PITCH_P_MILLI = 280;
+static constexpr int16_t DEFAULT_RATE_PITCH_I_MILLI = 80;
+static constexpr int16_t DEFAULT_RATE_PITCH_D_MILLI = 0;
+static constexpr int16_t DEFAULT_RATE_YAW_P_MILLI = 180;
 static constexpr int16_t DEFAULT_RATE_YAW_I_MILLI = 30;
 static constexpr int16_t DEFAULT_RATE_YAW_D_MILLI = 0;
+static constexpr int16_t DEFAULT_ANGLE_ROLL_P_MILLI = 4000;
+static constexpr int16_t DEFAULT_ANGLE_PITCH_P_MILLI = 4000;
+static constexpr int16_t DEFAULT_ANGLE_YAW_P_MILLI = 4000;
 
 // -----------------------------
 // ESC test config
@@ -238,8 +342,20 @@ static constexpr uint32_t ESC_STARTUP_SETTLE_MS = 3000;  // hold DSHOT zero afte
 static constexpr uint8_t BMP_ADDR_PRIMARY = 0x76;
 static constexpr uint8_t BMP_ADDR_ALT = 0x77;
 static constexpr uint8_t BMP_REG_CHIP_ID = 0xD0;
+static constexpr uint8_t BMP_REG_DIG_T1 = 0x88;
+static constexpr uint8_t BMP_REG_DIG_P1 = 0x8E;
+static constexpr uint8_t BMP_REG_STATUS = 0xF3;
+static constexpr uint8_t BMP_REG_CTRL_MEAS = 0xF4;
+static constexpr uint8_t BMP_REG_CONFIG = 0xF5;
+static constexpr uint8_t BMP_REG_PRESSURE_MSB = 0xF7;
+static constexpr uint8_t BMP_REG_TEMP_MSB = 0xFA;
 static constexpr uint8_t BMP_CHIP_ID = 0x58;
 static constexpr uint8_t BME_CHIP_ID = 0x60;
+static constexpr uint8_t BARO_FAIL_NONE = 0;
+static constexpr uint8_t BARO_FAIL_PRESSURE = 1;
+static constexpr uint8_t BARO_FAIL_TEMPERATURE = 2;
+static constexpr uint8_t BARO_FAIL_REFERENCE = 3;
+static constexpr uint8_t BARO_FAIL_ALTITUDE = 4;
 
 // -----------------------------
 // Types
@@ -267,16 +383,25 @@ struct ControlLinkState {
   uint32_t lastPacketMs = 0;
   uint32_t validPackets = 0;
   uint8_t appliedThrottlePercent = 0;
+  uint32_t linkLossStartMs = 0;
+  uint8_t linkLossHoldThrottlePercent = 0;
   control_protocol::ControlPacket lastPacket;
 };
 
 struct PidRuntime {
+  // Inner-loop rate PIDs. Roll/pitch angle errors feed rate setpoints first.
   FcuPidController roll;
   FcuPidController pitch;
   FcuPidController yaw;
   FcuPidTerms rollTerms;
   FcuPidTerms pitchTerms;
   FcuPidTerms yawTerms;
+  float angleRollGain = 0.0f;   // dps target per degree error
+  float anglePitchGain = 0.0f;
+  float angleYawGain = 0.0f;
+  float rollRateSetpointDps = 0.0f;
+  float pitchRateSetpointDps = 0.0f;
+  float yawRateSetpointDps = 0.0f;
   bool active = false;
   uint32_t lastUpdateMs = 0;
 };
@@ -306,10 +431,28 @@ struct PiAutonomyState {
   uint8_t status = 0;
 };
 
+struct BaroState {
+  bool ready = false;
+  bool valid = false;
+  float groundPressurePa = 0.0f;
+  float pressurePa = 0.0f;
+  float temperatureC = 0.0f;
+  float relativeAltM = 0.0f;
+  float emaRelativeAltM = 0.0f;
+  uint32_t lastReadMs = 0;
+  uint32_t lastUpdateMs = 0;
+  uint32_t readCount = 0;
+  uint32_t readFailCount = 0;
+  uint32_t lastReadDurationUs = 0;
+  uint32_t maxReadDurationUs = 0;
+  uint8_t lastFailReason = BARO_FAIL_NONE;
+};
+
 struct BatteryState {
   bool enabled = false;
   float volts = 0.0f;
   float emaVolts = 0.0f;
+  uint8_t percent = 0xFF;
   uint32_t lastSampleMs = 0;
   bool low = false;
 };
@@ -370,6 +513,7 @@ struct BenchState {
   TofState tof;
   GpsState gps;
   PiAutonomyState pi;
+  BaroState baro;
   BatteryState battery;
   AltitudeState altitude;
   AutonomyState autonomy;
@@ -428,6 +572,7 @@ RF24 gCtrlRadio(PIN_CTRL_CE, PIN_CTRL_CSN, RADIO_SPI_HZ);
 RF24 gTelmRadio(PIN_TELM_CE, PIN_TELM_CSN, RADIO_SPI_HZ);
 #endif
 FcuIcm20948 gImu;
+Adafruit_BMP280 gBmp;
 VL53L1X gTof(&Wire, -1);
 HardwareSerial gGpsSerial(1);
 HardwareSerial gPiSerial(2);
@@ -449,6 +594,10 @@ AltitudeController gAltCtrl;
 AutoTakeoff gAutoTakeoff;
 AutonomyUart gPiAutonomy;
 FailsafeManager gFailsafe;
+#if ENABLE_DYNAMIC_NOTCH
+DynamicNotchFilter gDynamicNotch;
+uint32_t gLastDynamicNotchLogMs = 0;
+#endif
 
 // -----------------------------
 // FreeRTOS synchronization + tasks
@@ -717,19 +866,19 @@ bool initSingleEsc(uint8_t index, int expectedGpio, esc::EasyEscMotor& motor, bo
 }
 
 bool initEsc() {
-  Serial.printf("[ESC] explicit per-motor attach gpio0=%d gpio1=%d gpio2=%d gpio3=%d\n",
+  Serial.printf("[ESC] explicit per-motor attach M1=%d M2=%d M3=%d M4=%d\n",
                 MOTOR0_GPIO,
                 MOTOR1_GPIO,
                 MOTOR2_GPIO,
                 MOTOR3_GPIO);
 
-  const bool ready0 = initSingleEsc(0, MOTOR0_GPIO, gMotor0, gState.motor0Ready);
-  const bool ready1 = initSingleEsc(1, MOTOR1_GPIO, gMotor1, gState.motor1Ready);
-  const bool ready2 = initSingleEsc(2, MOTOR2_GPIO, gMotor2, gState.motor2Ready);
-  const bool ready3 = initSingleEsc(3, MOTOR3_GPIO, gMotor3, gState.motor3Ready);
+  const bool ready0 = initSingleEsc(1, MOTOR0_GPIO, gMotor0, gState.motor0Ready);
+  const bool ready1 = initSingleEsc(2, MOTOR1_GPIO, gMotor1, gState.motor1Ready);
+  const bool ready2 = initSingleEsc(3, MOTOR2_GPIO, gMotor2, gState.motor2Ready);
+  const bool ready3 = initSingleEsc(4, MOTOR3_GPIO, gMotor3, gState.motor3Ready);
   const bool allReady = ready0 && ready1 && ready2 && ready3;
 
-  Serial.printf("[ESC] attached motors pins 0=%d 1=%d 2=%d 3=%d ready=%u/%u/%u/%u\n",
+  Serial.printf("[ESC] attached motors pins M1=%d M2=%d M3=%d M4=%d ready=%u/%u/%u/%u\n",
                 static_cast<int>(gMotor0.pin()),
                 static_cast<int>(gMotor1.pin()),
                 static_cast<int>(gMotor2.pin()),
@@ -748,6 +897,28 @@ bool initEsc() {
   return allReady;
 }
 
+float selectImuAxis(int axis, float x, float y, float z) {
+  switch (axis) {
+    case 0: return x;
+    case 1: return y;
+    case 2: return z;
+    default: return 0.0f;
+  }
+}
+
+const char* imuAxisName(int axis) {
+  switch (axis) {
+    case 0: return "X";
+    case 1: return "Y";
+    case 2: return "Z";
+    default: return "?";
+  }
+}
+
+char imuSignChar(float sign) {
+  return sign < 0.0f ? '-' : '+';
+}
+
 bool readImuSample(ImuSample& out) {
   sensors_event_t accel;
   sensors_event_t gyro;
@@ -756,12 +927,22 @@ bool readImuSample(ImuSample& out) {
     return false;
   }
   static constexpr float RAD_TO_DEG_F = 57.295779513082320876f;
-  out.ax_g = accel.acceleration.x / SENSORS_GRAVITY_EARTH;
-  out.ay_g = accel.acceleration.y / SENSORS_GRAVITY_EARTH;
-  out.az_g = accel.acceleration.z / SENSORS_GRAVITY_EARTH;
-  out.gx_dps = gyro.gyro.x * RAD_TO_DEG_F;
-  out.gy_dps = gyro.gyro.y * RAD_TO_DEG_F;
-  out.gz_dps = gyro.gyro.z * RAD_TO_DEG_F;
+
+  const float rawAxG = accel.acceleration.x / SENSORS_GRAVITY_EARTH;
+  const float rawAyG = accel.acceleration.y / SENSORS_GRAVITY_EARTH;
+  const float rawAzG = accel.acceleration.z / SENSORS_GRAVITY_EARTH;
+  const float rawGxDps = gyro.gyro.x * RAD_TO_DEG_F;
+  const float rawGyDps = gyro.gyro.y * RAD_TO_DEG_F;
+  const float rawGzDps = gyro.gyro.z * RAD_TO_DEG_F;
+
+  // Convert the IMU package axes into FCU body axes. This keeps the attitude
+  // filter and mixer conventions stable even if the board is mounted rotated.
+  out.ax_g = IMU_BODY_X_SIGN * selectImuAxis(IMU_BODY_X_AXIS, rawAxG, rawAyG, rawAzG);
+  out.ay_g = IMU_BODY_Y_SIGN * selectImuAxis(IMU_BODY_Y_AXIS, rawAxG, rawAyG, rawAzG);
+  out.az_g = IMU_BODY_Z_SIGN * selectImuAxis(IMU_BODY_Z_AXIS, rawAxG, rawAyG, rawAzG);
+  out.gx_dps = IMU_BODY_X_SIGN * selectImuAxis(IMU_BODY_X_AXIS, rawGxDps, rawGyDps, rawGzDps);
+  out.gy_dps = IMU_BODY_Y_SIGN * selectImuAxis(IMU_BODY_Y_AXIS, rawGxDps, rawGyDps, rawGzDps);
+  out.gz_dps = IMU_BODY_Z_SIGN * selectImuAxis(IMU_BODY_Z_AXIS, rawGxDps, rawGyDps, rawGzDps);
   return true;
 }
 
@@ -822,10 +1003,18 @@ void configurePidAxis(FcuPidController& pid, int16_t kpMilli, int16_t kiMilli, i
   pid.configure(config);
 }
 
+float safeAngleGainFromMilli(int16_t gainMilli) {
+  const int16_t safeGain = constrain(gainMilli, static_cast<int16_t>(0), MAX_ANGLE_KP_MILLI);
+  return gainFromMilli(safeGain);
+}
+
 void configurePidFromPacket(const control_protocol::ControlPacket& packet) {
   configurePidAxis(gState.pid.roll, packet.rateRollPMilli, packet.rateRollIMilli, packet.rateRollDMilli);
   configurePidAxis(gState.pid.pitch, packet.ratePitchPMilli, packet.ratePitchIMilli, packet.ratePitchDMilli);
   configurePidAxis(gState.pid.yaw, packet.rateYawPMilli, packet.rateYawIMilli, packet.rateYawDMilli);
+  gState.pid.angleRollGain = safeAngleGainFromMilli(packet.angleRollPMilli);
+  gState.pid.anglePitchGain = safeAngleGainFromMilli(packet.anglePitchPMilli);
+  gState.pid.angleYawGain = safeAngleGainFromMilli(packet.angleYawPMilli);
 }
 
 void loadDefaultControlPacket(control_protocol::ControlPacket& packet) {
@@ -839,6 +1028,9 @@ void loadDefaultControlPacket(control_protocol::ControlPacket& packet) {
   packet.rateYawPMilli = DEFAULT_RATE_YAW_P_MILLI;
   packet.rateYawIMilli = DEFAULT_RATE_YAW_I_MILLI;
   packet.rateYawDMilli = DEFAULT_RATE_YAW_D_MILLI;
+  packet.angleRollPMilli = DEFAULT_ANGLE_ROLL_P_MILLI;
+  packet.anglePitchPMilli = DEFAULT_ANGLE_PITCH_P_MILLI;
+  packet.angleYawPMilli = DEFAULT_ANGLE_YAW_P_MILLI;
 }
 
 bool initImu(uint32_t& usedHz, ImuSample& sample, bool& sampleValid) {
@@ -880,6 +1072,13 @@ bool initImu(uint32_t& usedHz, ImuSample& sample, bool& sampleValid) {
   Serial.printf("[IMU] ready SPI=%lu sample=%u\n",
                 static_cast<unsigned long>(usedHz),
                 static_cast<unsigned>(sampleValid));
+  Serial.printf("[IMU] body map X=%c%s Y=%c%s Z=%c%s\n",
+                imuSignChar(IMU_BODY_X_SIGN),
+                imuAxisName(IMU_BODY_X_AXIS),
+                imuSignChar(IMU_BODY_Y_SIGN),
+                imuAxisName(IMU_BODY_Y_AXIS),
+                imuSignChar(IMU_BODY_Z_SIGN),
+                imuAxisName(IMU_BODY_Z_AXIS));
   if (sampleValid) {
     Serial.printf("[IMU] sample ax/ay/az=%.3f/%.3f/%.3f g gx/gy/gz=%.2f/%.2f/%.2f dps\n",
                   sample.ax_g, sample.ay_g, sample.az_g,
@@ -889,11 +1088,18 @@ bool initImu(uint32_t& usedHz, ImuSample& sample, bool& sampleValid) {
 }
 
 bool initI2c() {
-  if (!Wire.begin(PIN_BMP_SDA, PIN_BMP_SCL, 400000U)) {
+  pinMode(PIN_BMP_SDA, INPUT_PULLUP);
+  pinMode(PIN_BMP_SCL, INPUT_PULLUP);
+  Wire.setTimeOut(I2C_TIMEOUT_MS);
+  if (!Wire.begin(PIN_BMP_SDA, PIN_BMP_SCL, I2C_HZ)) {
     Serial.printf("[I2C] begin failed SDA=%d SCL=%d\n", PIN_BMP_SDA, PIN_BMP_SCL);
     return false;
   }
-  Serial.printf("[I2C] ready SDA=%d SCL=%d\n", PIN_BMP_SDA, PIN_BMP_SCL);
+  Serial.printf("[I2C] ready SDA=%d SCL=%d hz=%lu timeout=%ums\n",
+                PIN_BMP_SDA,
+                PIN_BMP_SCL,
+                static_cast<unsigned long>(I2C_HZ),
+                static_cast<unsigned>(I2C_TIMEOUT_MS));
   return true;
 }
 
@@ -935,6 +1141,113 @@ bool i2cReadReg16(uint8_t addr, uint16_t reg, uint16_t& value) {
   return true;
 }
 
+bool bmpReadReg16Le(uint8_t addr, uint8_t reg, uint16_t& value) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0U) {
+    return false;
+  }
+
+  const size_t got = Wire.requestFrom(static_cast<uint8_t>(addr), static_cast<size_t>(2), true);
+  if (got != 2U || Wire.available() < 2) {
+    return false;
+  }
+
+  const uint8_t lsb = static_cast<uint8_t>(Wire.read());
+  const uint8_t msb = static_cast<uint8_t>(Wire.read());
+  value = static_cast<uint16_t>((static_cast<uint16_t>(msb) << 8) | lsb);
+  return true;
+}
+
+bool bmpReadReg24(uint8_t addr, uint8_t reg, uint32_t& value) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0U) {
+    return false;
+  }
+
+  const size_t got = Wire.requestFrom(static_cast<uint8_t>(addr), static_cast<size_t>(3), true);
+  if (got != 3U || Wire.available() < 3) {
+    return false;
+  }
+
+  const uint8_t msb = static_cast<uint8_t>(Wire.read());
+  const uint8_t lsb = static_cast<uint8_t>(Wire.read());
+  const uint8_t xlsb = static_cast<uint8_t>(Wire.read());
+  value = (static_cast<uint32_t>(msb) << 16) |
+          (static_cast<uint32_t>(lsb) << 8) |
+          static_cast<uint32_t>(xlsb);
+  return true;
+}
+
+const char* baroFailReasonName(uint8_t reason) {
+  switch (reason) {
+    case BARO_FAIL_NONE:
+      return "none";
+    case BARO_FAIL_PRESSURE:
+      return "pressure";
+    case BARO_FAIL_TEMPERATURE:
+      return "temp";
+    case BARO_FAIL_REFERENCE:
+      return "reference";
+    case BARO_FAIL_ALTITUDE:
+      return "altitude";
+    default:
+      return "unknown";
+  }
+}
+
+void noteBmpPollResult(uint32_t startUs, bool ok, uint8_t failReason) {
+  const uint32_t elapsedUs = micros() - startUs;
+  gState.baro.readCount++;
+  gState.baro.lastReadDurationUs = elapsedUs;
+  if (elapsedUs > gState.baro.maxReadDurationUs) {
+    gState.baro.maxReadDurationUs = elapsedUs;
+  }
+  if (ok) {
+    gState.baro.lastFailReason = BARO_FAIL_NONE;
+  } else {
+    gState.baro.readFailCount++;
+    gState.baro.lastFailReason = failReason;
+  }
+}
+
+void logBmpRawDiagnostics(uint8_t addr, const char* context) {
+  uint8_t status = 0;
+  uint8_t ctrl = 0;
+  uint8_t config = 0;
+  uint16_t digT1 = 0;
+  uint16_t digP1 = 0;
+  uint32_t rawPressure = 0;
+  uint32_t rawTemp = 0;
+
+  const bool statusOk = bmpReadReg8(addr, BMP_REG_STATUS, status);
+  const bool ctrlOk = bmpReadReg8(addr, BMP_REG_CTRL_MEAS, ctrl);
+  const bool configOk = bmpReadReg8(addr, BMP_REG_CONFIG, config);
+  const bool digT1Ok = bmpReadReg16Le(addr, BMP_REG_DIG_T1, digT1);
+  const bool digP1Ok = bmpReadReg16Le(addr, BMP_REG_DIG_P1, digP1);
+  const bool rawPressureOk = bmpReadReg24(addr, BMP_REG_PRESSURE_MSB, rawPressure);
+  const bool rawTempOk = bmpReadReg24(addr, BMP_REG_TEMP_MSB, rawTemp);
+
+  Serial.printf("[BMP][diag] %s addr=0x%02X status=%s0x%02X ctrl=%s0x%02X cfg=%s0x%02X digT1=%s%u digP1=%s%u rawP=%s0x%06lX rawT=%s0x%06lX\n",
+                context,
+                static_cast<unsigned>(addr),
+                statusOk ? "" : "!",
+                static_cast<unsigned>(status),
+                ctrlOk ? "" : "!",
+                static_cast<unsigned>(ctrl),
+                configOk ? "" : "!",
+                static_cast<unsigned>(config),
+                digT1Ok ? "" : "!",
+                static_cast<unsigned>(digT1),
+                digP1Ok ? "" : "!",
+                static_cast<unsigned>(digP1),
+                rawPressureOk ? "" : "!",
+                static_cast<unsigned long>(rawPressure),
+                rawTempOk ? "" : "!",
+                static_cast<unsigned long>(rawTemp));
+}
+
 bool initBmp(uint8_t& chipId, uint8_t& addrOut) {
   chipId = 0;
   addrOut = 0;
@@ -946,7 +1259,11 @@ bool initBmp(uint8_t& chipId, uint8_t& addrOut) {
   }
 
   if (addrOut == 0U) {
-    Serial.println("[BMP] not found");
+    Serial.printf("[BMP] not found at 0x%02X/0x%02X on SDA=%d SCL=%d\n",
+                  static_cast<unsigned>(BMP_ADDR_PRIMARY),
+                  static_cast<unsigned>(BMP_ADDR_ALT),
+                  PIN_BMP_SDA,
+                  PIN_BMP_SCL);
     return false;
   }
   if (chipId != BMP_CHIP_ID && chipId != BME_CHIP_ID) {
@@ -955,11 +1272,114 @@ bool initBmp(uint8_t& chipId, uint8_t& addrOut) {
                   static_cast<unsigned>(addrOut));
     return false;
   }
-
-  Serial.printf("[BMP] ready addr=0x%02X chip=0x%02X\n",
+  Serial.printf("[BMP] found addr=0x%02X chip=0x%02X expected_addr=%s\n",
                 static_cast<unsigned>(addrOut),
-                static_cast<unsigned>(chipId));
+                static_cast<unsigned>(chipId),
+                (addrOut == BMP_ADDR_PRIMARY) ? "0x76(SDO=GND)" : "0x77(SDO=VDD)");
+
+  if (!gBmp.begin(addrOut, chipId)) {
+    Serial.printf("[BMP] Adafruit driver begin failed at 0x%02X\n",
+                  static_cast<unsigned>(addrOut));
+    logBmpRawDiagnostics(addrOut, "begin_fail");
+    return false;
+  }
+
+  gBmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                   Adafruit_BMP280::SAMPLING_X2,
+                   Adafruit_BMP280::SAMPLING_X16,
+                   Adafruit_BMP280::FILTER_X16,
+                   Adafruit_BMP280::STANDBY_MS_1);
+  delay(150);
+  logBmpRawDiagnostics(addrOut, "after_begin");
+
+  float pressureSumPa = 0.0f;
+  uint8_t pressureSamples = 0;
+  float lastPressurePa = NAN;
+  for (uint8_t i = 0; i < 8; ++i) {
+    const float p = gBmp.readPressure();
+    lastPressurePa = p;
+    if (isfinite(p) && p >= 30000.0f && p <= 120000.0f) {
+      pressureSumPa += p;
+      pressureSamples++;
+    }
+    delay(50);
+  }
+  if (pressureSamples == 0U) {
+    Serial.printf("[BMP] pressure baseline read failed addr=0x%02X last=%.1fPa\n",
+                  static_cast<unsigned>(addrOut),
+                  lastPressurePa);
+    logBmpRawDiagnostics(addrOut, "baseline_fail");
+    return false;
+  }
+
+  gState.baro.ready = true;
+  gState.baro.groundPressurePa = pressureSumPa / static_cast<float>(pressureSamples);
+  gState.baro.pressurePa = gState.baro.groundPressurePa;
+  gState.baro.temperatureC = gBmp.readTemperature();
+  gState.baro.relativeAltM = 0.0f;
+  gState.baro.emaRelativeAltM = 0.0f;
+  gState.baro.valid = isfinite(gState.baro.temperatureC);
+  gState.baro.lastUpdateMs = gState.baro.valid ? millis() : 0U;
+  gState.baro.readCount = pressureSamples;
+  gState.baro.readFailCount = 0;
+  gState.baro.lastReadDurationUs = 0;
+  gState.baro.maxReadDurationUs = 0;
+  gState.baro.lastFailReason = gState.baro.valid ? BARO_FAIL_NONE : BARO_FAIL_TEMPERATURE;
+
+  Serial.printf("[BMP] ready addr=0x%02X chip=0x%02X ground=%.1fPa temp=%.2fC valid=%u\n",
+                static_cast<unsigned>(addrOut),
+                static_cast<unsigned>(chipId),
+                gState.baro.groundPressurePa,
+                gState.baro.temperatureC,
+                static_cast<unsigned>(gState.baro.valid));
   return true;
+}
+
+void pollBmp(uint32_t nowMs) {
+  const bool firstSample = gState.baro.lastReadMs == 0U;
+  if (!gState.baro.ready || (!firstSample && nowMs - gState.baro.lastReadMs < BMP_READ_PERIOD_MS)) {
+    return;
+  }
+  gState.baro.lastReadMs = nowMs;
+  const uint32_t startUs = micros();
+
+  const float pressurePa = gBmp.readPressure();
+  const float temperatureC = gBmp.readTemperature();
+  if (!isfinite(pressurePa) || pressurePa < 30000.0f || pressurePa > 120000.0f) {
+    gState.baro.valid = false;
+    noteBmpPollResult(startUs, false, BARO_FAIL_PRESSURE);
+    return;
+  }
+  if (!isfinite(temperatureC) || temperatureC < -40.0f || temperatureC > 85.0f) {
+    gState.baro.valid = false;
+    noteBmpPollResult(startUs, false, BARO_FAIL_TEMPERATURE);
+    return;
+  }
+  if (gState.baro.groundPressurePa < 30000.0f || gState.baro.groundPressurePa > 120000.0f) {
+    gState.baro.valid = false;
+    noteBmpPollResult(startUs, false, BARO_FAIL_REFERENCE);
+    return;
+  }
+
+  const float relativeAltM =
+      44330.0f * (1.0f - powf(pressurePa / gState.baro.groundPressurePa, 0.19029495f));
+  if (!isfinite(relativeAltM) || fabsf(relativeAltM) > 1000.0f) {
+    gState.baro.valid = false;
+    noteBmpPollResult(startUs, false, BARO_FAIL_ALTITUDE);
+    return;
+  }
+
+  if (firstSample) {
+    gState.baro.emaRelativeAltM = relativeAltM;
+  } else {
+    gState.baro.emaRelativeAltM = 0.20f * relativeAltM + 0.80f * gState.baro.emaRelativeAltM;
+  }
+  gState.baro.pressurePa = pressurePa;
+  gState.baro.temperatureC = temperatureC;
+  gState.baro.relativeAltM = gState.baro.emaRelativeAltM;
+  gState.baro.lastUpdateMs = nowMs;
+  gState.baro.valid = true;
+  noteBmpPollResult(startUs, true, BARO_FAIL_NONE);
 }
 
 bool initTof() {
@@ -1181,27 +1601,74 @@ void pollPiAutonomy(uint32_t nowMs) {
 #endif
 }
 
+uint8_t estimateBatteryPercent4s(float packVolts) {
+  struct CurvePoint {
+    float cellVolts;
+    uint8_t percent;
+  };
+  static constexpr CurvePoint kCurve[] = {
+      {3.50f, 0},
+      {3.60f, 20},
+      {3.70f, 35},
+      {3.80f, 50},
+      {3.90f, 65},
+      {4.00f, 80},
+      {4.10f, 90},
+      {4.20f, 100},
+  };
+
+  if (!isfinite(packVolts) || packVolts <= 1.0f) {
+    return 0xFF;
+  }
+
+  const float cellVolts = packVolts / 4.0f;
+  if (cellVolts <= kCurve[0].cellVolts) {
+    return 0;
+  }
+  const size_t last = (sizeof(kCurve) / sizeof(kCurve[0])) - 1U;
+  if (cellVolts >= kCurve[last].cellVolts) {
+    return 100;
+  }
+
+  for (size_t i = 1; i <= last; ++i) {
+    if (cellVolts <= kCurve[i].cellVolts) {
+      const CurvePoint& lo = kCurve[i - 1U];
+      const CurvePoint& hi = kCurve[i];
+      const float span = hi.cellVolts - lo.cellVolts;
+      const float t = (span > 0.0f) ? ((cellVolts - lo.cellVolts) / span) : 0.0f;
+      const int pct = static_cast<int>(lroundf(lo.percent + t * (hi.percent - lo.percent)));
+      return static_cast<uint8_t>(constrain(pct, 0, 100));
+    }
+  }
+  return 0xFF;
+}
+
 void pollBattery(uint32_t nowMs) {
   if (PIN_BATT_ADC < 0) {
     return;
   }
-  // Sample at 10Hz max; cheap analog read.
-  if (gState.battery.lastSampleMs != 0 && (nowMs - gState.battery.lastSampleMs) < 100U) {
+  const bool firstSample = gState.battery.lastSampleMs == 0U;
+  if (!firstSample && (nowMs - gState.battery.lastSampleMs) < BATT_READ_PERIOD_MS) {
     return;
   }
   gState.battery.lastSampleMs = nowMs;
 
-  const int raw = analogRead(PIN_BATT_ADC);
-  // ESP32-S3 ADC: 12-bit default, but be defensive.
-  const float adcVolts = (static_cast<float>(raw) / 4095.0f) * 3.3f;
+  uint32_t rawSum = 0;
+  for (uint8_t i = 0; i < BATT_OVERSAMPLE_COUNT; ++i) {
+    rawSum += static_cast<uint32_t>(analogRead(PIN_BATT_ADC));
+    delayMicroseconds(150);
+  }
+  const float rawAvg = static_cast<float>(rawSum) / static_cast<float>(BATT_OVERSAMPLE_COUNT);
+  const float adcVolts = (rawAvg / 4095.0f) * 3.3f;
   const float packVolts = adcVolts * BATT_DIVIDER_GAIN;
 
-  if (gState.battery.emaVolts <= 0.01f) {
+  if (firstSample || gState.battery.emaVolts <= 0.01f) {
     gState.battery.emaVolts = packVolts;
   } else {
-    gState.battery.emaVolts = 0.2f * packVolts + 0.8f * gState.battery.emaVolts;
+    gState.battery.emaVolts = BATT_EMA_ALPHA * packVolts + (1.0f - BATT_EMA_ALPHA) * gState.battery.emaVolts;
   }
   gState.battery.volts = gState.battery.emaVolts;
+  gState.battery.percent = estimateBatteryPercent4s(gState.battery.volts);
   gState.battery.enabled = true;
   gState.battery.low = gState.battery.volts < BATT_LOW_VOLTS;
 }
@@ -1316,8 +1783,9 @@ bool initTelemetryRadio(uint8_t& raw0, uint8_t& raw1, bool runDiagnostic) {
   gTelmRadio.setDataRate(RF24_1MBPS);
   gTelmRadio.setCRCLength(RF24_CRC_16);
   gTelmRadio.setAutoAck(false);
-  gTelmRadio.setRetries(CTRL_RETRY_DELAY, CTRL_RETRY_COUNT);
+  gTelmRadio.setRetries(0, 0);
   gTelmRadio.enableDynamicPayloads();
+  gTelmRadio.enableDynamicAck();
   gTelmRadio.openWritingPipe(TELM_TX_ADDRESS);
   gTelmRadio.powerUp();
   gTelmRadio.flush_tx();
@@ -1409,6 +1877,42 @@ uint16_t throttleToMotorRaw(uint8_t throttlePercent) {
                                          static_cast<int>(MOTOR_OUTPUT_MAX_RAW)));
 }
 
+uint8_t linkLossThrottlePercent(uint32_t nowMs, uint32_t startedMs, uint8_t holdPercent) {
+  if (startedMs == 0U || holdPercent == 0U) {
+    return 0;
+  }
+  const uint32_t elapsedMs = nowMs - startedMs;
+  if (elapsedMs <= LINK_LOSS_HOLD_MS) {
+    return holdPercent;
+  }
+  if (LINK_LOSS_RAMPDOWN_MS == 0U) {
+    return 0;
+  }
+  const uint32_t rampMs = elapsedMs - LINK_LOSS_HOLD_MS;
+  if (rampMs >= LINK_LOSS_RAMPDOWN_MS) {
+    return 0;
+  }
+  const float remaining = 1.0f - (static_cast<float>(rampMs) / static_cast<float>(LINK_LOSS_RAMPDOWN_MS));
+  return static_cast<uint8_t>(constrain(static_cast<int>(lroundf(holdPercent * remaining)), 0, 100));
+}
+
+#if ENABLE_DYNAMIC_NOTCH
+uint16_t maxMotorCommandForDynamicNotch() {
+  std::array<uint16_t, 4> motorSnap;
+  portENTER_CRITICAL(&gFlightMux);
+  motorSnap = gState.motorRaw;
+  portEXIT_CRITICAL(&gFlightMux);
+
+  uint16_t maxCommand = 0;
+  for (uint16_t cmd : motorSnap) {
+    if (cmd > maxCommand) {
+      maxCommand = cmd;
+    }
+  }
+  return maxCommand;
+}
+#endif
+
 int16_t floatToCenti(float value) {
   if (!isfinite(value)) {
     return 0;
@@ -1418,6 +1922,35 @@ int16_t floatToCenti(float value) {
 
 int16_t floatToCdeg(float value) {
   return floatToCenti(value);
+}
+
+bool sendTelemetryPayloadNoWait(const void* payload, uint8_t len) {
+#if !FCU_ENABLE_TELEMETRY_RADIO || FCU_PIN_TELM_CE < 0 || FCU_PIN_TELM_CSN < 0
+  (void)payload;
+  (void)len;
+  return false;
+#else
+  if (!gState.telemRadioReady) {
+    return false;
+  }
+
+  const uint32_t startUs = micros();
+  gTelmRadio.flush_tx();
+  const bool ok = gTelmRadio.startWrite(payload, len, true);
+  if (!ok) {
+    gTelmRadio.flush_tx();
+  }
+
+  const uint32_t elapsedUs = micros() - startUs;
+  static uint32_t lastWarnMs = 0;
+  if (elapsedUs > TELEMETRY_SPI_WARN_US && (millis() - lastWarnMs) > 1000U) {
+    lastWarnMs = millis();
+    Serial.printf("[RADIO][TELM] slow nonblocking send %luus ok=%u\n",
+                  static_cast<unsigned long>(elapsedUs),
+                  static_cast<unsigned>(ok));
+  }
+  return ok;
+#endif
 }
 
 uint16_t clampMotorRaw(float value) {
@@ -1439,6 +1972,9 @@ void resetPidOutputs() {
   gState.pid.rollTerms = FcuPidTerms{};
   gState.pid.pitchTerms = FcuPidTerms{};
   gState.pid.yawTerms = FcuPidTerms{};
+  gState.pid.rollRateSetpointDps = 0.0f;
+  gState.pid.pitchRateSetpointDps = 0.0f;
+  gState.pid.yawRateSetpointDps = 0.0f;
   gState.pid.active = false;
 }
 
@@ -1478,10 +2014,10 @@ void applyMotorOutputs(const std::array<uint16_t, 4>& raw) {
     return;
   }
 
-  const bool armed0 = ensureSingleEscArmed(0, gMotor0, gState.motor0Ready);
-  const bool armed1 = ensureSingleEscArmed(1, gMotor1, gState.motor1Ready);
-  const bool armed2 = ensureSingleEscArmed(2, gMotor2, gState.motor2Ready);
-  const bool armed3 = ensureSingleEscArmed(3, gMotor3, gState.motor3Ready);
+  const bool armed0 = ensureSingleEscArmed(1, gMotor0, gState.motor0Ready);
+  const bool armed1 = ensureSingleEscArmed(2, gMotor1, gState.motor1Ready);
+  const bool armed2 = ensureSingleEscArmed(3, gMotor2, gState.motor2Ready);
+  const bool armed3 = ensureSingleEscArmed(4, gMotor3, gState.motor3Ready);
   const bool ok0 = armed0 && gMotor0.spinRaw(raw[0]);
   const bool ok1 = armed1 && gMotor1.spinRaw(raw[1]);
   const bool ok2 = armed2 && gMotor2.spinRaw(raw[2]);
@@ -1547,6 +2083,8 @@ void processControlPacket(const control_protocol::ControlPacket& packet, uint32_
   gState.control.validPackets++;
   gState.control.linkActive = true;
   gState.control.failsafeActive = false;
+  gState.control.linkLossStartMs = 0;
+  gState.control.linkLossHoldThrottlePercent = 0;
   gState.control.safeBootComplete =
       control_protocol::flagIsSet(packet.flags, control_protocol::kFlagSafeBootComplete);
   portEXIT_CRITICAL(&gControlMux);
@@ -1585,7 +2123,9 @@ void pollControlRadio(uint32_t nowMs) {
     return;
   }
 
-  while (gCtrlRadio.available()) {
+  uint8_t processed = 0;
+  while (processed < CONTROL_RADIO_MAX_PACKETS_PER_WAKE && gCtrlRadio.available()) {
+    processed++;
     const uint8_t payloadSize = gCtrlRadio.getDynamicPayloadSize();
     if (payloadSize == 0 || payloadSize > 32) {
       gCtrlRadio.flush_rx();
@@ -1625,7 +2165,6 @@ void applyFailsafeIfNeeded(uint32_t nowMs) {
   } else if (nowMs - gState.control.lastPacketMs > CONTROL_FAILSAFE_TIMEOUT_MS) {
     gState.control.linkActive = false;
     gState.control.failsafeActive = true;
-    gState.control.lastPacket.throttlePercent = 0;
     justEntered = !wasFailsafe;
     isTimeout = true;
     linkActiveLocal = false;
@@ -1673,9 +2212,25 @@ void applyFailsafeIfNeeded(uint32_t nowMs) {
   gState.failsafeReason = reason;
 
   if (justEntered) {
-    forceMotorStop();
-    Serial.printf("[CTRL] failsafe entered (%s reason=%u); throttle=0\n",
-                  isTimeout ? "timeout" : "no_link", static_cast<unsigned>(reason));
+    if (reason == control_protocol::kFailsafeControlLinkTimeout) {
+      uint8_t holdThrottle = 0;
+      portENTER_CRITICAL(&gControlMux);
+      if (gState.control.linkLossStartMs == 0U) {
+        gState.control.linkLossStartMs = nowMs;
+        gState.control.linkLossHoldThrottlePercent = gState.control.appliedThrottlePercent;
+      }
+      holdThrottle = gState.control.linkLossHoldThrottlePercent;
+      portEXIT_CRITICAL(&gControlMux);
+      Serial.printf("[CTRL] link-loss grace entered (%s); hold=%u%% grace=%lums ramp=%lums\n",
+                    isTimeout ? "timeout" : "no_link",
+                    static_cast<unsigned>(holdThrottle),
+                    static_cast<unsigned long>(LINK_LOSS_HOLD_MS),
+                    static_cast<unsigned long>(LINK_LOSS_RAMPDOWN_MS));
+    } else {
+      forceMotorStop();
+      Serial.printf("[CTRL] failsafe entered (%s reason=%u); throttle=0\n",
+                    isTimeout ? "timeout" : "no_link", static_cast<unsigned>(reason));
+    }
   }
 }
 
@@ -1683,12 +2238,14 @@ void applyFailsafeIfNeeded(uint32_t nowMs) {
 // that the inner loop interprets as angle setpoints. Manual stick movement
 // always wins (handled by the manualOverride gate in updateControlLoop).
 static constexpr float kAutonomyTiltStickPct = 40.0f;  // 40% stick = ~8 deg with 20 deg cap
+static constexpr float kAutonomyYawStickPct = 35.0f;
 static constexpr float kAutonomyLandRateMps = 0.4f;    // descend at 0.4 m/s during LAND
 
 void autonomyCommandToSticks(uint8_t cmd, float& outStickX, float& outStickY,
-                              bool& outRequestLand, bool& outRequestStop) {
+                              float& outYawStick, bool& outRequestLand, bool& outRequestStop) {
   outStickX = 0.0f;
   outStickY = 0.0f;
+  outYawStick = 0.0f;
   outRequestLand = false;
   outRequestStop = false;
   switch (cmd) {
@@ -1696,11 +2253,8 @@ void autonomyCommandToSticks(uint8_t cmd, float& outStickX, float& outStickY,
     case control_protocol::kPiCmdBackward: outStickY = -kAutonomyTiltStickPct; break;
     case control_protocol::kPiCmdLeft:     outStickX = -kAutonomyTiltStickPct; break;
     case control_protocol::kPiCmdRight:    outStickX = +kAutonomyTiltStickPct; break;
-    case control_protocol::kPiCmdYawLeft:
-    case control_protocol::kPiCmdYawRight:
-      // Yaw rate isn't wired into this rev's inner loop (angle-only). TODO when
-      // a yaw-rate stick is plumbed through. For now treat as HOVER.
-      break;
+    case control_protocol::kPiCmdYawLeft:  outYawStick = -kAutonomyYawStickPct; break;
+    case control_protocol::kPiCmdYawRight: outYawStick = +kAutonomyYawStickPct; break;
     case control_protocol::kPiCmdLand: outRequestLand = true; break;
     case control_protocol::kPiCmdStop: outRequestStop = true; break;
     case control_protocol::kPiCmdHover:
@@ -1729,9 +2283,28 @@ void updateControlLoop(uint32_t nowMs) {
     gState.loopRate.lastSampleMs = nowMs;
   }
 
+#if ENABLE_DYNAMIC_NOTCH
+  const float imuSampleRateHz = (dtSeconds > 0.0f && isfinite(dtSeconds)) ? (1.0f / dtSeconds) : 0.0f;
+  gDynamicNotch.updateFromMotorCommand(imuSampleRateHz, maxMotorCommandForDynamicNotch(), nowMs);
+#if DYN_NOTCH_DEBUG
+  if (DYNAMIC_NOTCH_DEBUG_ENABLED && (nowMs - gLastDynamicNotchLogMs) >= 1000U) {
+    gLastDynamicNotchLogMs = nowMs;
+    Serial.printf("[DYN_NOTCH] active=%u bypass=%u f=%.1fHz target=%.1fHz fs=%.1fHz\n",
+                  static_cast<unsigned>(gDynamicNotch.active()),
+                  static_cast<unsigned>(gDynamicNotch.runtimeBypass()),
+                  gDynamicNotch.centerHz(),
+                  gDynamicNotch.targetHz(),
+                  gDynamicNotch.sampleRateHz());
+  }
+#endif
+#endif
+
   if (gState.imuReady) {
     ImuSample sample;
     if (readImuSample(sample)) {
+#if ENABLE_DYNAMIC_NOTCH
+      gDynamicNotch.process(sample.gx_dps, sample.gy_dps, sample.gz_dps);
+#endif
       portENTER_CRITICAL(&gFlightMux);
       gState.imuSample = sample;
       gState.imuSampleValid = true;
@@ -1747,11 +2320,16 @@ void updateControlLoop(uint32_t nowMs) {
   control_protocol::ControlPacket packet;
   bool failsafe;
   bool linkActiveSnap;
+  uint32_t linkLossStartMs;
+  uint8_t linkLossHoldThrottle;
   portENTER_CRITICAL(&gControlMux);
   packet = gState.control.lastPacket;
   failsafe = gState.control.failsafeActive;
   linkActiveSnap = gState.control.linkActive;
+  linkLossStartMs = gState.control.linkLossStartMs;
+  linkLossHoldThrottle = gState.control.linkLossHoldThrottlePercent;
   portEXIT_CRITICAL(&gControlMux);
+  const uint8_t failsafeReasonSnap = gState.failsafeReason;
 
   // Snapshot flight-task-visible state. The radio task writes these under the
   // same mux from processControlPacket(), so we must read them here too.
@@ -1759,6 +2337,7 @@ void updateControlLoop(uint32_t nowMs) {
   bool autonomyEnabledSnap;
   uint16_t altitudeTargetDmSnap;
   AttitudeSample attitudeSnap;
+  ImuSample imuSampleSnap;
   bool imuValidSnap;
   portENTER_CRITICAL(&gFlightMux);
   gState.loopRate.lastFlightTickMs = nowMs;
@@ -1766,6 +2345,7 @@ void updateControlLoop(uint32_t nowMs) {
   autonomyEnabledSnap = gState.autonomy.enabled;
   altitudeTargetDmSnap = gState.altitude.targetDm;
   attitudeSnap = gState.attitude;
+  imuSampleSnap = gState.imuSample;
   imuValidSnap = gState.imuSampleValid;
   portEXIT_CRITICAL(&gFlightMux);
 
@@ -1777,13 +2357,17 @@ void updateControlLoop(uint32_t nowMs) {
   const bool flightMode = packet.mode == 1;
   const bool flightSwitchOn = control_protocol::flagIsSet(packet.flags, control_protocol::kFlagFlightSwitchOn);
   const bool safeBoot = control_protocol::flagIsSet(packet.flags, control_protocol::kFlagSafeBootComplete);
-  const bool allowFlight = flightMode && flightSwitchOn && safeBoot && !failsafe;
+  const bool controlledLinkLoss =
+      failsafe && failsafeReasonSnap == control_protocol::kFailsafeControlLinkTimeout &&
+      linkLossStartMs != 0U && linkLossHoldThrottle > 0U;
+  const bool allowFlight = flightMode && flightSwitchOn && safeBoot && (!failsafe || controlledLinkLoss);
 
   // Manual override detection: any meaningful stick deflection or throttle input
   // overrides autonomy/auto-takeoff instantly. Use slightly hysteretic thresholds.
   const bool manualStickMoved =
-      (abs(packet.stickXPercent) > 20) || (abs(packet.stickYPercent) > 20) ||
-      (packet.throttlePercent > 5);
+      !controlledLinkLoss &&
+      ((abs(packet.stickXPercent) > 20) || (abs(packet.stickYPercent) > 20) ||
+       (packet.throttlePercent > 5));
 
 #if FCU_ENABLE_AUTO_TAKEOFF
   // Auto-takeoff state machine: independent of inner-loop period to avoid
@@ -1814,7 +2398,9 @@ void updateControlLoop(uint32_t nowMs) {
   // Compose the effective throttle: ATK overrides remote throttle when active.
   uint8_t effectiveThrottle = 0;
   bool altHoldActive = false;
-  if (allowFlight && atk.active) {
+  if (allowFlight && controlledLinkLoss) {
+    effectiveThrottle = linkLossThrottlePercent(nowMs, linkLossStartMs, linkLossHoldThrottle);
+  } else if (allowFlight && atk.active) {
     effectiveThrottle = static_cast<uint8_t>(constrain(static_cast<int>(atk.throttlePct + 0.5f), 0, 100));
     altHoldActive = (atk.state == control_protocol::kAutoTakeoffAscend ||
                      atk.state == control_protocol::kAutoTakeoffAltHold);
@@ -1857,17 +2443,20 @@ void updateControlLoop(uint32_t nowMs) {
 
   // Compose stick setpoints. Manual stick always wins; autonomy only steers
   // when enabled AND user hasn't moved sticks/throttle.
-  float effStickX = static_cast<float>(packet.stickXPercent);
-  float effStickY = static_cast<float>(packet.stickYPercent);
+  float effStickX = controlledLinkLoss ? 0.0f : static_cast<float>(packet.stickXPercent);
+  float effStickY = controlledLinkLoss ? 0.0f : static_cast<float>(packet.stickYPercent);
+  float effYawStick = 0.0f;
   bool autonomyLand = false;
   bool autonomyStop = false;
 #if FCU_ENABLE_AUTONOMY_UART
-  if (autonomyEnabledSnap && !manualStickMoved) {
+  if (!controlledLinkLoss && autonomyEnabledSnap && !manualStickMoved) {
     float aX = 0.0f;
     float aY = 0.0f;
-    autonomyCommandToSticks(gPiAutonomy.lastCommand(), aX, aY, autonomyLand, autonomyStop);
+    float aYaw = 0.0f;
+    autonomyCommandToSticks(gPiAutonomy.lastCommand(), aX, aY, aYaw, autonomyLand, autonomyStop);
     effStickX = aX;
     effStickY = aY;
+    effYawStick = aYaw;
     portENTER_CRITICAL(&gFlightMux);
     gState.autonomy.manualOverride = false;
     portEXIT_CRITICAL(&gFlightMux);
@@ -1892,17 +2481,28 @@ void updateControlLoop(uint32_t nowMs) {
     portEXIT_CRITICAL(&gControlMux);
   }
 
-  const float rollSetpoint = (effStickX / 100.0f) * MAX_ANGLE_SETPOINT_DEG;
-  const float pitchSetpoint = (effStickY / 100.0f) * MAX_ANGLE_SETPOINT_DEG;
-  const float yawSetpoint = 0.0f;
+  const float rollAngleSetpointDeg = (effStickX / 100.0f) * MAX_ANGLE_SETPOINT_DEG;
+  const float pitchAngleSetpointDeg = (effStickY / 100.0f) * MAX_ANGLE_SETPOINT_DEG;
+  const float yawRateSetpointDps =
+      constrain((effYawStick / 100.0f) * MAX_YAW_RATE_SETPOINT_DPS,
+                -MAX_YAW_RATE_SETPOINT_DPS, MAX_YAW_RATE_SETPOINT_DPS);
 
   FcuPidTerms rollT;
   FcuPidTerms pitchT;
   FcuPidTerms yawT;
   portENTER_CRITICAL(&gFlightMux);
-  rollT = gState.pid.roll.update(rollSetpoint, gState.attitude.rollDeg, dtSeconds);
-  pitchT = gState.pid.pitch.update(pitchSetpoint, gState.attitude.pitchDeg, dtSeconds);
-  yawT = gState.pid.yaw.update(yawSetpoint, gState.attitude.yawDeg, dtSeconds);
+  const float rollRateSetpointDps =
+      constrain((rollAngleSetpointDeg - attitudeSnap.rollDeg) * gState.pid.angleRollGain,
+                -MAX_ANGLE_RATE_SETPOINT_DPS, MAX_ANGLE_RATE_SETPOINT_DPS);
+  const float pitchRateSetpointDps =
+      constrain((pitchAngleSetpointDeg - attitudeSnap.pitchDeg) * gState.pid.anglePitchGain,
+                -MAX_ANGLE_RATE_SETPOINT_DPS, MAX_ANGLE_RATE_SETPOINT_DPS);
+  rollT = gState.pid.roll.update(rollRateSetpointDps, imuSampleSnap.gx_dps, dtSeconds);
+  pitchT = gState.pid.pitch.update(pitchRateSetpointDps, imuSampleSnap.gy_dps, dtSeconds);
+  yawT = gState.pid.yaw.update(yawRateSetpointDps, imuSampleSnap.gz_dps, dtSeconds);
+  gState.pid.rollRateSetpointDps = rollRateSetpointDps;
+  gState.pid.pitchRateSetpointDps = pitchRateSetpointDps;
+  gState.pid.yawRateSetpointDps = yawRateSetpointDps;
   gState.pid.rollTerms = rollT;
   gState.pid.pitchTerms = pitchT;
   gState.pid.yawTerms = yawT;
@@ -1910,16 +2510,17 @@ void updateControlLoop(uint32_t nowMs) {
   portEXIT_CRITICAL(&gFlightMux);
 
   const float base = static_cast<float>(throttleToMotorRaw(effectiveThrottle));
-  const float roll = rollT.output;
-  const float pitch = pitchT.output;
-  const float yaw = yawT.output;
+  const float roll = rollT.output * MIX_ROLL_SIGN;
+  const float pitch = pitchT.output * MIX_PITCH_SIGN;
+  const float yaw = yawT.output * MIX_YAW_SIGN;
 
-  // Quad-X mix placeholder. Verify motor order and signs against the frame before flight.
+  // Quad-X mix for verified Betaflight-style motor numbering:
+  // M1 rear-right, M2 front-right, M3 rear-left, M4 front-left.
   std::array<uint16_t, 4> mixed = {
-      clampMotorRaw(base + pitch + roll - yaw),
-      clampMotorRaw(base + pitch - roll + yaw),
-      clampMotorRaw(base - pitch - roll - yaw),
-      clampMotorRaw(base - pitch + roll + yaw),
+      clampMotorRaw(base - roll + pitch - yaw),  // M1 rear-right
+      clampMotorRaw(base - roll - pitch + yaw),  // M2 front-right
+      clampMotorRaw(base + roll + pitch + yaw),  // M3 rear-left
+      clampMotorRaw(base + roll - pitch - yaw),  // M4 front-left
   };
   applyMotorOutputs(mixed);
 }
@@ -1997,8 +2598,9 @@ void sendTelemetry(uint32_t nowMs) {
     if (gState.gps.uartReady) packet.flags |= control_protocol::kTelemetryFlagGpsUartReady;
 
 #if FCU_PIN_TELM_CE >= 0 && FCU_PIN_TELM_CSN >= 0
-    (void)gTelmRadio.write(&packet, sizeof(packet));
-    gState.telemetryPrimaryTxCount++;
+    if (sendTelemetryPayloadNoWait(&packet, sizeof(packet))) {
+      gState.telemetryPrimaryTxCount++;
+    }
 #else
     (void)packet;
 #endif
@@ -2024,6 +2626,18 @@ void sendTelemetry(uint32_t nowMs) {
                                                          -32768, 32767));
     const float tiltMag = fmaxf(fabsf(att.rollDeg), fabsf(att.pitchDeg));
     aux.tiltDeg10 = static_cast<uint8_t>(constrain(static_cast<int>(tiltMag * 10.0f + 0.5f), 0, 255));
+    aux.pressureAltCm = static_cast<int16_t>(
+        constrain(static_cast<int>(lroundf(gState.baro.relativeAltM * 100.0f)), -32768, 32767));
+    aux.batteryPercent = gState.battery.enabled ? gState.battery.percent : 0xFF;
+    if (gState.baro.valid) {
+      aux.bmpFlags |= control_protocol::kTelemetryBmpFlagValid;
+      aux.bmpPressurePa10 = static_cast<uint16_t>(
+          constrain(static_cast<int>(lroundf(gState.baro.pressurePa / 10.0f)), 0, 65535));
+      aux.bmpTempCentiC = static_cast<int16_t>(
+          constrain(static_cast<int>(lroundf(gState.baro.temperatureC * 100.0f)), -32768, 32767));
+      aux.bmpAgeMs10 = static_cast<uint16_t>(
+          constrain(static_cast<int>((nowMs - gState.baro.lastUpdateMs) / 10U), 0, 65535));
+    }
 
     if (altSnap.holdActive) aux.flags2 |= control_protocol::kTelemetry2FlagAltHoldActive;
     if (autSnap.enabled) aux.flags2 |= control_protocol::kTelemetry2FlagAutonomyEnabled;
@@ -2044,8 +2658,9 @@ void sendTelemetry(uint32_t nowMs) {
     }
 
 #if FCU_PIN_TELM_CE >= 0 && FCU_PIN_TELM_CSN >= 0
-    (void)gTelmRadio.write(&aux, sizeof(aux));
-    gState.telemetryAuxTxCount++;
+    if (sendTelemetryPayloadNoWait(&aux, sizeof(aux))) {
+      gState.telemetryAuxTxCount++;
+    }
 #else
     (void)aux;
 #endif
@@ -2153,6 +2768,7 @@ void radioTask(void* /*arg*/) {
       lastTelemMs = nowMs;
       sendTelemetry(nowMs);
     }
+    vTaskDelay(1);
   }
 }
 
@@ -2162,6 +2778,7 @@ void sensorTask(void* /*arg*/) {
   for (;;) {
     const uint32_t nowMs = millis();
     pollTof(nowMs);
+    pollBmp(nowMs);
     pollGps(nowMs);
     pollPiAutonomy(nowMs);
     pollBattery(nowMs);
@@ -2206,6 +2823,30 @@ void setup() {
   configurePidFromPacket(gState.control.lastPacket);
   initNrfStatusLeds();
 
+#if ENABLE_DYNAMIC_NOTCH
+  DynamicNotchConfig notchConfig;
+  notchConfig.minFrequencyHz = DYNAMIC_NOTCH_MIN_HZ;
+  notchConfig.maxFrequencyHz = DYNAMIC_NOTCH_MAX_HZ;
+  notchConfig.lowCommandFrequencyHz = DYNAMIC_NOTCH_LOW_CMD_HZ;
+  notchConfig.highCommandFrequencyHz = DYNAMIC_NOTCH_HIGH_CMD_HZ;
+  notchConfig.q = DYNAMIC_NOTCH_Q;
+  notchConfig.updateRateHz = DYNAMIC_NOTCH_UPDATE_HZ;
+  notchConfig.minCommand = MOTOR_OUTPUT_MIN_ACTIVE_RAW;
+  notchConfig.maxCommand = MOTOR_OUTPUT_MAX_RAW;
+  notchConfig.useSecondHarmonic = DYNAMIC_NOTCH_USE_SECOND_HARMONIC;
+  gDynamicNotch.configure(notchConfig);
+  Serial.printf("[DYN_NOTCH] enabled min=%.1f max=%.1f map=%.1f..%.1fHz q=%.1f update=%.1fHz harmonic2=%u\n",
+                DYNAMIC_NOTCH_MIN_HZ,
+                DYNAMIC_NOTCH_MAX_HZ,
+                DYNAMIC_NOTCH_LOW_CMD_HZ,
+                DYNAMIC_NOTCH_HIGH_CMD_HZ,
+                DYNAMIC_NOTCH_Q,
+                DYNAMIC_NOTCH_UPDATE_HZ,
+                static_cast<unsigned>(DYNAMIC_NOTCH_USE_SECOND_HARMONIC));
+#else
+  Serial.println("[DYN_NOTCH] disabled (define ENABLE_DYNAMIC_NOTCH=1 to enable)");
+#endif
+
   // Keep chip-select lines deasserted before bus init.
   prepareRadioChipSelects();
   pinMode(PIN_IMU_CS, OUTPUT);
@@ -2242,6 +2883,15 @@ void setup() {
   if (PIN_BATT_ADC >= 0) {
     pinMode(PIN_BATT_ADC, INPUT);
     analogReadResolution(12);
+    analogSetPinAttenuation(PIN_BATT_ADC, ADC_11db);
+    Serial.printf("[BATT] adc gpio=%d gain=%.5f low=%.1fV samples=%u period=%lums\n",
+                  PIN_BATT_ADC,
+                  BATT_DIVIDER_GAIN,
+                  BATT_LOW_VOLTS,
+                  static_cast<unsigned>(BATT_OVERSAMPLE_COUNT),
+                  static_cast<unsigned long>(BATT_READ_PERIOD_MS));
+  } else {
+    Serial.println("[BATT] ADC disabled; set FCU_PIN_BATT_ADC to the divider GPIO");
   }
   // Bit-bang both nRFs once, before any SPI peripheral init touches the bus pins.
   runRadioBitBangDiagnostics();
@@ -2321,7 +2971,18 @@ void loop() {
     pidYaw = gState.pid.yawTerms.output;
     portEXIT_CRITICAL(&gFlightMux);
 
-    Serial.printf("[FCU] ctrl=%u telem=%u tx_pri=%lu tx_aux=%lu esc_hold=%u link=%u failsafe=%u rx_pkts=%lu thr=%u m=%u/%u/%u/%u att=%.1f/%.1f/%.1f tof=%u gps_fix=%u sat=%u pid=%.1f/%.1f/%.1f\n",
+    char battText[18] = "OFF";
+    if (gState.battery.enabled) {
+      if (gState.battery.percent <= 100U) {
+        snprintf(battText, sizeof(battText), "%.2fV/%u%%",
+                 gState.battery.volts,
+                 static_cast<unsigned>(gState.battery.percent));
+      } else {
+        snprintf(battText, sizeof(battText), "%.2fV/--%%", gState.battery.volts);
+      }
+    }
+
+    Serial.printf("[FCU] ctrl=%u telem=%u tx_pri=%lu tx_aux=%lu esc_hold=%u link=%u failsafe=%u rx_pkts=%lu thr=%u m1/2/3/4=%u/%u/%u/%u batt=%s att=%.1f/%.1f/%.1f tof=%u gps_fix=%u sat=%u pid=%.1f/%.1f/%.1f\n",
                   static_cast<unsigned>(gState.ctrlRadioReady),
                   static_cast<unsigned>(gState.telemRadioReady),
                   static_cast<unsigned long>(gState.telemetryPrimaryTxCount),
@@ -2335,6 +2996,7 @@ void loop() {
                   static_cast<unsigned>(motorSnap[1]),
                   static_cast<unsigned>(motorSnap[2]),
                   static_cast<unsigned>(motorSnap[3]),
+                  battText,
                   attSnap.pitchDeg, attSnap.rollDeg, attSnap.yawDeg,
                   static_cast<unsigned>(gState.tof.distanceMm),
                   static_cast<unsigned>(gState.gps.hasFix),
@@ -2357,6 +3019,22 @@ void loop() {
                   static_cast<unsigned>(sensorHw),
                   static_cast<unsigned>(loopHw),
                   static_cast<unsigned>(ESP.getFreeHeap()));
+    const uint32_t bmpAgeMs = (gState.baro.valid && gState.baro.lastUpdateMs != 0U)
+        ? (nowMs - gState.baro.lastUpdateMs)
+        : 0xFFFFFFFFU;
+    Serial.printf("[BMP] ready=%u valid=%u alt=%.2fm pressure=%.1fPa temp=%.2fC age=%s%lu reads=%lu fails=%lu fail=%s last_us=%lu max_us=%lu\n",
+                  static_cast<unsigned>(gState.baro.ready),
+                  static_cast<unsigned>(gState.baro.valid),
+                  gState.baro.relativeAltM,
+                  gState.baro.pressurePa,
+                  gState.baro.temperatureC,
+                  bmpAgeMs == 0xFFFFFFFFU ? ">" : "",
+                  static_cast<unsigned long>(bmpAgeMs == 0xFFFFFFFFU ? 9999UL : bmpAgeMs),
+                  static_cast<unsigned long>(gState.baro.readCount),
+                  static_cast<unsigned long>(gState.baro.readFailCount),
+                  baroFailReasonName(gState.baro.lastFailReason),
+                  static_cast<unsigned long>(gState.baro.lastReadDurationUs),
+                  static_cast<unsigned long>(gState.baro.maxReadDurationUs));
   }
 
   vTaskDelay(pdMS_TO_TICKS(50));

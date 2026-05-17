@@ -87,13 +87,16 @@ SPI host. Subsequent retries are cheap: HW SPI status read + `RF24::begin()`.
 - **Attitude estimation**: complementary filter, gyro-dominant short-term
   (rejects motor-vibration noise on accelerometer), accel-correcting
   long-term. `τ = 0.5 s`. Runs at 250 Hz.
-- **Inner loop**: 250 Hz PID per axis with anti-windup-clamped integrator and
-  output limits (`PID_OUTPUT_LIMIT_RAW`).
-- **Mixer**: quad-X placeholder. Verify motor order and signs against your
-  frame before flight.
-- **Failsafe**: 350 ms control-packet timeout → throttle = 0, motors stopped,
-  PID reset. Edge-detected so motors are explicitly stopped on the *transition*
-  into failsafe (no log spam while held in failsafe).
+- **Inner loop**: 250 Hz cascaded control. Roll/pitch use angle P to generate
+  gyro-rate targets, then rate PID drives the mixer. Yaw uses rate PID damping
+  because the current remote packet has no manual yaw axis.
+- **Mixer**: quad-X using verified motor-number order M1 rear-right,
+  M2 front-right, M3 rear-left, M4 front-left. Mix signs can be flipped with
+  `FCU_MIX_ROLL_SIGN`, `FCU_MIX_PITCH_SIGN`, and `FCU_MIX_YAW_SIGN`.
+- **Failsafe**: 350 ms control-packet timeout enters link-loss grace. The FCU
+  holds the last applied throttle for `FCU_LINK_LOSS_HOLD_MS`, commands level
+  attitude, then ramps throttle to zero over `FCU_LINK_LOSS_RAMPDOWN_MS`.
+  Non-link failsafes still stop motors immediately.
 - **PID gain hot-reload**: control packets carry the full gain table per axis.
   Gains are clamped on receipt (`P ≤ 5.0`, `I ≤ 3.0`, `D ≤ 1.0`) to keep a
   malformed packet from destabilizing the loop.
@@ -169,7 +172,8 @@ high-water shows headroom, bump it if it's getting close to zero.
 
 - Yaw is integrated from the gyro only; expect drift. Magnetometer fusion
   (ICM-20948 has one) is not yet wired up.
-- Quad-X mix has not been verified against the physical frame.
+- Quad-X motor positions follow the verified M1/M2/M3/M4 frame numbering, but
+  first hover tests should still confirm pitch/roll/yaw correction signs.
 - Telemetry radio is disabled in the default build (`FCU_ENABLE_TELEMETRY_RADIO=0`).
 - VL53L1X ToF is optional; the firmware logs "not found" and continues if
   the sensor isn't present on the I²C bus.

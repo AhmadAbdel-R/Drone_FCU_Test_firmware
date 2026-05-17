@@ -36,6 +36,7 @@ constexpr uint8_t kTelemetry2FlagBatteryLow = 0x10;
 constexpr uint8_t kTelemetry2FlagTiltUnsafe = 0x20;
 constexpr uint8_t kTelemetry2FlagPiCmdValid = 0x40;
 constexpr uint8_t kTelemetry2FlagAbortRequested = 0x80;
+constexpr uint8_t kTelemetryBmpFlagValid = 0x01;
 
 // ---------- Auto-takeoff state enum (in TelemetryAuxPacket.autoTakeoffState) ----------
 constexpr uint8_t kAutoTakeoffIdle = 0;
@@ -151,7 +152,13 @@ struct __attribute__((packed)) TelemetryAuxPacket {
   int16_t altErrorMm = 0;           // target - measured, mm
   int16_t altPidOutMilli = 0;       // altitude controller output (milli, signed)
   uint8_t tiltDeg10 = 0;            // current tilt magnitude (deg * 10)
-  uint8_t reserved[14] = {};
+  int16_t pressureAltCm = 0;        // barometric altitude (cm) relative to boot ground
+  uint8_t batteryPercent = 0xFF;    // estimated pack remaining (0..100, 0xFF = unknown)
+  uint16_t bmpPressurePa10 = 0;     // pressure in 10 Pa units
+  int16_t bmpTempCentiC = 0;        // BMP temperature in centi-deg C
+  uint8_t bmpFlags = 0;             // kTelemetryBmpFlag*
+  uint16_t bmpAgeMs10 = 0xFFFF;     // age of last valid BMP sample, 10ms units
+  uint8_t reserved[4] = {};
 };
 
 static_assert(sizeof(TelemetryAuxPacket) <= 32, "TelemetryAuxPacket exceeds NRF24 payload size");

@@ -1,0 +1,27 @@
+Motor FFT Report
+================
+Source           : sweep_all4_20260516_180656.csv
+Samples          : 4999
+Sample rate (est): 1000.0 Hz
+Motor tested     : 255 @ DShot 1100
+
+gyro_x top peaks:
+    126.8 Hz   mag       1370.2
+    129.6 Hz   mag        359.4
+
+gyro_y top peaks:
+    129.6 Hz   mag       2519.9
+    126.8 Hz   mag       2272.0
+     17.4 Hz   mag        260.3
+
+gyro_z top peaks:
+    129.6 Hz   mag        941.8
+    126.8 Hz   mag        266.3
+    276.3 Hz   mag        181.6
+    253.7 Hz   mag        140.0
+     17.4 Hz   mag        117.6
+
+Suggested notch filter centres (Hz):
+  17.4
+  126.8
+  276.3

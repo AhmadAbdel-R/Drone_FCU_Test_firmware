@@ -1,0 +1,161 @@
+# This GitHub Actions workflow is designed to ensure code quality and
+# successful compilation for an ESP32 Arduino library.
+# It runs on every push to any branch.
+
+name: ESP32 Build & Quality Check
+
+# Set permissions for the GitHub token.
+# 'contents: read' is required to checkout the repository.
+permissions:
+  contents: read
+
+# Define the trigger for the workflow.
+# It runs on any push to any branch.
+on:
+  push:
+    branches: [ '*' ]
+
+# Concurrency control ensures that only the latest commit for a branch
+# runs, canceling any workflows already in progress for the same branch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ============================================================================
+  # Prepare Environment & Cache
+  # This job installs the Arduino core and libraries and saves them to a cache
+  # for later jobs to use.
+  # ============================================================================
+  prepare-cache:
+    name: Prepare Cache (Linux)
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Restore Arduino Core & Libraries Cache
+        uses: actions/cache@v4
+        id: cache-arduino
+        with:
+          path: |
+            ~/.arduino15/packages
+            ~/.arduino15/cache
+            ~/Arduino/libraries
+          key: linux-arduino-esp32-v2-v3
+
+      - name: Install Dependencies
+        if: steps.cache-arduino.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          arduino-cli core update-index --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core install esp32:esp32
+          arduino-cli lib install "ArduinoJson"
+          mkdir -p "$HOME/Arduino/libraries"
+          git clone --depth=1 https://github.com/ESP32Async/ESPAsyncWebServer "$HOME/Arduino/libraries/ESPAsyncWebServer"
+          git clone --depth=1 https://github.com/ESP32Async/AsyncTCP "$HOME/Arduino/libraries/AsyncTCP"
+
+  # ============================================================================
+  # Code Quality & Linting
+  # This job runs after the cache is prepared and checks the code quality.
+  # ============================================================================
+  quality-check:
+    name: Arduino Lint Check (Linux)
+    needs: prepare-cache
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Restore Arduino Core & Libraries Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.arduino15/packages
+            ~/.arduino15/cache
+            ~/Arduino/libraries
+          key: linux-arduino-esp32-v2-v3
+      
+      - name: Run Arduino Lint
+        uses: arduino/arduino-lint-action@v2
+        with:
+          path: ${{ github.workspace }}
+          compliance: strict
+          library-manager: update
+          verbose: true
+
+  # ============================================================================
+  # Compilation Test
+  # This job compiles all example sketches.
+  # ============================================================================
+  compile-sketches:
+    name: Compile ${{ matrix.sketch }} (Linux)
+    needs: prepare-cache
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        sketch:
+          - examples/throttle_percent/throttle_percent.ino
+          - examples/dshot300/dshot300.ino
+          - examples/web_control/web_control.ino
+          - examples/web_client/web_client.ino
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Restore Arduino Core & Libraries Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.arduino15/packages
+            ~/.arduino15/cache
+            ~/Arduino/libraries
+          key: linux-arduino-esp32-v2-v3
+      
+      - name: Compile Sketch
+        run: arduino-cli compile --fqbn esp32:esp32:esp32 --library ${{ github.workspace }} "${{ matrix.sketch }}"
+
+  # ============================================================================
+  # Build Status Report
+  # This job runs last and provides a summary of the build status.
+  # ============================================================================
+  build-summary:
+    name: Build Summary
+    runs-on: ubuntu-latest
+    if: always() # This ensures the job runs even if previous jobs fail
+    needs:
+      - quality-check
+      - compile-sketches
+      
+    steps:
+      - name: Create Build Summary
+        run: |
+          echo "# 🔧 DShotRMT Build Report" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status | Details |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|---------|" >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ needs.quality-check.result }}" == "success" ]]; then
+            echo "| 📋 Quality Check | ✅ Passed | Arduino Lint completed successfully |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| 📋 Quality Check | ❌ Failed | Check Arduino Lint report for errors |" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [[ "${{ needs.compile-sketches.result }}" == "success" ]]; then
+            echo "| 🔨 Compilation | ✅ Passed | All examples compiled successfully |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| 🔨 Compilation | ❌ Failed | One or more examples failed to compile |" >> $GITHUB_STEP_SUMMARY
+          fi
+          

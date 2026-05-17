@@ -1,0 +1,13 @@
+Ramp spectrogram report
+=======================
+Source: ramp_motor4_20260516_181809.csv
+Samples: 10050
+Sample rate: 978.5 Hz
+Target: motor 4
+Throttle: 48 -> 2000 DShot
+
+How to read the PNG:
+  * Diagonal stripes that climb with the DShot trace = motor-RPM
+    related (notch widths must scale with RPM, e.g. dynamic notches).
+  * Horizontal stripes (don't move with throttle) = frame/structural
+    resonances. Use fixed notch centres.
