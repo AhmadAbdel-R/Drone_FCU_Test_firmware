@@ -1,11 +1,32 @@
+# Test Directory
 
-This directory is intended for PlatformIO Test Runner and project tests.
+This project mostly uses dedicated PlatformIO environments instead of the
+default PlatformIO unit-test runner.
 
-Unit Testing is a software testing method by which individual units of
-source code, sets of one or more MCU program modules together with associated
-control data, usage procedures, and operating procedures, are tested to
-determine whether they are fit for use. Unit testing finds problems early
-in the development cycle.
+## Useful Test/Bench Environments
 
-More information about PlatformIO Unit Testing:
-- https://docs.platformio.org/en/latest/advanced/unit-testing/index.html
+| Env | Command | Purpose |
+|---|---|---|
+| `test` | `pio run -e test` | On-target test harness from `src/test_main.cpp` |
+| `fcu_bench_test` | `pio run -e fcu_bench_test -t upload` | Auto-sequenced ESC, motor direction, IMU, and mixer bench run |
+| `fcu_motor_fft_test` | `pio run -e fcu_motor_fft_test -t upload` | Motor vibration logging firmware for FFT tools |
+| `fcu_motor_fft_test_full_dshot` | `pio run -e fcu_motor_fft_test_full_dshot -t upload` | Full-range sweep variant for restrained test stands |
+| `ekf_sim` | `pio run -e ekf_sim` | On-target EKF synthetic trajectory test |
+| `native_ekf_sim` | `pio run -e native_ekf_sim` | Desktop/native EKF synthetic trajectory test |
+
+## Safety
+
+- Remove props for all motor direction and single-motor tests.
+- Full-range or all-motor tests require a restrained airframe.
+- Do not run PID webserver or bench-relaxed failsafe builds for flight.
+
+## Commit Smoke Test
+
+Before staging a large firmware change, a practical minimum is:
+
+```pwsh
+pio run -e esp32-s3-mini
+pio run -e fcu_motor_fft_test
+pio run -e fcu_bench_test
+pio run -e native_ekf_sim
+```

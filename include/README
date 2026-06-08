@@ -1,37 +1,36 @@
+# Include Directory
 
-This directory is intended for project header files.
+Project headers in this directory are used as module contracts for the firmware.
+Most implementations still live in `src/main.cpp`; the headers keep ownership,
+threading, and safety notes close to the APIs they describe.
 
-A header file is a file containing C declarations and macro definitions
-to be shared between several project source files. You request the use of a
-header file in your project source file (C, C++, etc) located in `src` folder
-by including it, with the C preprocessing directive `#include'.
+## Main Module Groups
 
-```src/main.c
+| Area | Headers |
+|---|---|
+| Control protocols | `control_protocol.h`, `crsf_receiver.h`, `crsf_control.h`, `ibus_receiver.h`, `ibus_control.h`, `nrf_telemetry.h` |
+| Motors and filtering | `motor_module.h`, `RpmNotchFilter.h`, `motor_fft_test.h`, `BiquadFilter.h`, `DynamicNotchFilter.h` |
+| Sensors | `imu_module.h`, `tof_module.h`, `tof_altitude.h`, `baro_module.h`, `gps_module.h`, `battery_module.h`, `sensor_calibration.h`, `mag_calibration.h` |
+| PID and tuning | `fcu_pid.h`, `pid_block.h`, `pid_webserver.h`, `gain_schedule.h` |
+| Autonomy/GNC | `frames.h`, `math3.h`, `ekf_estimator.h`, `estimator_health.h`, `cascaded_controller.h`, `velocity_controller.h`, `position_controller.h`, `return_to_home.h`, `landing_controller.h`, `auto_takeoff.h`, `flight_modes.h`, `flight_state_machine.h`, `sim_harness.h` |
+| Support | `autonomy_uart.h`, `camera_gimbal.h`, `fcu_nvs.h`, `led_blinker.h` |
 
-#include "header.h"
+## Conventions
 
-int main (void)
-{
- ...
-}
-```
+- Headers should document which task writes shared state and which locks guard
+  it. Use the existing module banners as the local style.
+- Prefer small POD snapshot structs for cross-task data. Avoid heap ownership
+  in flight-loop paths.
+- Keep build-flag defaults in `src/main.cpp` and `platformio.ini`; headers
+  should describe the contract, not silently change feature gates.
+- Safety-sensitive comments should name exact failure behavior: motor stop,
+  failsafe latch, telemetry-only, or log-only.
 
-Including a header file produces the same results as copying the header file
-into each source file that needs it. Such copying would be time-consuming
-and error-prone. With a header file, the related declarations appear
-in only one place. If they need to be changed, they can be changed in one
-place, and programs that include the header file will automatically use the
-new version when next recompiled. The header file eliminates the labor of
-finding and changing all the copies as well as the risk that a failure to
-find one copy will result in inconsistencies within a program.
+## Current Control Flow
 
-In C, the convention is to give header files names that end with `.h'.
+`crsfControlTask` or a legacy input task writes a `ControlPacket`. The 500 Hz
+`flightTask` reads that packet, polls IMU, updates filters/PID, and writes four
+DShot outputs. `sensorTask` refreshes slower sensors and battery state.
 
-Read more about using header files in official GCC documentation:
-
-* Include Syntax
-* Include Operation
-* Once-Only Headers
-* Computed Includes
-
-https://gcc.gnu.org/onlinedocs/cpp/Header-Files.html
+Experimental EKF/autonomy headers are compiled in, but direct mixer authority is
+still gated by `ENABLE_EXPERIMENTAL_EKF_CONTROL`.

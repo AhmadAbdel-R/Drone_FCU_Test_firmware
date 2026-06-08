@@ -22,7 +22,11 @@
 //      spin until you send an explicit TEST_MOTOR command.
 //
 // -----------------------------------------------------------------------------
-// SERIAL PROTOCOL (115200 8N1, newline-terminated, case-insensitive):
+// SERIAL PROTOCOL (921600 8N1, newline-terminated, case-insensitive):
+//
+//   RUN_SWEEP <M1|M2|M3|M4|ALL> [max_dshot] [step_dshot] [hold_ms]
+//        stepped sweep. Defaults are intentionally low-power and capped by
+//        MOTOR_FFT_SWEEP_HARD_MAX at compile time.
 //
 //   TEST_MOTOR <id> <cmd>
 //        id  = 1..4 (motor index, matches the flight firmware mapping)
@@ -41,14 +45,14 @@
 //        Print the command list.
 //
 // -----------------------------------------------------------------------------
-// CSV LINE FORMAT (one line per gyro sample while logging is on):
+// CSV LINE FORMAT:
 //
-//   [CSV] timestamp_us,gyro_x,gyro_y,gyro_z,accel_x,accel_y,accel_z,motor_id,motor_command
+//   [CSV] timestamp_us,test_target,motor_id,dshot_cmd,phase,gx,gy,gz,ax,ay,az,sample_count
 //
 //     gyro_*        deg/s
-//     accel_*       g (1.0 = 1 standard gravity)
-//     motor_id      0 if no motor active, else 1..4
-//     motor_command DShot raw value (0 or 48..2047)
+//     accel_*       g; post-sweep buffered dumps print 0.000 for these columns
+//     motor_id      0 if no motor active, else 1..4 or 255 for ALL
+//     dshot_cmd     DShot raw value (0 or 48..2047)
 //
 // Status lines are prefixed with "[STATUS] " so a host log parser can
 // distinguish them from CSV rows.
@@ -66,6 +70,30 @@
 #define MOTOR_FFT_DSHOT_MIN 48U
 #define MOTOR_FFT_DSHOT_MAX 2047U
 
+// Sweep defaults for the standalone FFT firmware. These are full-range and
+// should only be used in a restrained test stand.
+#ifndef MOTOR_FFT_SWEEP_DEFAULT_MAX
+#define MOTOR_FFT_SWEEP_DEFAULT_MAX 2047U
+#endif
+#ifndef MOTOR_FFT_SWEEP_HARD_MAX
+#define MOTOR_FFT_SWEEP_HARD_MAX 2047U
+#endif
+#ifndef MOTOR_FFT_SWEEP_DEFAULT_STEP
+#define MOTOR_FFT_SWEEP_DEFAULT_STEP 10U
+#endif
+#ifndef MOTOR_FFT_SWEEP_DEFAULT_HOLD_MS
+#define MOTOR_FFT_SWEEP_DEFAULT_HOLD_MS 100U
+#endif
+
 #define MOTOR_FFT_RING_CAPACITY 1024U       // sample queue depth, ~1 s at 1 kHz
+
+// Buffered sweeps avoid serial printing during motor motion. Decimate by 2 so a
+// full 2047/10/100ms sweep fits on no-PSRAM ESP32-S3 boards.
+#ifndef MOTOR_FFT_SWEEP_DUMP_AFTER
+#define MOTOR_FFT_SWEEP_DUMP_AFTER 1
+#endif
+#ifndef MOTOR_FFT_SWEEP_CAPTURE_DECIMATE
+#define MOTOR_FFT_SWEEP_CAPTURE_DECIMATE 2U
+#endif
 
 #endif  // MOTOR_FFT_TEST_MODE

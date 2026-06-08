@@ -96,6 +96,7 @@ static constexpr auto RMT_QUEUE_DEPTH = 1;
 // --- RMT Receiver Configuration ---
 static constexpr uint32_t DSHOT_PULSE_MIN_NS = 800;  // 0.8us minimum pulse duration for receiver
 static constexpr uint32_t DSHOT_PULSE_MAX_NS = 8000; // 8.0us maximum pulse duration for receiver
+static constexpr uint32_t DSHOT_TELEMETRY_IDLE_TIMEOUT_NS = 80000; // Covers the ~30us BDShot turnaround gap.
 
 // Stores pre-calculated timing values in RMT ticks for efficient signal generation.
 typedef struct rmt_ticks
@@ -179,11 +180,25 @@ typedef struct dshot_result
 {
     bool success;
     dshot_msg_code_t result_code;          // Specific error or success code.
-    uint16_t erpm;                         // Electrical RPM (eRPM) if telemetry is successful.
-    uint16_t motor_rpm;                    // Motor RPM if telemetry is successful and magnet count is known.
+    uint32_t erpm;                         // Electrical RPM (eRPM) if telemetry is successful.
+    uint32_t motor_rpm;                    // Motor RPM if telemetry is successful and magnet count is known.
     dshot_telemetry_data_t telemetry_data; // Full telemetry data if available
     bool telemetry_available;              // Flag to indicate if telemetry_data is valid
 } dshot_result_t;
+
+typedef struct dshot_telemetry_stats
+{
+    uint32_t rx_start_count;
+    uint32_t rx_start_failed_count;
+    uint32_t rx_done_count;
+    uint32_t rx_no_edge_count;
+    uint32_t rx_decode_error_count;
+    uint32_t rx_crc_error_count;
+    uint32_t rx_period_error_count;
+    uint32_t rx_overrun_count;
+    uint32_t good_frame_count;
+    uint32_t bad_frame_count;
+} dshot_telemetry_stats_t;
 
 // --- DShot Commands ---
 // Standard DShot commands by "betaflight"

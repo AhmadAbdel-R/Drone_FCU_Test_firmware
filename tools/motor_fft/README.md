@@ -1,23 +1,21 @@
-# Motor FFT Logger (host tool)
+# Motor FFT Logger
 
-Companion host app for the `env:fcu_motor_fft_test` firmware build. Logs the
-gyro/accel CSV stream over USB serial, then runs an FFT pass and prints
-suggested notch-filter centre frequencies.
+Host-side serial logger for the `env:fcu_motor_fft_test` firmware. It captures
+the FCU's motor-test CSV stream, runs an FFT pass, and writes CSV/PNG/report
+artifacts for dynamic-notch tuning.
 
-## SAFETY
+Current committed results are summarized in
+[`docs/DYNAMIC_NOTCH_TEST.md`](../../docs/DYNAMIC_NOTCH_TEST.md).
 
-Before powering on the drone with this firmware:
+## Safety
 
-1. **Remove props** for motor identification / mapping. The firmware will
-   never spin two motors at once, but a single motor with a prop on it is
-   already a hazard.
-2. For prop-on vibration testing, **the airframe must be restrained** in a
-   vibration stand. Wear eye and hearing protection.
-3. Always send `STOP` between tests. Closing the serial port also triggers a
-   final `STOP` from this tool.
-4. The firmware itself **only spins after an explicit `TEST_MOTOR`** command.
+1. Remove props for motor mapping and single-motor identification.
+2. Prop-on vibration work requires a restrained airframe, eye protection, and
+   hearing protection.
+3. Always send `STOP` between tests. The logger also sends `STOP` when it exits.
+4. The firmware only spins after an explicit `TEST_MOTOR` or sweep command.
 
-## One-time setup (Windows PowerShell)
+## Setup
 
 ```pwsh
 cd C:\dev\ESP32-S3-MINI-FCU-FIRMWARE\tools\motor_fft
@@ -26,71 +24,80 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-On macOS / Linux substitute `source .venv/bin/activate`.
+On macOS/Linux, use `source .venv/bin/activate`.
 
-## Flash the firmware first
+## Flash The Test Firmware
 
 ```pwsh
 cd C:\dev\ESP32-S3-MINI-FCU-FIRMWARE
-pio run -e fcu_motor_fft_test -t upload -t monitor
+pio run -e fcu_motor_fft_test -t upload
+pio device monitor -e fcu_motor_fft_test
 ```
 
-This selects the isolated test env — the flight firmware is **not** touched.
-The monitor at 115200 should print the boot banner ending in
-`Type HELP for the command list.`
+The current motor FFT env uses `monitor_speed = 921600`. Close the monitor
+before running the Python logger so the COM port is free.
 
-## Run the logger
-
-In a separate terminal (firmware monitor must be closed so the port is free):
+## Run The Logger
 
 ```pwsh
+cd C:\dev\ESP32-S3-MINI-FCU-FIRMWARE\tools\motor_fft
 .\.venv\Scripts\Activate.ps1
 python motor_fft_logger.py --port COM7
 ```
 
-Replace `COM7` with the actual port. The tool drops you into a prompt:
+Replace `COM7` with the FCU port.
 
-```
-> help                       # firmware echoes the command list
-> test 1 1100                # spin motor 1 at DShot 1100
-> log start                  # begin CSV capture (auto-named file)
+Example session:
+
+```text
+> help
+> test 1 1100
+> log start
 ... wait a few seconds ...
-> log stop                   # ends capture, runs FFT, saves PNG + report
-> stop                       # zero throttle
+> log stop
+> stop
 > test 2 1100
-...
-> quit                       # closes session (sends STOP first)
+> quit
 ```
 
-`log stop` writes three files alongside the CSV:
+`log stop` writes:
 
-- `motor_fft_<timestamp>.csv` — raw samples
-- `motor_fft_<timestamp>.png` — gyro time-series + spectrum
-- `motor_fft_<timestamp>_report.txt` — top peaks, suggested notch centres
+- `motor_fft_<timestamp>.csv`
+- `motor_fft_<timestamp>.png`
+- `motor_fft_<timestamp>_report.txt`
 
-## Offline analysis
-
-If you only want to re-run FFT on an existing CSV:
+## Offline Analysis
 
 ```pwsh
 python motor_fft_logger.py --analyze motor_fft_20260518_142211.csv
 ```
 
-## CSV schema
+## Current CSV Schema
 
+The firmware emits lines shaped like:
+
+```text
+timestamp_us,test_target,motor_id,dshot_cmd,phase,gx,gy,gz,ax,ay,az,sample_count
 ```
-timestamp_us,gyro_x,gyro_y,gyro_z,accel_x,accel_y,accel_z,motor_id,motor_command
-```
 
-- `gyro_*` is degrees per second
-- `accel_*` is g (1.0 = 9.80665 m/s²)
-- `motor_id` is the motor under test (1..4), `0` when no motor is active
-- `motor_command` is the live DShot raw value (0 or 48..2047)
+- `test_target`: single motor target or all-motor mode.
+- `motor_id`: `0` when idle, `1..4` for one motor, `255` for all motors.
+- `dshot_cmd`: raw DShot value, `0` or `48..2047`.
+- `gx/gy/gz`: gyro in degrees per second.
+- `ax/ay/az`: acceleration in g.
 
-## Interpreting the suggested notch frequencies
+## Interpreting Results
 
-The firmware samples at 1 kHz, so the FFT covers 0..500 Hz. Strong peaks come
-from motor rotation × pole count, prop imbalance, bearing wear, or frame
-resonance. The reported notch centres are the clearest dominant peaks across
-all three gyro axes — feed them into your flight firmware's notch filters
-once you have them.
+The flight firmware currently uses a dynamic throttle-mapped notch and has an
+optional BDShot RPM filter. FFT captures are still valuable:
+
+- Confirm the dynamic notch range tracks the motor fundamental.
+- Check whether `FCU_MOTOR_OUTPUT_MAX_RAW` changes require retuning
+  `DYN_NOTCH_LOW_CMD_HZ` / `DYN_NOTCH_HIGH_CMD_HZ`.
+- Validate frame resonances that RPM filtering will not fully solve.
+
+Feed strong motor-band peaks back into the dynamic-notch config and keep
+separate captures for M1/M2/M3/M4/all-motor tests.
+
+The repository currently includes CSV/report files but no committed PNG plots.
+Regenerate plots with `--analyze` or the GUI before adding image links.

@@ -27,7 +27,7 @@ dshot_result_t init_rmt_tx_channel(
         .mem_block_symbols = tx_buffer_symbols,
         .trans_queue_depth = RMT_QUEUE_DEPTH,
         .flags = {
-            .invert_out = is_bidirectional ? 1 : 0,
+            .invert_out = is_bidirectional ? 1U : 0U,
             .init_level = 0}};
 
     rmt_transmit_config_t rmt_tx_config = {}; // Initialize all members to zero

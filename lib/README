@@ -1,46 +1,28 @@
+# Local Libraries
 
-This directory is intended for project specific (private) libraries.
-PlatformIO will compile them to static libraries and link into the executable file.
+This project intentionally uses local libraries from `lib/` for the motor
+output chain. PlatformIO discovers these before external dependencies, which
+keeps the flight build reproducible.
 
-The source code of each library should be placed in a separate directory
-("lib/your_library_name/[Code]").
+## Libraries
 
-For example, see the structure of the following example libraries `Foo` and `Bar`:
+| Library | Purpose |
+|---|---|
+| `DShotRMT` | ESP-IDF 5 RMT DShot driver with patched bidirectional DShot receive, GCR/eRPM decode, persistent RX/TX buffers, and telemetry stats. |
+| `easy-esc-esp32` | Local EasyESC facade used by the firmware. Exposes cached `EasyEscMotor::telemetry()` so RPM filtering can read BDShot eRPM without reaching into driver internals. |
 
-|--lib
-|  |
-|  |--Bar
-|  |  |--docs
-|  |  |--examples
-|  |  |--src
-|  |     |- Bar.c
-|  |     |- Bar.h
-|  |  |- library.json (optional. for custom build options, etc) https://docs.platformio.org/page/librarymanager/config.html
-|  |
-|  |--Foo
-|  |  |- Foo.c
-|  |  |- Foo.h
-|  |
-|  |- README --> THIS FILE
-|
-|- platformio.ini
-|--src
-   |- main.c
+## Rules For Motor-Library Changes
 
-Example contents of `src/main.c` using Foo and Bar:
-```
-#include <Foo.h>
-#include <Bar.h>
+- Do not allocate in the flight-loop send/telemetry path.
+- Do not attach, detach, delete, or recreate RMT channels during normal motor
+  output. Passthrough suspend/resume is the exception.
+- Normal DShot output must continue even when telemetry is missing or bad.
+- Bad BDShot frames must increment counters, not publish a new RPM value.
+- Keep DShot300 as the safe default unless a bench capture proves a higher
+  speed is reliable on the actual wiring.
 
-int main (void)
-{
-  ...
-}
+## PlatformIO Dependency Note
 
-```
-
-The PlatformIO Library Dependency Finder will find automatically dependent
-libraries by scanning project source files.
-
-More information about PlatformIO Library Dependency Finder
-- https://docs.platformio.org/page/librarymanager/ldf.html
+`platformio.ini` no longer lists the EasyESC GitHub dependency directly for the
+flight/test envs. The local `lib/easy-esc-esp32` copy is the source of truth for
+this firmware because it contains the BDShot telemetry bridge.

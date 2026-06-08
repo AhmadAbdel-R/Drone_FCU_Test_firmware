@@ -72,9 +72,21 @@ constexpr uint8_t kPiCmdYawLeft = 6;
 constexpr uint8_t kPiCmdYawRight = 7;
 constexpr uint8_t kPiCmdLand = 8;
 constexpr uint8_t kPiCmdStop = 9;
+constexpr uint8_t kPiCmdRth = 10;     // Return-to-home (from Pi AI decision)
 
 constexpr uint8_t kMaxTakeoffAltDm = 50;  // 5.0 m hard cap
 constexpr uint8_t kMinTakeoffAltDm = 2;   // 0.2 m floor (matches user spec)
+constexpr uint8_t kTakeoffAltDmMask = 0x3F;
+constexpr uint8_t kControlClearFailsafeBit = 0x40;
+
+// Top bit of pidSelectedField is a "save this PID field to FCU NVS" signal,
+// valid only when kFlagPidModeSwitchOn is set. Lower 7 bits = field index.
+// FCU semantics: PID gain bytes in the packet are HONORED only when this bit
+// is set; otherwise the FCU uses whatever values it has in NVS. This makes
+// the FCU the source of truth for tuning across remote reboots.
+constexpr uint8_t kPidSaveBitInSelectedField = 0x80;
+constexpr uint8_t kPidFieldIndexMask = 0x7F;
+constexpr uint8_t kPidFieldCount = 12;
 
 struct __attribute__((packed)) ControlPacket {
   uint8_t version = kVersion;
@@ -158,7 +170,12 @@ struct __attribute__((packed)) TelemetryAuxPacket {
   int16_t bmpTempCentiC = 0;        // BMP temperature in centi-deg C
   uint8_t bmpFlags = 0;             // kTelemetryBmpFlag*
   uint16_t bmpAgeMs10 = 0xFFFF;     // age of last valid BMP sample, 10ms units
-  uint8_t reserved[4] = {};
+  // PID echo: FCU rotates its NVS-stored gains through these two fields,
+  // one per aux packet. Remote can rebuild the full set from successive
+  // packets and display the values the FCU is actually flying with.
+  uint8_t pidEchoIndex = 0xFF;      // 0..kPidFieldCount-1, 0xFF = no echo this packet
+  int16_t pidEchoValueMilli = 0;
+  uint8_t reserved[1] = {};
 };
 
 static_assert(sizeof(TelemetryAuxPacket) <= 32, "TelemetryAuxPacket exceeds NRF24 payload size");
@@ -180,14 +197,20 @@ inline bool flagIsSet(uint8_t flags, uint8_t flag) {
 }
 
 // Extracts the takeoff altitude (decimeters) carried in pidSelectedField when
-// PID-tune mode is OFF. Returns 0 if the packet is in PID tune mode or carries
-// an out-of-range value.
+// PID-tune mode is OFF. Bit 6 is a non-PID clear-failsafe command, so only the
+// lower 6 bits carry altitude. Returns 0 if PID tune mode is active or the
+// altitude is out of range.
 inline uint8_t desiredTakeoffAltDm(const ControlPacket& packet) {
   if (flagIsSet(packet.flags, kFlagPidModeSwitchOn)) {
     return 0;
   }
-  const uint8_t v = packet.pidSelectedField;
+  const uint8_t v = packet.pidSelectedField & kTakeoffAltDmMask;
   return (v > kMaxTakeoffAltDm) ? 0 : v;
+}
+
+inline bool failsafeClearRequested(const ControlPacket& packet) {
+  return !flagIsSet(packet.flags, kFlagPidModeSwitchOn) &&
+         ((packet.pidSelectedField & kControlClearFailsafeBit) != 0);
 }
 
 }  // namespace control_protocol

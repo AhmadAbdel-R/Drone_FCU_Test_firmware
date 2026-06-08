@@ -20,6 +20,7 @@ class FailsafeManager {
     uint32_t lastControlPacketMs = 0;
     uint32_t nowMs = 0;
     uint32_t controlTimeoutMs = 350;
+    bool tiltOnly = false;           // bench/tuning mode: latch unsafe tilt only
 
     bool autonomyEnabled = false;
     uint32_t piLastCommandMs = 0;
@@ -31,6 +32,7 @@ class FailsafeManager {
     float batteryVolts = 0.0f;
     float batteryLowVolts = 10.5f;    // ~3.5V/cell for 3S; tune via configure()
     bool batteryEnabled = false;      // skip until we actually have a sample
+    bool batteryFailsafeEnabled = true;
 
     float tiltMagDeg = 0.0f;
     float tiltUnsafeDeg = 60.0f;
@@ -73,30 +75,33 @@ class FailsafeManager {
       return reason_;
     }
 
-    // 1. Control link
-    if (!in.linkActive ||
-        (in.lastControlPacketMs != 0 && in.nowMs - in.lastControlPacketMs > in.controlTimeoutMs)) {
-      latch(control_protocol::kFailsafeControlLinkTimeout, in.nowMs);
-      return reason_;
-    }
+    if (!in.tiltOnly) {
+      // 1. Control link
+      if (!in.linkActive ||
+          (in.lastControlPacketMs != 0 && in.nowMs - in.lastControlPacketMs > in.controlTimeoutMs)) {
+        latch(control_protocol::kFailsafeControlLinkTimeout, in.nowMs);
+        return reason_;
+      }
 
-    // 2. Pi cmd timeout (only when autonomy enabled and we have ever seen a command)
-    if (in.autonomyEnabled && in.piLastCommandMs != 0 &&
-        in.nowMs - in.piLastCommandMs > in.piTimeoutMs) {
-      latch(control_protocol::kFailsafePiCmdTimeout, in.nowMs);
-      return reason_;
-    }
+      // 2. Pi cmd timeout (only when autonomy enabled and we have ever seen a command)
+      if (in.autonomyEnabled && in.piLastCommandMs != 0 &&
+          in.nowMs - in.piLastCommandMs > in.piTimeoutMs) {
+        latch(control_protocol::kFailsafePiCmdTimeout, in.nowMs);
+        return reason_;
+      }
 
-    // 3. ToF invalid (only when we depend on it)
-    if (in.altitudeHoldActive && !in.tofReady) {
-      latch(control_protocol::kFailsafeTofInvalid, in.nowMs);
-      return reason_;
-    }
+      // 3. ToF invalid (only when we depend on it)
+      if (in.altitudeHoldActive && !in.tofReady) {
+        latch(control_protocol::kFailsafeTofInvalid, in.nowMs);
+        return reason_;
+      }
 
-    // 4. Low battery (only when we actually have a sample)
-    if (in.batteryEnabled && in.batteryVolts > 0.1f && in.batteryVolts < in.batteryLowVolts) {
-      latch(control_protocol::kFailsafeLowBattery, in.nowMs);
-      return reason_;
+      // 4. Low battery (only when enabled and we actually have a sample)
+      if (in.batteryFailsafeEnabled && in.batteryEnabled &&
+          in.batteryVolts > 0.1f && in.batteryVolts < in.batteryLowVolts) {
+        latch(control_protocol::kFailsafeLowBattery, in.nowMs);
+        return reason_;
+      }
     }
 
     // 5. Unsafe tilt (only when armed and IMU is producing data)
@@ -105,17 +110,19 @@ class FailsafeManager {
       return reason_;
     }
 
-    // 6. IMU invalid (only when armed)
-    if (in.armed && !in.imuValid) {
-      latch(control_protocol::kFailsafeImuInvalid, in.nowMs);
-      return reason_;
-    }
+    if (!in.tiltOnly) {
+      // 6. IMU invalid (only when armed)
+      if (in.armed && !in.imuValid) {
+        latch(control_protocol::kFailsafeImuInvalid, in.nowMs);
+        return reason_;
+      }
 
-    // 7. Flight loop overrun (loop hasn't ticked recently)
-    if (in.armed && in.lastFlightLoopMs != 0 &&
-        in.nowMs - in.lastFlightLoopMs > in.loopTimeoutMs) {
-      latch(control_protocol::kFailsafeLoopOverrun, in.nowMs);
-      return reason_;
+      // 7. Flight loop overrun (loop hasn't ticked recently)
+      if (in.armed && in.lastFlightLoopMs != 0 &&
+          in.nowMs - in.lastFlightLoopMs > in.loopTimeoutMs) {
+        latch(control_protocol::kFailsafeLoopOverrun, in.nowMs);
+        return reason_;
+      }
     }
 
     return control_protocol::kFailsafeNone;

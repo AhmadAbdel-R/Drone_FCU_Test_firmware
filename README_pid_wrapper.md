@@ -1,13 +1,20 @@
-# Simulink PID Wrapper (C Caller Compatible)
+# Simulink PID Wrapper
 
-This module exposes a plain C-compatible function (`pid_step`) that calls internal C++ PID logic.  
-It is designed for firmware-in-the-loop style testing in Simulink while keeping all state external.
+Small C-compatible wrapper around the standalone C++ PID implementation. This
+is useful for firmware-in-the-loop style Simulink tests without pulling in the
+full ESP32/Arduino firmware.
+
+This wrapper is separate from the current flight PID implementation in
+`include/fcu_pid.h` and `src/main.cpp`. Use it for model experiments and quick
+host-side checks, not as the source of truth for the in-flight rate loop.
 
 ## Files
 
-- `pid_controller.hpp` / `pid_controller.cpp`: C++ PID implementation.
-- `pid_wrapper.h` / `pid_wrapper.cpp`: `extern "C"` interface for Simulink C Caller.
-- `test_pid_wrapper.cpp`: standalone loop test (no Simulink required).
+| File | Purpose |
+|---|---|
+| `pid_controller.hpp` / `pid_controller.cpp` | Standalone C++ PID core |
+| `pid_wrapper.h` / `pid_wrapper.cpp` | `extern "C"` API for Simulink C Caller |
+| `test_pid_wrapper.cpp` | Minimal host smoke test |
 
 ## Simulink-Facing API
 
@@ -32,76 +39,51 @@ extern "C" void pid_step(
 );
 ```
 
-## PID Behavior Implemented
+## Behavior
 
 1. `error = setpoint - measurement`
 2. `P = kp * error`
-3. `integral = integral_in + error * dt` (held if `dt <= 0`)
+3. `integral = integral_in + error * dt` when `dt > 0`
 4. `I = ki * integral`
-5. `derivative = (error - prev_error_in) / dt` when `dt > 0`, else `0`
-6. `D = kd * derivative`
-7. `raw = P + I + D`
-8. `output = clamp(raw, out_min, out_max)`
-9. Outputs: `output`, `P`, `I`, `D`, `integral_out`, `prev_error_out`
+5. `D = kd * (error - prev_error_in) / dt` when `dt > 0`
+6. `output = clamp(P + I + D, out_min, out_max)`
 
-## Intended Simulink Wiring
+The wrapper intentionally keeps all state external so Simulink can own the
+delays and initial conditions.
 
-- `setpoint` -> `pid_step` input
-- `measurement` -> `pid_step` input
-- `dt`, `kp`, `ki`, `kd`, `out_min`, `out_max` -> Constant blocks
-- `integral_out` -> Unit Delay -> `integral_in`
-- `prev_error_out` -> Unit Delay -> `prev_error_in`
-- `output` -> plant model (drone axis dynamics)
-- plant measured rate -> feedback into `measurement`
+## Current Firmware Difference
 
-## Solver and Timing Notes
+The flight firmware has moved beyond this simple wrapper:
 
-- Use a **fixed-step** solver for deterministic control behavior.
-- Choose step size to match firmware loop period:
-  - `dt = 0.002` for 500 Hz
-  - `dt = 0.004` for 250 Hz
-  - `dt = 0.01` for 100 Hz
-- Keep Simulink sample time and `dt` constant aligned.
+- Rate PID can use D-on-measurement.
+- D-term low-pass is compile-configurable.
+- Integral clamping is decoupled from output ceiling.
+- Gains and pitch front-bias can be saved in FCU NVS.
 
-## Adding Custom Code to Simulink
+For current aircraft tuning, prefer `tools/sim_tuning` and live `[TUNE]` logs.
+Keep this wrapper for simple block-level experiments and regression checks.
 
-In **Model Settings -> Simulation Target -> Custom Code**:
+## Simulink Wiring
 
-- Header file: `pid_wrapper.h`
-- Source files: `pid_wrapper.cpp`, `pid_controller.cpp`
-- Include path: folder containing these files
+- `setpoint` and `measurement` feed `pid_step`.
+- Constants feed `dt`, `kp`, `ki`, `kd`, `out_min`, and `out_max`.
+- `integral_out` loops through a Unit Delay into `integral_in`.
+- `prev_error_out` loops through a Unit Delay into `prev_error_in`.
+- `output` feeds the plant model.
 
-If your setup does not auto-select C++ for `.cpp` files:
+Use a fixed-step solver. Typical values:
 
-- Configure MEX C++ compiler: `mex -setup C++`
-- Ensure simulation custom code is compiled with a C++ toolchain
+| Firmware loop | `dt` |
+|---|---|
+| 500 Hz | `0.002` |
+| 250 Hz | `0.004` |
+| 100 Hz | `0.010` |
 
-The wrapper remains C-compatible because of `extern "C"` even though implementation is C++.
-
-## Signals to Log
-
-- `setpoint`
-- `measurement`
-- `output`
-- `p_term`
-- `i_term`
-- `d_term`
-- `integral_out`
-
-## Common PID Issues to Watch
-
-- Overshoot and oscillation: often too much `kp` or `ki`, or too little `kd`
-- Output saturation: output stuck at `out_min`/`out_max`
-- Integral windup: integral keeps growing while saturated
-- Noisy derivative: `d_term` spikes from measurement noise
-
-## Optional Local Smoke Test
-
-Compile and run from this repository root:
+## Optional Host Smoke Test
 
 ```bash
 g++ -std=c++17 -Wall -Wextra -pedantic pid_controller.cpp pid_wrapper.cpp test_pid_wrapper.cpp -o test_pid_wrapper
 ./test_pid_wrapper
 ```
 
-On Windows shell, executable may be `test_pid_wrapper.exe`.
+On Windows, the executable is usually `test_pid_wrapper.exe`.

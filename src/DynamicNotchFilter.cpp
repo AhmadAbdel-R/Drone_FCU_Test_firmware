@@ -77,12 +77,25 @@ void DynamicNotchFilter::setRuntimeBypass(bool bypassed) {
 }
 
 float DynamicNotchFilter::commandToFrequency(uint16_t motorCommand) const {
+  // Map DShot -> approximate motor fundamental frequency. We use a SQRT
+  // interpolation between lowCommandFrequencyHz and highCommandFrequencyHz
+  // rather than a straight linear because BLDC motors driving a propeller
+  // load have RPM proportional to sqrt(throttle) — the prop's thrust scales
+  // with ω², so a doubling of input current does NOT double RPM. Empirical
+  // sweeps on this airframe (2026-05) showed the prior linear mapping was
+  // off by +30 to +40 Hz in the DShot 800-1200 range, which placed the
+  // notch in the peak's *skirt* instead of its centre and caused a +2 dB
+  // gz regression at mid-throttle. The sqrt curve fits the measured points
+  // within ±5 Hz across the whole DShot range with no airframe-specific
+  // tuning beyond the existing lowCommandFrequencyHz/highCommandFrequencyHz
+  // endpoints.
   const float cmd = static_cast<float>(motorCommand);
   const float minCmd = static_cast<float>(config_.minCommand);
   const float maxCmd = static_cast<float>(config_.maxCommand);
-  const float t = clampFloat((cmd - minCmd) / (maxCmd - minCmd), 0.0f, 1.0f);
+  const float tLinear = clampFloat((cmd - minCmd) / (maxCmd - minCmd), 0.0f, 1.0f);
+  const float tCurved = std::sqrt(tLinear);
   return config_.lowCommandFrequencyHz +
-         t * (config_.highCommandFrequencyHz - config_.lowCommandFrequencyHz);
+         tCurved * (config_.highCommandFrequencyHz - config_.lowCommandFrequencyHz);
 }
 
 float DynamicNotchFilter::clampCenter(float centerHz, float sampleRateHz) const {

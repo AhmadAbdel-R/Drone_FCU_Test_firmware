@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <Arduino.h>
 
@@ -78,6 +79,8 @@ public:
     // Sets TX channel memory symbols used when creating the RMT TX channel.
     void setTxBufferSymbols(uint16_t symbols);
     uint16_t getTxBufferSymbols() const { return _tx_buffer_symbols; }
+    dshot_telemetry_stats_t getTelemetryStats() const;
+    void resetTelemetryStats();
 
     // Getters for DShot info
     dshot_mode_t getMode() const { return _mode; }
@@ -86,7 +89,18 @@ public:
     uint16_t getEncodedFrameValue() const { return _encoded_frame_value; }
 
 private:
+    enum class DecodeStatus : uint8_t
+    {
+        Ok,
+        NoEdge,
+        SymbolDecodeFailed,
+        GcrDecodeFailed,
+        CrcFailed,
+        PeriodInvalid
+    };
+
     dshot_result_t _sendRawDshotFrame(uint16_t value);
+    static bool IRAM_ATTR _on_tx_done(rmt_channel_handle_t rmt_tx_channel, const rmt_tx_done_event_data_t *edata, void *user_data);
     static bool IRAM_ATTR _on_rx_done(rmt_channel_handle_t rmt_rx_channel, const rmt_rx_done_event_data_t *edata, void *user_data);
 
     // DShot Configuration Parameters
@@ -112,9 +126,10 @@ private:
     uint16_t _last_throttle = 0;             // Last transmitted throttle value
     dshot_packet_t _packet;                  // Current DShot packet being processed
     uint16_t _encoded_frame_value = 0;       // Last encoded 16-bit DShot frame value
+    uint16_t _tx_payload = 0;                // Async RMT TX payload storage; must outlive rmt_transmit().
 
     // Telemetry Related Variables
-    std::atomic<uint16_t> _last_erpm_atomic = 0;                          // Atomically stored last received eRPM value
+    std::atomic<uint32_t> _last_erpm_atomic = 0;                          // Atomically stored last received eRPM value
     std::atomic<bool> _telemetry_ready_flag_atomic = false;               // Atomically stored flag indicating new telemetry data
     std::atomic<dshot_telemetry_data_t> _last_telemetry_data_atomic = {}; // Atomically stored last received full telemetry data
     std::atomic<bool> _full_telemetry_ready_flag_atomic = false;          // Atomically stored flag indicating new full telemetry data
@@ -122,6 +137,27 @@ private:
         // RMT receive event callbacks
         .on_recv_done = _on_rx_done,
     };
+    rmt_tx_event_callbacks_t _tx_event_callbacks = {
+        .on_trans_done = _on_tx_done,
+    };
+    rmt_receive_config_t _rmt_rx_config = {
+        .signal_range_min_ns = DSHOT_PULSE_MIN_NS,
+        .signal_range_max_ns = DSHOT_TELEMETRY_IDLE_TIMEOUT_NS,
+    };
+    std::array<rmt_symbol_word_t, DSHOT_TELEMETRY_FULL_GCR_BITS> _rx_symbols = {};
+    std::atomic<bool> _rx_busy_atomic = false;
+    std::atomic<bool> _rx_done_flag_atomic = false;
+    std::atomic<uint16_t> _rx_symbol_count_atomic = 0;
+    std::atomic<uint32_t> _rx_start_count_atomic = 0;
+    std::atomic<uint32_t> _rx_start_failed_count_atomic = 0;
+    std::atomic<uint32_t> _rx_done_count_atomic = 0;
+    std::atomic<uint32_t> _rx_no_edge_count_atomic = 0;
+    std::atomic<uint32_t> _rx_decode_error_count_atomic = 0;
+    std::atomic<uint32_t> _rx_crc_error_count_atomic = 0;
+    std::atomic<uint32_t> _rx_period_error_count_atomic = 0;
+    std::atomic<uint32_t> _rx_overrun_count_atomic = 0;
+    std::atomic<uint32_t> _good_frame_count_atomic = 0;
+    std::atomic<uint32_t> _bad_frame_count_atomic = 0;
 
     // Private Helper Functions for DShot Protocol Logic
     bool _isValidCommand(dshotCommands_e command) const;                                                          // Checks if a given DShot command is valid
@@ -132,7 +168,11 @@ private:
     void _extractTelemetryData(const uint8_t *raw_telemetry_bytes, dshot_telemetry_data_t &telemetry_data) const; // Extracts telemetry data from raw bytes
     void _preCalculateRMTTicks();                                                                                 // Pre-calculates RMT timing ticks for the selected DShot mode
     dshot_result_t _sendPacket(const dshot_packet_t &packet);                                                     // Sends a DShot frame via RMT TX channel
-    uint16_t IRAM_ATTR _decodeDShotFrame(const rmt_symbol_word_t *symbols) const;                                 // Decodes a received RMT symbol array into an eRPM value
+    DecodeStatus _decodePendingErpmFrame(uint32_t &erpm) const;                                                   // Decodes deferred RMT symbols into actual eRPM.
+    DecodeStatus _symbolsToDifferentialValue(const rmt_symbol_word_t *symbols, size_t num_symbols, uint32_t &value) const;
+    DecodeStatus _decodeGcrTelemetryValue(uint32_t differential_value, uint16_t &period_us) const;
+    DecodeStatus _periodToErpm(uint16_t period_us, uint32_t &erpm) const;
+    void _recordDecodeStatus(DecodeStatus status);
     void IRAM_ATTR _processFullTelemetryFrame(const rmt_symbol_word_t *symbols, size_t num_symbols);              // Processes a full telemetry frame
     bool IRAM_ATTR _isFrameIntervalElapsed() const;                                                               // Checks if enough time has passed since the last frame transmission
     void _recordFrameTransmissionTime();                                                                          // Records the current time as the last frame transmission time

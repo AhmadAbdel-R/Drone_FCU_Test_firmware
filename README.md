@@ -1,183 +1,317 @@
-# ESP32-S3 Mini Flight Controller Firmware
+# ESP32-S3 Mini FCU Firmware
 
-Quadcopter flight controller firmware for an ESP32-S3 board.
-DSHOT300 motor output, nRF24L01+ control link (optional telemetry downlink),
-ICM-20948 IMU over SPI, BMP280 baro and VL53L1X ToF over I²C, GPS over UART,
-and a FreeRTOS task layout pinned across both cores.
+Firmware and bench tooling for a custom ESP32-S3 flight controller on an F450
+quad. The current flight build uses ELRS/CRSF control input, DShot300 motor
+output through the local EasyESC/DShotRMT stack, ICM-20948 IMU over SPI,
+BMP280/VL53L1X altitude sensors, GPS, battery sensing, dynamic gyro notches,
+and experimental EKF/autonomy code that is still gated away from direct mixer
+authority by default.
+
+> **Dynamic Notch Test Results**
+> See [docs/DYNAMIC_NOTCH_TEST.md](docs/DYNAMIC_NOTCH_TEST.md). Committed CSV
+> and report artifacts identify the current motor fundamental band around
+> 125-130 Hz at DShot 1100. PNG plots are not currently committed, so any plot
+> screenshots still need to be regenerated or added.
+
+## Main README Structure
+
+- Hardware and reference images
+- Wiring and component map
+- ELRS/CRSF and RadioMaster Pocket M2 setup
+- ESC, EasyESC, bidirectional DShot, ESC telemetry, and RPM filtering notes
+- Dynamic notch and motor FFT test results
+- Build, flash, and test commands
+- Runtime task map
+- Code audit: blocking, latency, allocation, and control-loop risk register
+- Commit checklist
 
 ## Hardware
 
-| Subsystem  | Bus / pins | Notes |
+| Item | Current setup | Notes |
 |---|---|---|
-| **MCU**    | ESP32-S3, 8 MB flash, custom 4 MB partition (`partitions_4mb.csv`) | |
-| **IMU**    | ICM-20948 on FSPI: MOSI=11, SCK=12, MISO=13, CS=14 | up to 7 MHz |
-| **Control radio** | nRF24L01+ on HSPI: SCK=6, MISO=5, MOSI=4; CE=15, CSN=7, IRQ=16 | channel 108, address `CTL01` |
-| **Telemetry radio** | shares the same HSPI; CE=21, CSN=8, IRQ=38 | channel 110, disabled by default |
-| **Baro**   | BMP280 on I²C0: SDA=9, SCL=10 (400 kHz), addr 0x76 | |
-| **ToF**    | VL53L1X on the same I²C bus, addr 0x29 | |
-| **GPS**    | NMEA on UART1: RX=34, TX=33, 9600 baud | |
-| **Pi link**| UART2: RX=18, TX=17, 115200 baud (placeholder) | |
-| **ESCs**   | DSHOT300 on GPIO 39, 40, 37, 42 | refresh 2 ms |
-| **Status** | RX-OK LED=47, TX-OK LED=48 | |
+| Flight controller | Custom ESP32-S3 FCU | Custom board/image pending. |
+| Frame | F450 quadcopter frame | 450 mm class airframe, X quad layout. |
+| ESC | Sequre Blueson A2 6S 65A 4-in-1 ESC, AM32 | DShot capable, telemetry capable, no BEC. |
+| Motors | A2212 / 2212 920KV class motors | 2-4S reference class, 9450/1045 prop class. Verify current and temperature on this exact hardware. |
+| Battery | 4S LiPo | Battery ADC model is compiled into the FCU. |
+| Props | 9450 props | 9.4 x 5 in class, CW/CCW pairs. |
+| Radio | RadioMaster Pocket M2 / Pocket 2 ELRS | Use the ELRS variant, not CC2500. |
+| Receiver | ELRS receiver using CRSF over UART | FCU expects receiver TX/RX on UART0 pins below. |
+| ESC telemetry | Dedicated ESC TLM planned; bidirectional DShot/eRPM planned | BDShot is the RPM-filter path; dedicated TLM is better suited for health data. |
 
-Every pin is overridable via `FCU_PIN_*` build flags in `platformio.ini`.
+## Hardware Images And Reference Links
 
-## Build
+No local image assets or generated PNG plots were found in the repository during
+this docs pass. Add project-owned photos under a docs or assets directory before
+using them in the README.
 
-```bash
-pio run                    # build firmware
-pio run -t upload          # build + flash over USB
-pio run -t monitor         # serial monitor (115200 baud, exception decoder enabled)
-pio run -e test            # build the on-target test harness (src/test_main.cpp)
+![Custom ESP32 FCU](TODO: add custom FCU image path)
+
+Reference links:
+
+- [Sequre Blueson A2 65A 6S AM32 ESC reference](https://www.rotorama.com/product/sequre-blueson-a2-65a-6s-am32)
+- [Sequre Blueson A2 user guide PDF](https://flymod.net/download/sequre_blueson_a2_70a_esc_manual)
+- [RadioMaster Pocket Radio Controller M2 reference](https://radiomasterrc.com/products/pocket-radio-controller-m2?gQT=2)
+- [2212 920KV 2-4S motor reference](https://www.hawks-work.com/pages/brushless-motor-2212)
+- [DJI 9450 prop reference](https://www.bhphotovideo.com/c/product/1080029-REG/dji_cp_ep_000022_9450_self_tightening_rotor_thrust.html/specs)
+- [F450 450 mm frame reference](https://www.hawks-work.com/products/f450-drone-frame-450mm-wheelbase-quadcopter-frame-kit-with-landing-skid-gear)
+- [AM32 firmware documentation](https://wiki.am32.ca/general/docs.html)
+- [Betaflight DShot RPM filtering reference](https://betaflight.com/docs/wiki/guides/current/DSHOT-RPM-Filtering)
+
+Suggested project images to add later:
+
+- Custom ESP32 FCU top and bottom photos.
+- Wiring diagram: FCU to Sequre 4-in-1 ESC, ELRS receiver, battery ADC, GPS, ToF, barometer.
+- Motor order diagram for the F450 frame.
+- Dynamic notch and RPM-filter plots regenerated from `tools/motor_fft`.
+
+## Wiring Map
+
+| Subsystem | Bus / pins | Notes |
+|---|---|---|
+| MCU | ESP32-S3 devkit target, 4 MB partition table | `partitions_4mb.csv` |
+| IMU | ICM-20948 on FSPI: MOSI=11, SCK=12, MISO=13, CS=14 | `FCU_IMU_SPI_HZ=7000000UL` in the flight env |
+| Control link | ELRS/CRSF on UART0: RX=36, TX=37, 420000 baud | Primary control path |
+| Legacy control | FlySky iBUS or nRF24 | Compile-time fallback only |
+| Telemetry radio | nRF24L01+ on HSPI: SCK=6, MISO=5, MOSI=4, CE=21, CSN=8, IRQ=38 | Independent of CRSF control |
+| GPS | UART1: RX=34, TX=33, 9600 baud | Enabled in the main flight env |
+| Pi/autonomy link | UART2: RX=18, TX=17, 115200 baud | Compiled off in the main flight env |
+| Barometer | BMP280 on I2C0: SDA=9, SCL=10, addr 0x76 | Used by altitude/EKF paths |
+| ToF | VL53L1X on I2C0, addr 0x29 | Altitude hold and landing input |
+| Battery | ADC on `FCU_PIN_BATT_ADC=2` | 4S LiPo percent model |
+| ESCs | DShot300 M1=GPIO39, M2=GPIO40, M3=GPIO41, M4=GPIO42 | 500 Hz flight loop |
+| FPV gimbal | PAN=GPIO7, TILT=GPIO16 | Enabled in the main flight env |
+
+Motor order:
+
+| Motor | Position | Direction | GPIO |
+|---|---|---|---|
+| M1 | Front-left | CCW | 39 |
+| M2 | Rear-left | CW | 40 |
+| M3 | Front-right | CW | 41 |
+| M4 | Rear-right | CCW | 42 |
+
+## ELRS / CRSF Setup
+
+The main build uses an ELRS receiver that emits CRSF over UART. `platformio.ini`
+sets:
+
+```ini
+-D USE_ELRS_CRSF_CONTROL=1
+-D CRSF_RX_PIN=36
+-D CRSF_TX_PIN=37
+-D CRSF_BAUD=420000
+-D CRSF_LINK_TIMEOUT_MS=200U
 ```
 
-## Runtime architecture
+RadioMaster Pocket M2 / Pocket 2 ELRS setup checklist:
 
-The firmware runs on four FreeRTOS tasks pinned across both cores. `loop()` is
-left as the lowest-priority task on core 1 and only emits diagnostic logs.
+1. Confirm the handset is the ELRS variant, not the CC2500 variant.
+2. Set the model internal RF protocol to CRSF/ELRS.
+3. Match ELRS firmware major version, regulatory domain, packet rate, and bind
+   phrase between the handset and receiver.
+4. Start with conservative output power and dynamic power disabled until range
+   and failsafe tests are repeatable.
+5. Wire receiver TX to FCU RX GPIO36 and receiver RX to FCU TX GPIO37.
+6. Verify channel order and switch mapping with props removed.
+7. Confirm link-loss behavior: CRSF LQ drops, `CRSF_LINK_TIMEOUT_MS` trips, and
+   the FCU enters failsafe instead of holding stale commands.
 
-| Task | Core | Priority | Wakeup | Job |
-|---|---|---|---|---|
-| `flight`  | 1 | 24 | `vTaskDelayUntil` 2 ms (500 Hz) | DSHOT refresh × 4, IMU read, complementary filter, 250 Hz PID + quad-X mix, failsafe |
-| `radio`   | 0 | 22 | IRQ via `vTaskNotifyGiveFromISR`, 10 ms timeout floor | nRF24 RX poll, telemetry TX, radio init retries |
-| `sensors` | 0 |  8 | `vTaskDelayUntil` 20 ms (50 Hz) | ToF I²C poll, GPS NMEA parse, Pi UART drain |
-| `loopTask` (Arduino) | 1 | 1 | `vTaskDelay` 50 ms | Bench log + `[HEALTH]` stack high-water and free heap |
+The CRSF parser is bounded by a per-call byte guard. The legacy iBUS parser is
+still present for fallback builds and is called out in the audit because it
+drains all currently buffered UART bytes without the same guard.
 
-### Synchronization
+## ESC, EasyESC, DShot, And Telemetry
 
-- `gControlMux` (portMUX) — guards `gState.control.*`. Writers: radio task
-  (`processControlPacket`). Readers/writers: flight task
-  (`applyFailsafeIfNeeded`, `updateControlLoop`). Reader: radio task
-  (`sendTelemetry`) and `loopTask` (log).
-- `gFlightMux` (portMUX) — guards `gState.imuSample`, `gState.attitude`,
-  `gState.pid.*`, `gState.motorRaw`. Single writer (flight task), read by
-  radio + loop for telemetry / logging.
-- Sensor fields (`gState.tof`, `gState.gps`, `gState.pi`) are single-writer
-  from the sensor task; readers accept torn reads since these are best-effort
-  telemetry values.
+Motor-control path:
 
-### Control-radio IRQ path
-
-`attachInterrupt(PIN_CTRL_IRQ, ctrlRadioIsr, FALLING)` →
-`IRAM_ATTR` ISR calls `vTaskNotifyGiveFromISR(gRadioTaskHandle)` +
-`portYIELD_FROM_ISR()`. The radio task blocks on
-`ulTaskNotifyTake(pdTRUE, 10 ms)` — wakes immediately on packet arrival,
-falls back to a 10 ms polling floor.
-
-### Radio init / retry
-
-CTRL and TELM are independent state machines. Each owns its own:
-
-- attempt counter
-- "diagnostic done" flag
-- "given up" flag
-- next-attempt timestamp
-
-Failures back off exponentially (500 ms → 15 s cap) and give up after 20
-attempts. Failure of one radio does **not** block or pause the other.
-
-The bit-bang electrical probe runs **once** in `setup()` via
-`runRadioBitBangDiagnostics()` — this **must** happen before any
-`gRadioBus.begin()` because on Arduino-ESP32 ≥ 3.0 calling `pinMode()` on a
-SPI peripheral pin triggers `spiDetachBus()` and silently kills the entire
-SPI host. Subsequent retries are cheap: HW SPI status read + `RF24::begin()`.
-
-## Flight controller details
-
-- **Attitude estimation**: complementary filter, gyro-dominant short-term
-  (rejects motor-vibration noise on accelerometer), accel-correcting
-  long-term. `τ = 0.5 s`. Runs at 250 Hz.
-- **Inner loop**: 250 Hz cascaded control. Roll/pitch use angle P to generate
-  gyro-rate targets, then rate PID drives the mixer. Yaw uses rate PID damping
-  because the current remote packet has no manual yaw axis.
-- **Mixer**: quad-X using verified motor-number order M1 rear-right,
-  M2 front-right, M3 rear-left, M4 front-left. Mix signs can be flipped with
-  `FCU_MIX_ROLL_SIGN`, `FCU_MIX_PITCH_SIGN`, and `FCU_MIX_YAW_SIGN`.
-- **Failsafe**: 350 ms control-packet timeout enters link-loss grace. The FCU
-  holds the last applied throttle for `FCU_LINK_LOSS_HOLD_MS`, commands level
-  attitude, then ramps throttle to zero over `FCU_LINK_LOSS_RAMPDOWN_MS`.
-  Non-link failsafes still stop motors immediately.
-- **PID gain hot-reload**: control packets carry the full gain table per axis.
-  Gains are clamped on receipt (`P ≤ 5.0`, `I ≤ 3.0`, `D ≤ 1.0`) to keep a
-  malformed packet from destabilizing the loop.
-- **ESC startup settle**: 3 s after arm, motors are held at DSHOT zero while
-  the control link comes up.
-
-## Protocols
-
-See `include/control_protocol.h`. Both packets are 32-byte payloads (fit a
-single nRF24L01+ frame).
-
-- **ControlPacket** — version, sequence, stick X/Y, throttle, mode, flag bits
-  (flight switch, IMU calibrate request, safe-boot complete, etc.), full PID
-  gain table.
-- **TelemetryPacket** — attitude in centidegrees, PID output values, ToF, GPS
-  fix state, link / failsafe / IMU / GPS / Pi flags.
-
-## File layout
-
-```
-src/main.cpp              firmware entrypoint, tasks, RTOS plumbing
-src/test_main.cpp         on-target bench test harness (pio env=test only)
-include/control_protocol.h
-include/fcu_pid.h
-pid_controller.{hpp,cpp}  PID controller core
-pid_wrapper.{h,cpp}       C-style wrapper around the PID
-platformio.ini            build envs + pin/clock overrides
-partitions_4mb.csv        custom partition table for the 4 MB usable flash
+```text
+src/main.cpp updateControlLoop()
+  -> applyMotorOutputs()
+  -> EasyEscMotor::spinRaw()
+  -> EscDshotOutput::sendMotorRaw()
+  -> DShotRMT::sendThrottle()
+  -> DShotRMT::_sendPacket()
+  -> rmt_transmit()
 ```
 
-## Configuration
+Current flight default:
 
-Common build flags (`platformio.ini` `[env:esp32-s3-mini]` → `build_flags`):
+```ini
+; DShot300 motor output is active.
+; Bidirectional DShot is compiled off unless this line is enabled:
+; -D FCU_DSHOT_BIDIR=1
 
-- `FCU_ENABLE_TELEMETRY_RADIO=1` — enable telemetry TX radio
-- `FCU_RADIO_SPI_HZ=<hz>` — nRF SPI clock (default 1 MHz, max 10 MHz)
-- `FCU_IMU_SPI_HZ=<hz>` — IMU SPI clock (default 1 MHz, max 7 MHz)
-- `FCU_PIN_*` — override any pin (CE/CSN/IRQ/MOSI/MISO/SCK/etc.)
-- `FCU_SENSITIVE_PIN_SAFE_BOOT_MS=<ms>` — safe-boot delay before motor outputs
-  can be commanded
-
-## Reading the serial log
-
-Key lines you'll see on boot:
-
-```
-[FCU] control RX + sensors + PID startup
-[ESC] motor=0 expected_gpio=39 ... initialized=1 armed=1
-[IMU] ready SPI=1000000 sample=1
-[I2C] ready SDA=9 SCL=10
-[BMP] ready addr=0x76 chip=0x58
-[RADIO][CTRL] bitbang=0x?? /0x??           ← one-shot pre-bus probe
-[RADIO][CTRL] SPI=… bb=… hw=…              ← first HW probe
-[RADIO][CTRL] ready                        ← begin + isChipConnected passed
-[FCU] summary esc=1 imu=1 imu_sample=1 …
-[FCU] RTOS tasks ready: flight@core1/p24 radio@core0/p22 sensors@core0/p8
+; RPM filter is implemented but off unless enabled:
+; -D FCU_ENABLE_RPM_FILTER=1
 ```
 
-Periodic during operation:
+Sequre Blueson A2 notes for this build:
 
+- Use a separate regulated 5 V supply; the ESC reference lists no BEC.
+- AM32 supports DShot-class protocols and telemetry features, but the exact ESC
+  firmware/config must be verified on the bench before relying on RPM data.
+- The ESC's current and voltage telemetry should be treated as unverified until
+  logged against bench instruments.
+
+Dedicated ESC TLM versus bidirectional DShot:
+
+| Path | Wiring | Best use | Status |
+|---|---|---|---|
+| Dedicated ESC TLM pin | Separate ESC telemetry wire to a UART | Voltage, current, temperature, aggregate health data | Planned |
+| Bidirectional DShot | Same motor signal wire, open-drain with 3.3 V pull-up | Per-motor eRPM for RPM filtering | Planned / compile-gated |
+
+For RPM filtering, the important signal is per-motor eRPM. That normally comes
+from bidirectional DShot on the motor signal line. Dedicated ESC TLM is still
+useful for health telemetry, but it is not the current fast per-motor filter
+input in this firmware.
+
+BDShot hardware requirement: add 4.7 kOhm pull-ups from each motor signal line
+to 3.3 V at the FCU end before enabling `FCU_DSHOT_BIDIR=1`. Validate with
+props off and do not enable `FCU_RPM_FILTER_REQUIRED_FOR_ARM=1` until all four
+motors produce stable telemetry.
+
+## Filtering And Dynamic Notch
+
+Dynamic throttle-mapped gyro notch is enabled in the main env:
+
+```ini
+-D ENABLE_DYNAMIC_NOTCH=1
 ```
-[FCU] ctrl=1 telem=0 esc_hold=0 link=1 failsafe=0 packets=… thr=… m=…/… att=… pid=…
-[HEALTH] stack_free(words) flight=… radio=… sensors=… loop=… heap_free=…
-[CTRL] failsafe entered (timeout); throttle=0
-[RADIO][CTRL] attempt N failed; next retry in <ms> ms
-[RADIO][CTRL] giving up after 20 attempts
+
+The committed motor FFT reports show the strongest DShot 1100 motor band around
+125-130 Hz on the current airframe, with higher-order peaks around 250-370 Hz
+depending on motor. The dynamic notch report is the source of truth for current
+logged results:
+
+- [docs/DYNAMIC_NOTCH_TEST.md](docs/DYNAMIC_NOTCH_TEST.md)
+- `tools/motor_fft/*_report.txt`
+- `tools/motor_fft/*.csv`
+
+RPM-filter bring-up flags:
+
+```ini
+-D FCU_DSHOT_BIDIR=1
+-D FCU_ENABLE_RPM_FILTER=1
+-D FCU_RPM_MOTOR_POLES=<rotor magnet count>
 ```
 
-`stack_free` is in 32-bit words. Drop a task's stack allocation if its
-high-water shows headroom, bump it if it's getting close to zero.
+`FCU_RPM_MOTOR_POLES` is the rotor bell magnet count, not stator teeth or coil
+count.
 
-## Known limitations
+## Build And Flash
 
-- Yaw is integrated from the gyro only; expect drift. Magnetometer fusion
-  (ICM-20948 has one) is not yet wired up.
-- Quad-X motor positions follow the verified M1/M2/M3/M4 frame numbering, but
-  first hover tests should still confirm pitch/roll/yaw correction signs.
-- Telemetry radio is disabled in the default build (`FCU_ENABLE_TELEMETRY_RADIO=0`).
-- VL53L1X ToF is optional; the firmware logs "not found" and continues if
-  the sensor isn't present on the I²C bus.
+Use the PlatformIO executable in the user environment if `pio` is not on PATH:
+
+```pwsh
+C:\Users\ahmad\.platformio\penv\Scripts\platformio.exe run -e esp32-s3-mini
+```
+
+Common commands:
+
+```pwsh
+pio run -e esp32-s3-mini
+pio run -e esp32-s3-mini -t upload
+pio device monitor -e esp32-s3-mini
+pio run -e fcu_motor_fft_test -t upload
+pio run -e fcu_bench_test -t upload
+pio run -e ekf_sim
+pio run -e native_ekf_sim
+```
+
+Available environments:
+
+| Env | Purpose |
+|---|---|
+| `esp32-s3-mini` | Main flight firmware |
+| `esp32-s3-mini-pidweb` | PID webserver build with failsafes relaxed for bench tuning |
+| `test` | PlatformIO on-target test harness |
+| `fcu_motor_fft_test` | Isolated motor vibration/FFT firmware |
+| `fcu_motor_fft_test_full_dshot` | Full-range motor sweep variant |
+| `fcu_bench_test` | Auto-sequenced motor/IMU/mixer bench verification |
+| `ekf_sim` | On-target EKF synthetic trajectory test |
+| `native_ekf_sim` | Desktop/native EKF synthetic trajectory test |
+
+## Runtime Tasks
+
+| Task | Core | Priority | Rate / wakeup | Owns |
+|---|---:|---:|---|---|
+| `flightTask` | 1 | 24 | 2 ms, 500 Hz | IMU read, attitude, EKF predict, gyro filtering, PID, mixer, DShot |
+| `radioTask` | 1 | 23 | 10 ms service loop | nRF telemetry, radio init/retry |
+| `sensorTask` | 0 | 8 | 20 ms, 50 Hz | ToF, BMP280, GPS, battery, Pi telemetry |
+| `crsfControlTask` | 0 | 7 | 4 ms | ELRS/CRSF UART drain and ControlPacket dispatch |
+| `ibusControlTask` | 0 | 7 | 5 ms | Legacy iBUS fallback when compiled in |
+
+The Arduino `loop()` task stays low priority and only emits slow diagnostics.
+
+## Code Audit: Blocking / Latency / Allocation Risks
+
+This audit documents risk patterns only. No source fixes were made in this
+documentation pass.
+
+| File | Function / area | Approx line | Pattern | Why risky | Severity | Suggested future fix | Status |
+|---|---|---:|---|---|---|---|---|
+| `src/main.cpp` | `ensureSingleEscArmed()` / `applyMotorOutputs()` | 4677 / 4708 | Runtime re-arm, zero command, and throttled `Serial.printf()` in motor-output path | If an ESC de-arms or a driver fault occurs during flight, the 500 Hz path can do extra command traffic and logging instead of staying a pure output path | High | Move re-arm/recovery to an explicit state-machine phase; make the flight output path send throttle or fail-safe zero only | Not fixed in this pass |
+| `src/main.cpp` | `applyMotorOutputs()` | 4721-4724 | Four sequential motor writes | Per-motor send time and failures accumulate inside the flight tick; skew matters once BDShot telemetry is enabled | Medium | Measure max send time with all four motors, then consider grouped send scheduling or stricter timing counters | Not fixed in this pass |
+| `lib/easy-esc-esp32/src/esc_dshot_output.cpp` | `sendMotorRaw()` | 521-540 | Telemetry poll before throttle send, `Serial.printf()` on TX failure | Repeated TX failures can add USB CDC pressure; BDShot polling adds work to each motor write | High | Store compact error counters in the hot path; emit logs from a lower-priority diagnostics task | Not fixed in this pass |
+| `lib/DShotRMT/src/DShotRMT.cpp` | `_sendPacket()` | 420-441 | Nonblocking `rmt_transmit()` queue attempt | Queue or timing failures drop a frame; this is acceptable only if failure counters and motor behavior are monitored | Medium | Track per-motor queue/timing misses and expose them in health telemetry | Not fixed in this pass |
+| `lib/DShotRMT/src/DShotRMT.cpp` | `_on_tx_done()` | 729-746 | Starts `rmt_receive()` from the TX-done callback | Driver calls from an ISR-style callback can add latency or fail under contention; must be proven at the final motor rate | High | Bench-test BDShot at 500 Hz on all four motors; consider pre-armed receive windows or a deferred receive-start design if jitter appears | Not fixed in this pass |
+| `lib/DShotRMT/src/DShotRMT.cpp` | `_sendRepeatedCommand()` | 281-298 | `delayMicroseconds()` between DShot command repeats | Blocking, but used for setup/config commands rather than normal throttle output | Low | Keep repeated commands out of the armed flight path | Not fixed in this pass |
+| `src/main.cpp` | `updateControlLoop()` filters and IMU read | 6311-6334 | Dynamic/RPM filter updates plus SPI IMU read in the 2 ms loop | Any SPI stall or expensive coefficient update directly consumes flight-loop budget | Medium | Keep coefficient updates rate-limited; log max loop time under FFT/RPM-filter builds | Not fixed in this pass |
+| `src/main.cpp` | Flight-loop debug logs | 6315, 6759, 6829 | `Serial.printf()` behind debug/tuning flags | USB CDC backpressure can add jitter if debug flags are enabled during flight | Medium | Keep debug flags off for flight; use ring-buffered telemetry drained by a lower-priority task | Not fixed in this pass |
+| `src/main.cpp` | BMP280 / I2C sensor path | 3180, 3389, 3449 | Blocking I2C sensor reads with Wire timeout | Sensor task is lower priority than flight, but I2C faults can delay altitude/failsafe freshness | Medium | Add sensor fault backoff and log read duration; keep control-loop dependencies tolerant of stale altitude | Not fixed in this pass |
+| `src/main.cpp` | GPS / Pi UART drains | 3819, 3847 | Bounded `while` drains with byte budgets | Work per wake is bounded, but UART floods still consume sensor-task time | Low | Keep budgets; expose dropped/remaining byte counters if telemetry staleness appears | Not fixed in this pass |
+| `src/main.cpp` | nRF control/telemetry drains | 5215, 5269 | Bounded packet loops | Work is capped, but packet floods can still load the radio task | Low | Keep packet caps and profile `radioMaxUs` during radio stress tests | Not fixed in this pass |
+| `include/crsf_receiver.h` | `CrsfReceiver::poll()` | 94-95 | UART drain with `guard = 512` | Bounded and appropriate, but the worst-case byte flood still has a known CPU cost | Low | Leave guard in place; tune if CRSF task max time grows | Not fixed in this pass |
+| `include/ibus_receiver.h` | `IBusReceiver::poll()` | 60 | Unbounded `while (serial_->available() > 0)` | Legacy fallback can drain an arbitrary UART backlog in one call | Medium | Add a CRSF-style byte guard before using iBUS in flight again | Not fixed in this pass |
+| `src/pid_webserver_enabled.cpp` | HTTP body / WiFi connect | 267, 515-521 | Blocking HTTP receive loop and `delay(100)` during WiFi connect | Bench-only env; unsafe if mixed into flight-critical timing | Medium | Keep PID webserver isolated to `esp32-s3-mini-pidweb`; do not fly with it enabled | Not fixed in this pass |
+| `src/motor_fft_test.cpp` | Test harness buffers and serial dump | 372-374, 683 | Runtime heap allocation and buffered CSV dump loop | Isolated test firmware only; acceptable for bench tooling but not a flight-loop pattern | Low | Keep allocation/dump behavior out of main flight firmware | Not fixed in this pass |
+| `lib/easy-esc-esp32/src/easy_esc.cpp` | Current calibration | 344 | `delay(sampleDelayMs)` | Blocking calibration routine; acceptable only when invoked deliberately on the bench | Low | Keep calibration out of armed flight state | Not fixed in this pass |
+
+Highest-risk areas to verify before enabling RPM filtering in flight:
+
+- BDShot receive startup from the RMT TX-done callback.
+- Repeated motor-output failure logging and runtime re-arm behavior.
+- Per-motor send time with telemetry polling enabled on all four motors.
+- Debug Serial flags accidentally left enabled during flight.
+
+## File Layout
+
+```text
+src/main.cpp                    firmware entrypoint, tasks, module implementations
+include/*.h                     module contracts and small header-only controllers
+lib/DShotRMT                    local RMT DShot/BDShot driver
+lib/easy-esc-esp32              local EasyESC facade used by the firmware
+tools/motor_fft                 serial motor FFT logger and committed CSV/report artifacts
+tools/motor_sweep_gui           PyQt motor sweep and spectrum GUI
+tools/sim_tuning                MATLAB/Simulink tuning workflow
+docs/ARCHITECTURE.md            EKF/GNC architecture notes
+docs/DYNAMIC_NOTCH_TEST.md      dynamic notch and motor FFT test report
+platformio.ini                  build envs, pins, feature gates
+partitions_4mb.csv              flash partition table
+```
+
+## Commit Checklist
+
+Before a large commit, run at least:
+
+```pwsh
+pio run -e esp32-s3-mini
+pio run -e fcu_motor_fft_test
+pio run -e fcu_bench_test
+pio run -e native_ekf_sim
+```
+
+For RPM-filter changes, also compile a temporary env or local flag set with:
+
+```ini
+-D FCU_DSHOT_BIDIR=1
+-D FCU_ENABLE_RPM_FILTER=1
+```
+
+Review `git status --short` carefully before staging. This worktree contains
+generated, experimental, and untracked files.
 
 ## License
 
-TBD.
+Project license: TBD. Vendored libraries retain their upstream licenses.
