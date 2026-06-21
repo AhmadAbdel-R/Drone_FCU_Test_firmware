@@ -10953,6 +10953,21 @@ void serviceEscStartupSettle(uint32_t nowMs) {
   }
 }
 
+void serviceBootMotorZeroHeartbeat() {
+  if (!gState.escReady) {
+    return;
+  }
+  // setup() can block for several seconds on IMU/BMP init and stationary
+  // calibration before flightTask exists. Keep the ESC signal alive at DShot
+  // zero during that window; flightTask becomes the sole motor writer after
+  // the scheduler starts.
+  gMotor0.update();
+  gMotor1.update();
+  gMotor2.update();
+  gMotor3.update();
+  sendZeroDshotFrame();
+}
+
 // =============================================================================
 // [CALIBRATION] — sensor calibration helpers
 // -----------------------------------------------------------------------------
@@ -11060,6 +11075,7 @@ void runBootStationaryCal() {
                     math3::Vector3{s.gx_dps, s.gy_dps, s.gz_dps},
                     baroValid, baroPa, nowMs);
     }
+    serviceBootMotorZeroHeartbeat();
     feedTaskWatchdog();
     delay(10);
   }
@@ -11678,6 +11694,7 @@ void setup() {
     gState.escReadyMs = millis();
     Serial.printf("[ESC] startup settle %lu ms: holding motors at DSHOT zero while control link comes up\n",
                   static_cast<unsigned long>(ESC_STARTUP_SETTLE_MS));
+    serviceBootMotorZeroHeartbeat();
   }
 
 #if ENABLE_ESC_PASSTHROUGH
@@ -11696,6 +11713,7 @@ void setup() {
 #endif
   feedTaskWatchdog();
   gState.imuReady = initImu(gState.imuSpiUsedHz, gState.imuSample, gState.imuSampleValid);
+  serviceBootMotorZeroHeartbeat();
   feedTaskWatchdog();
   if (gState.imuSampleValid) {
     updateAttitudeFromImu(gState.imuSample, gState.attitude, 0.0f);
@@ -11735,7 +11753,9 @@ void setup() {
   }
 #endif
   gState.i2cReady = initI2c();
+  serviceBootMotorZeroHeartbeat();
   gState.bmpReady = gState.i2cReady && initBmp(gState.bmpChipId, gState.bmpAddr);
+  serviceBootMotorZeroHeartbeat();
   feedTaskWatchdog();
 
   // [CALIBRATION] Run boot stationary calibration AFTER IMU + BMP are up but
@@ -11746,6 +11766,7 @@ void setup() {
   } else {
     Serial.println("[CAL] skipping boot stationary cal (IMU not ready)");
   }
+  serviceBootMotorZeroHeartbeat();
   // Configure the GPS origin debouncer with bench-friendly defaults. The
   // operator can tighten via NVS later if needed.
   {
@@ -11756,9 +11777,12 @@ void setup() {
   feedTaskWatchdog();
 
   gState.tof.ready = initTof();
+  serviceBootMotorZeroHeartbeat();
   gTofFilter.reset();
   gState.gps.uartReady = initGpsUart();
+  serviceBootMotorZeroHeartbeat();
   gState.pi.uartReady = initPiUart();
+  serviceBootMotorZeroHeartbeat();
   gState.pi.status = gState.pi.uartReady ? 1 : 0;
   if (gState.pi.uartReady) {
     gPiAutonomy.begin(gPiSerial);
@@ -11851,6 +11875,7 @@ void setup() {
   gState.nextCtrlRadioInitMs = millis();
   gState.nextTelemRadioInitMs = millis();
   serviceRadioInit(millis());
+  serviceBootMotorZeroHeartbeat();
   feedTaskWatchdog();
 
 #if USE_NRF_CONTROL
@@ -11882,6 +11907,7 @@ void setup() {
                 TELEMETRY_RADIO_ENABLED ? (gState.telemRadioReady ? "ready" : "init pending")
                                         : "disabled (build flag)");
   Serial.flush();
+  serviceBootMotorZeroHeartbeat();
 
   // Spawn the radio task first so its handle is valid before the CTRL IRQ can fire.
   // (With USE_NRF_CONTROL=0 the CTRL IRQ install is skipped, but the radio task
