@@ -12002,12 +12002,13 @@ void setup() {
   }
 #endif
 #if ENABLE_BLE_CONFIG
+  const bool bleBootStored = gPidNvs.hasBleBootEnabled();
   const bool bleBootEnabled = gPidNvs.loadBleBootEnabled(BLE_DEFAULT_ENABLED != 0);
   fcu_ble_config::init(millis(), bleBootEnabled, saveBleBootEnabled);
   Serial.printf("[BLE] config compiled=1 boot_request=%u default=%u source=%s\n",
                 static_cast<unsigned>(bleBootEnabled),
                 static_cast<unsigned>(BLE_DEFAULT_ENABLED != 0),
-                gPidNvs.ready() ? "nvs" : "compiled");
+                bleBootStored ? "nvs" : "default");
 #endif
 
 #if FCU_WIFI_STACK_ENABLED

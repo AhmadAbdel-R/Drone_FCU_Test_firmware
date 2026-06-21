@@ -175,6 +175,10 @@ class FcuPidNvs {
     return const_cast<Preferences&>(prefs_).getUChar("bleBoot", defaultEnabled ? 1 : 0) != 0;
   }
 
+  bool hasBleBootEnabled() const {
+    return ready_ && const_cast<Preferences&>(prefs_).isKey("bleBoot");
+  }
+
   bool saveBleBootEnabled(bool enabled) {
     if (!ready_) return false;
     return prefs_.putUChar("bleBoot", enabled ? 1 : 0) > 0;
