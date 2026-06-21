@@ -22,10 +22,10 @@ constexpr size_t kMaxPayloadLen = 512;
 constexpr size_t kMaxFrameLen = kHeaderLen + kMaxPayloadLen + kCrcLen;
 
 #ifndef FCU_CONFIGURATOR_MAX_RX_BYTES_PER_SERVICE
-#define FCU_CONFIGURATOR_MAX_RX_BYTES_PER_SERVICE 128
+#define FCU_CONFIGURATOR_MAX_RX_BYTES_PER_SERVICE 512
 #endif
 #ifndef FCU_CONFIGURATOR_TX_TIMEOUT_MS
-#define FCU_CONFIGURATOR_TX_TIMEOUT_MS 40U
+#define FCU_CONFIGURATOR_TX_TIMEOUT_MS 120U
 #endif
 
 enum FrameFlags : uint8_t {

@@ -1712,6 +1712,14 @@ static constexpr uint16_t ZERO_THR_RAW = 0;
 static constexpr uint32_t ZERO_SEND_PERIOD_US = 2000;    // 500 Hz zero-frame output
 static constexpr uint32_t ZERO_LOG_PERIOD_MS = 250;      // concise bench logs
 static constexpr uint32_t HEALTH_LOG_PERIOD_MS = 5000;   // stack high-water + heap snapshot
+#ifndef FCU_PERIODIC_LOOP_LOGS
+#if ENABLE_USB_CONFIG && !FCU_ENABLE_USB_SERIAL_LOGGING && !FCU_WIFI_STACK_ENABLED
+#define FCU_PERIODIC_LOOP_LOGS 0
+#else
+#define FCU_PERIODIC_LOOP_LOGS 1
+#endif
+#endif
+static constexpr bool PERIODIC_LOOP_LOGS_ENABLED = (FCU_PERIODIC_LOOP_LOGS != 0);
 static constexpr uint32_t ESC_STARTUP_SETTLE_MS = 3000;  // hold DSHOT zero after attach/arm
 static constexpr uint16_t PIDWEB_MOTOR_TEST_RAW = 300;
 static constexpr uint32_t PIDWEB_MOTOR_TEST_MS = 300;
@@ -12014,9 +12022,17 @@ void loop() {
   if (gNotchAnalyzer.needsAnalyze()) {
     gNotchAnalyzer.analyze();
   }
-  const SensorSnapshot sensorSnap = readSensorSnapshot();
+  const bool loopLogDue = PERIODIC_LOOP_LOGS_ENABLED &&
+                          !esc_passthrough::isActive() &&
+                          nowMs - gState.lastLogMs >= ZERO_LOG_PERIOD_MS;
+  const bool healthLogDue = PERIODIC_LOOP_LOGS_ENABLED &&
+                            nowMs - gState.lastHealthLogMs >= HEALTH_LOG_PERIOD_MS;
+  SensorSnapshot sensorSnap;
+  if (loopLogDue || healthLogDue) {
+    sensorSnap = readSensorSnapshot();
+  }
 
-  if (!esc_passthrough::isActive() && nowMs - gState.lastLogMs >= ZERO_LOG_PERIOD_MS) {
+  if (loopLogDue) {
     gState.lastLogMs = nowMs;
 
     bool linkActive;
@@ -12253,7 +12269,7 @@ void loop() {
                   static_cast<unsigned long>(gPiAutonomy.aiLowConfidenceCount()));
   }
 
-  if (nowMs - gState.lastHealthLogMs >= HEALTH_LOG_PERIOD_MS) {
+  if (healthLogDue) {
     gState.lastHealthLogMs = nowMs;
     const UBaseType_t flightHw = (gFlightTaskHandle != nullptr)
                                      ? uxTaskGetStackHighWaterMark(gFlightTaskHandle) : 0;
