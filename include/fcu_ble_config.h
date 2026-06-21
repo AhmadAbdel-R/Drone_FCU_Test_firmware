@@ -34,6 +34,8 @@
 
 namespace fcu_ble_config {
 
+using PersistRequestedFn = bool (*)(bool enabled);
+
 struct Status {
   bool compiled = false;
   bool requestedEnabled = false;
@@ -45,7 +47,8 @@ struct Status {
   uint32_t toggles = 0;
 };
 
-void init(uint32_t nowMs);
+void init(uint32_t nowMs, bool bootEnabled = (BLE_DEFAULT_ENABLED != 0),
+          PersistRequestedFn persistRequested = nullptr);
 void service(uint32_t nowMs, bool allowToggle);
 bool setRequestedEnabled(bool enabled);
 bool requestedEnabled();

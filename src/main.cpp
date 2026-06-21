@@ -2254,6 +2254,10 @@ static inline bool failsafesBypassed() {
   return gFailsafeBypass.load(std::memory_order_relaxed);
 }
 
+bool saveBleBootEnabled(bool enabled) {
+  return gPidNvs.saveBleBootEnabled(enabled);
+}
+
 // New autonomy controllers. All four are unconditionally compiled in so the
 // mode-switch decoder doesn't need #ifdef walls around every call site;
 // they're disengaged unless the active FlightMode triggers them.
@@ -11998,7 +12002,9 @@ void setup() {
   }
 #endif
 #if ENABLE_BLE_CONFIG
-  fcu_ble_config::init(millis());
+  fcu_ble_config::init(millis(),
+                       gPidNvs.loadBleBootEnabled(BLE_DEFAULT_ENABLED != 0),
+                       saveBleBootEnabled);
 #endif
 
 #if FCU_WIFI_STACK_ENABLED

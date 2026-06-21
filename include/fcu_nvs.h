@@ -167,6 +167,19 @@ class FcuPidNvs {
     return prefs_.putUChar("fsByp", bypass ? 1 : 0) > 0;
   }
 
+  // ---- BLE configurator boot gate ------------------------------------------
+  // BLE remains compile-gated by ENABLE_BLE_CONFIG. This key only remembers
+  // whether the BLE configurator should be requested on boot when compiled in.
+  bool loadBleBootEnabled(bool defaultEnabled) const {
+    if (!ready_) return defaultEnabled;
+    return const_cast<Preferences&>(prefs_).getUChar("bleBoot", defaultEnabled ? 1 : 0) != 0;
+  }
+
+  bool saveBleBootEnabled(bool enabled) {
+    if (!ready_) return false;
+    return prefs_.putUChar("bleBoot", enabled ? 1 : 0) > 0;
+  }
+
   // ---- Autonomy-controller gain persistence --------------------------------
   // All gains stored as float (Preferences::getFloat / putFloat). Distinct
   // key prefixes per controller; key length kept under the 15-char NVS limit.

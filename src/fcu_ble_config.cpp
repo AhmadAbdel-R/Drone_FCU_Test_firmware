@@ -27,8 +27,10 @@ constexpr uint16_t kFastBlinkOffMs = 62;
 
 Status gStatus;
 bool gRequestedEnabled = (BLE_DEFAULT_ENABLED != 0);
+PersistRequestedFn gPersistRequested = nullptr;
 bool gActive = false;
 bool gConnected = false;
+bool gInitialized = false;
 bool gRawButtonState = true;
 bool gStableButtonState = true;
 bool gLastReleasedState = true;
@@ -47,6 +49,12 @@ void writeBleLeds(bool on) {
   writeLedPin(FCU_BLE_STATUS_LED_A, on);
   if (FCU_BLE_STATUS_LED_B != FCU_BLE_STATUS_LED_A) {
     writeLedPin(FCU_BLE_STATUS_LED_B, on);
+  }
+}
+
+void persistRequestedEnabled() {
+  if (gPersistRequested != nullptr) {
+    (void)gPersistRequested(gRequestedEnabled);
   }
 }
 
@@ -252,6 +260,7 @@ void pollButton(uint32_t nowMs, bool allowToggle) {
     if (allowToggle) {
       gRequestedEnabled = !gRequestedEnabled;
       gStatus.toggles++;
+      persistRequestedEnabled();
     }
     gClickCount = 0;
   }
@@ -282,20 +291,28 @@ void serviceLeds(uint32_t nowMs) {
 
 }  // namespace
 
-void init(uint32_t nowMs) {
+void init(uint32_t nowMs, bool bootEnabled, PersistRequestedFn persistRequested) {
   gStatus.compiled = ENABLE_BLE_CONFIG != 0;
-  gRequestedEnabled = (BLE_DEFAULT_ENABLED != 0);
+  gRequestedEnabled = bootEnabled;
+  gPersistRequested = persistRequested;
   pinMode(FCU_BLE_BOOT_BUTTON_PIN, INPUT_PULLUP);
   if (FCU_BLE_STATUS_LED_A >= 0) pinMode(FCU_BLE_STATUS_LED_A, OUTPUT);
   if (FCU_BLE_STATUS_LED_B >= 0 && FCU_BLE_STATUS_LED_B != FCU_BLE_STATUS_LED_A) {
     pinMode(FCU_BLE_STATUS_LED_B, OUTPUT);
   }
   writeBleLeds(false);
+  gRawButtonState = digitalRead(FCU_BLE_BOOT_BUTTON_PIN) != LOW;
+  gStableButtonState = gRawButtonState;
+  gLastReleasedState = gStableButtonState;
   gButtonChangeMs = nowMs;
+  gClickCount = 0;
+  gClickWindowStartMs = 0;
+  gInitialized = true;
 }
 
 void service(uint32_t nowMs, bool allowToggle) {
 #if ENABLE_BLE_CONFIG
+  if (!gInitialized) return;
   pollButton(nowMs, allowToggle);
   if (gRequestedEnabled && !gActive) {
     (void)startBle(nowMs);
@@ -313,7 +330,9 @@ void service(uint32_t nowMs, bool allowToggle) {
 }
 
 bool setRequestedEnabled(bool enabled) {
+  if (gRequestedEnabled == enabled) return true;
   gRequestedEnabled = enabled;
+  persistRequestedEnabled();
   return true;
 }
 
