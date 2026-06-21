@@ -198,7 +198,9 @@ bool startBle(uint32_t nowMs) {
   gRx = service->createCharacteristic(kRxUuid,
                                       BLECharacteristic::PROPERTY_WRITE |
                                       BLECharacteristic::PROPERTY_WRITE_NR);
-  gTx = service->createCharacteristic(kTxUuid, BLECharacteristic::PROPERTY_NOTIFY);
+  gTx = service->createCharacteristic(kTxUuid,
+                                      BLECharacteristic::PROPERTY_NOTIFY |
+                                      BLECharacteristic::PROPERTY_INDICATE);
   gInfo = service->createCharacteristic(kInfoUuid, BLECharacteristic::PROPERTY_READ);
   if (gRx == nullptr || gTx == nullptr || gInfo == nullptr) {
     BLEDevice::deinit(false);
