@@ -11906,8 +11906,11 @@ void setup() {
   Serial.printf("[FCU] failsafe starts active; control link drives throttle, telemetry %s\n",
                 TELEMETRY_RADIO_ENABLED ? (gState.telemRadioReady ? "ready" : "init pending")
                                         : "disabled (build flag)");
+#if !(ENABLE_USB_CONFIG && !FCU_ENABLE_USB_SERIAL_LOGGING)
   Serial.flush();
+#endif
   serviceBootMotorZeroHeartbeat();
+  Serial.println("[FCU] spawning RTOS tasks");
 
   // Spawn the radio task first so its handle is valid before the CTRL IRQ can fire.
   // (With USE_NRF_CONTROL=0 the CTRL IRQ install is skipped, but the radio task
@@ -11949,7 +11952,9 @@ void setup() {
                   static_cast<int>(ibusTaskOk),
                   static_cast<int>(crsfTaskOk));
     forceMotorStop("fatal_task_create");
+#if !(ENABLE_USB_CONFIG && !FCU_ENABLE_USB_SERIAL_LOGGING)
     Serial.flush();
+#endif
     delay(100);
     ESP.restart();
   }

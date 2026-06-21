@@ -767,7 +767,6 @@ void init(const pid_webserver::Callbacks& callbacks, const char* buildName) {
   // and a frame larger than the ring forces HWCDC's fragile multi-write drain
   // path which — under the SERIAL_IN_EMPTY re-arm race — stalls or corrupts the
   // reply. A ring comfortably above kMaxFrameLen keeps every reply atomic.
-  Serial.flush();
   Serial.setTxBufferSize(2048);
   resetRx();
   fcu_log::logf(fcu_log::Level::Warn,
