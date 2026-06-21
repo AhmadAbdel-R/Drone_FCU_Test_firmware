@@ -15,16 +15,16 @@
 //     it shares state with the PID. Look for `// [MIXER]` markers.
 //
 // Motor numbering (CRITICAL — wiring depends on this):
-//   M1 — front-left  (GPIO 39) — CCW
-//   M2 — rear-left   (GPIO 40) — CW
-//   M3 — front-right (GPIO 41) — CW
-//   M4 — rear-right  (GPIO 42) — CCW
+//   M1 — front-right (GPIO 39) — CW
+//   M2 — rear-right  (GPIO 40) — CCW
+//   M3 — front-left  (GPIO 41) — CCW
+//   M4 — rear-left   (GPIO 42) — CW
 //
 // DShot value range:
 //   0           = motors off (no signal)
 //   1..47       = reserved (DShot commands like beep, direction, save)
 //   48..2047    = throttle 0..100%
-//   MOTOR_OUTPUT_MAX_RAW (default 1800) = where 100% stick maps
+//   MOTOR_OUTPUT_MAX_RAW (active flight env: 1900) = where 100% stick maps
 //   MOTOR_OUTPUT_ABS_MAX_RAW (2047) = absolute physical cap
 //
 // Mixer:
@@ -71,4 +71,11 @@ void sendZeroDshotFrame();
 // in gState.motorRaw, resets PID integrators (gState.pid.*), and marks the
 // smoothed-throttle slew filter as uninitialized so the next non-zero command
 // snaps cleanly instead of ramping from a stale value.
-void forceMotorStop();
+//
+// `reason` must be a static string ("disarmed", "imu_invalid", ...). It is
+// recorded in gState.pid.lastResetReason for the [FLT_STATE] log / telemetry.
+// IMPORTANT (active-flight-path safety fix, 2026-06): this is a TRANSITION
+// action — disarm, failsafe, touchdown, explicit stop. It must NOT be called
+// merely because the pilot's throttle stick is low while armed; that case is
+// handled by the armed-idle path in updateControlLoop().
+void forceMotorStop(const char* reason = "unspecified");

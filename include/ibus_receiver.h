@@ -57,7 +57,11 @@ class IBusReceiver {
       return false;
     }
     bool gotFrame = false;
-    while (serial_->available() > 0) {
+    // Bound work per call so a UART flood or large backlog can't make one poll
+    // drain unbounded bytes in a single task iteration (mirrors CrsfReceiver
+    // and the GPS/Pi parsers). (F7)
+    int guard = 512;
+    while (serial_->available() > 0 && guard-- > 0) {
       const int byteIn = serial_->read();
       if (byteIn < 0) break;
       const uint8_t b = static_cast<uint8_t>(byteIn);

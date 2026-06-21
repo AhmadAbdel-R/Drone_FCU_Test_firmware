@@ -28,14 +28,13 @@
 //   CH3 (1000-2000 µs)  →  throttle  → packet.throttlePercent (0..100)
 //   CH4 (1000-2000 µs)  →  yaw       → gCrsfYawStickPercent (side channel)
 //   CH5 (2/3-pos)       →  arm/disarm  — RESERVED for future state mapping
-//   CH6 (3-pos)         →  flight mode — RESERVED for future state mapping
-//   CH7 (1000-2000 µs)  →  camera PAN  → CameraPanTilt (normalized -1..+1)
-//   CH8 (1000-2000 µs)  →  camera TILT → CameraPanTilt (normalized -1..+1)
-//   CH9+                →  unused; available for later.
+//   CH6 (1000-2000 µs)  →  camera PAN rate  → centre hold, +/- moves to endstop
+//   CH7 (1000-2000 µs)  →  camera TILT rate → centre hold, +/- moves to endstop
+//   CH8+                →  unused; available for later.
 //
-// NOTE ON ARM/MODE (CH5/CH6): per the migration plan, final button/state
-// mappings are NOT wired yet. CH5/CH6 are decoded and logged for monitoring
-// only — they do not arm the craft or change controllers. The single place to
+// NOTE ON ARM/MODE: per the migration plan, final button/state
+// mappings are NOT wired yet. CH5 is decoded and logged for monitoring
+// only — it does not arm the craft or change controllers. The single place to
 // add that behaviour later is updateFlightModeFromAuxChannels(); everything
 // needed (latched switch positions, hysteresis) is already in CrsfBridgeState.
 //
@@ -95,7 +94,7 @@ void crsfControlTask(void* /*arg*/);
 // gState.control.lastPacket — the bridge only updates stick/throttle/flags.
 void buildAndDispatchCrsfControlPacket(uint32_t nowMs);
 
-// FUTURE HOOK — intentionally a no-op today. This is where CH5/CH6 (and any
+// FUTURE HOOK — intentionally a no-op today. This is where CH5 and any
 // later aux switches) will be translated into arm/disarm and flight-mode/state
 // transitions. Kept separate from the per-frame decode so the mapping policy
 // lives in exactly one place. See the TODO body in main.cpp.

@@ -61,10 +61,16 @@ class CrsfReceiver {
 
   void begin(HardwareSerial& serial, uint32_t baud, int rxPin, int txPin) {
     serial_ = &serial;
-    // CRSF is 8N1. TX is wired so the FC can later send CRSF telemetry back to
-    // the handset; it is not required for RC decode. setRxBufferSize() must
-    // precede begin() to take effect on ESP32.
-    serial_->setRxBufferSize(256);
+    // CRSF is 8N1. TX carries FC->handset CRSF telemetry (crsf_telemetry.h);
+    // it is not required for RC decode. Both buffer-size calls must precede
+    // begin() to take effect on ESP32. The TX buffer makes writeFrame()
+    // non-blocking whenever txFree() has room — without it, HardwareSerial
+    // write() blocks on the 128-byte hardware FIFO.
+    // RX = 512 bytes ≈ 12 ms of wire time at 420 kbaud. Insurance against
+    // core-0 scheduling jitter while the (disarmed-only) WiFi stack is up:
+    // the ESP-IDF WiFi task runs at prio 23 on core 0, above this task.
+    serial_->setRxBufferSize(512);
+    serial_->setTxBufferSize(256);
     serial_->begin(baud, SERIAL_8N1, rxPin, txPin);
     bufferLen_ = 0;
     expectedLen_ = 0;
@@ -132,10 +138,22 @@ class CrsfReceiver {
         everReceived_ = true;
         const uint8_t type = buffer_[2];
         if (type == kTypeRcChannels) {
-          decodeRcChannels(nowMs);
-          gotRcFrame = true;
+          // RC frame length is fixed: type + 22 packed payload + crc = 24.
+          // Reject any other length so decodeRcChannels() can never read stale
+          // bytes a previous (longer) frame left in buffer_. (F2)
+          if (expectedLen_ == static_cast<uint8_t>(kRcPayloadBytes + 2u)) {
+            decodeRcChannels(nowMs);
+            gotRcFrame = true;
+          } else {
+            lengthErrors_++;
+          }
         } else if (type == kTypeLinkStatistics) {
-          decodeLinkStatistics();
+          // LINK_STATISTICS is exactly type + 10 payload + crc = 12.
+          if (expectedLen_ == 12u) {
+            decodeLinkStatistics();
+          } else {
+            lengthErrors_++;
+          }
         }
         // Other frame types (telemetry, device info, …) are valid but ignored.
       } else {
@@ -206,6 +224,18 @@ class CrsfReceiver {
   uint16_t frameRateHz() const {
     if (frameIntervalUsEma_ == 0) return 0;
     return static_cast<uint16_t>(1000000UL / frameIntervalUsEma_);
+  }
+
+  // --- Telemetry TX (FC -> RX -> RF -> handset) -----------------------------
+  // The ELRS receiver forwards valid CRSF frames heard on this UART up the RF
+  // link. Caller builds frames with crsf_telemetry.h and MUST check txFree()
+  // against the frame length first so a write never blocks the control task.
+  int txFree() const {
+    return (serial_ != nullptr) ? static_cast<int>(serial_->availableForWrite()) : 0;
+  }
+  size_t writeFrame(const uint8_t* data, size_t len) {
+    if (serial_ == nullptr || data == nullptr || len == 0) return 0;
+    return serial_->write(data, len);
   }
 
   // CRSF 11-bit value -> microseconds. Linear, matches Betaflight/ELRS:

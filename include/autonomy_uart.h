@@ -442,14 +442,24 @@ class AutonomyUart {
       aiParseErrorCount_++;
       return;
     }
-    const long seqLong = atol(fields[1]);
-    const long classLong = atol(fields[3]);
-    if (seqLong < 0 || seqLong > 255 || classLong < 0 || classLong > 255) {
+    // Strict numeric parsing: reject empty/partial fields rather than silently
+    // accepting atol/atof's 0. The end pointer must reach the field's '\0'. (F12)
+    char* endp = nullptr;
+    const long seqLong = strtol(fields[1], &endp, 10);
+    const bool seqOk = (endp != fields[1] && *endp == '\0');
+    endp = nullptr;
+    const long classLong = strtol(fields[3], &endp, 10);
+    const bool classOk = (endp != fields[3] && *endp == '\0');
+    if (!seqOk || !classOk ||
+        seqLong < 0 || seqLong > 255 || classLong < 0 || classLong > 255) {
       aiParseErrorCount_++;
       return;
     }
-    const float confidence = static_cast<float>(atof(fields[4]));
-    if (!(confidence >= 0.0f && confidence <= 1.0f)) {
+    endp = nullptr;
+    const float confidence = strtof(fields[4], &endp);
+    // The range test also rejects NaN/inf (both fail >=0 && <=1).
+    if (endp == fields[4] || *endp != '\0' ||
+        !(confidence >= 0.0f && confidence <= 1.0f)) {
       aiParseErrorCount_++;
       return;
     }

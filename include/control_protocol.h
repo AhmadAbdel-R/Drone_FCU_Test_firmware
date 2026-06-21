@@ -38,6 +38,20 @@ constexpr uint8_t kTelemetry2FlagPiCmdValid = 0x40;
 constexpr uint8_t kTelemetry2FlagAbortRequested = 0x80;
 constexpr uint8_t kTelemetryBmpFlagValid = 0x01;
 
+// ---------- Mixer saturation flag bits (TelemetryAuxPacket.mixerSatFlags) ----
+// Set by the flight loop each tick; see PidRuntime in flight_control.h for
+// exact semantics. kTelemetrySatArmedIdle is the armed-idle indicator (motors
+// held at MOTOR_OUTPUT_MIN_ACTIVE_RAW because the pilot throttle is zero while
+// armed — the post-2026-06 replacement for the old stop-motors-at-zero-throttle
+// behavior).
+constexpr uint8_t kTelemetrySatMotorMin = 0x01;
+constexpr uint8_t kTelemetrySatMotorMax = 0x02;
+constexpr uint8_t kTelemetrySatCorrScaled = 0x04;
+constexpr uint8_t kTelemetrySatRollPid = 0x08;
+constexpr uint8_t kTelemetrySatPitchPid = 0x10;
+constexpr uint8_t kTelemetrySatYawPid = 0x20;
+constexpr uint8_t kTelemetrySatArmedIdle = 0x40;
+
 // ---------- Auto-takeoff state enum (in TelemetryAuxPacket.autoTakeoffState) ----------
 constexpr uint8_t kAutoTakeoffIdle = 0;
 constexpr uint8_t kAutoTakeoffPrecheck = 1;
@@ -175,7 +189,9 @@ struct __attribute__((packed)) TelemetryAuxPacket {
   // packets and display the values the FCU is actually flying with.
   uint8_t pidEchoIndex = 0xFF;      // 0..kPidFieldCount-1, 0xFF = no echo this packet
   int16_t pidEchoValueMilli = 0;
-  uint8_t reserved[1] = {};
+  // Was reserved[1]; same offset/size, so remotes built against the old header
+  // still parse every other field. Bits: kTelemetrySat* above.
+  uint8_t mixerSatFlags = 0;
 };
 
 static_assert(sizeof(TelemetryAuxPacket) <= 32, "TelemetryAuxPacket exceeds NRF24 payload size");

@@ -86,10 +86,10 @@ Motor order:
 
 | Motor | Position | Direction | GPIO |
 |---|---|---|---|
-| M1 | Front-left | CCW | 39 |
-| M2 | Rear-left | CW | 40 |
-| M3 | Front-right | CW | 41 |
-| M4 | Rear-right | CCW | 42 |
+| M1 | Front-right | CW | 39 |
+| M2 | Rear-right | CCW | 40 |
+| M3 | Front-left | CCW | 41 |
+| M4 | Rear-left | CW | 42 |
 
 ## ELRS / CRSF Setup
 
@@ -171,6 +171,132 @@ to 3.3 V at the FCU end before enabling `FCU_DSHOT_BIDIR=1`. Validate with
 props off and do not enable `FCU_RPM_FILTER_REQUIRED_FOR_ARM=1` until all four
 motors produce stable telemetry.
 
+## ESC Passthrough Over USB COM Port
+
+A serial-commanded mode that takes the four DShot motor lines away from the
+flight code so the 4-in-1 ESC (Sequre Blueson A2 65A, **AM32**) can be configured
+over the FCU's normal USB COM port — no extra hardware.
+
+> ⚠️ **STATUS: SAFE SCAFFOLD + DRY-RUN.** The safety/lifecycle plumbing is real
+> and complete. The actual AM32 wire protocol (the BLHeli/AM32 4-way interface
+> over USB + the single-wire bootloader bit-bang) is **not implemented yet**, so
+> this **cannot flash or configure the ESC yet**. The dry-run proves the disarm
+> gating, the real DShot suspend/restore handoff, serial-activity detection and
+> the inactivity timeout. See
+> [`docs/ESC_PASSTHROUGH_AM32_DESIGN.md`](docs/ESC_PASSTHROUGH_AM32_DESIGN.md) for
+> the feasibility study and the design for the real bridge.
+
+> 🚨 **PROPS OFF, ALWAYS.** Enabling passthrough is only allowed while disarmed;
+> arming is blocked while it is active. Keep the props off whenever the ESC is
+> powered during configuration.
+
+The feature is **compiled out of the default flight image** (gated by
+`ENABLE_ESC_PASSTHROUGH`, default `0`). It can never auto-start on boot, never
+runs while armed, and does not change boot/reset, USB VID/PID, the bootloader, or
+the upload path. Build the dedicated bench env to use it:
+
+```
+pio run -e esp32-s3-mini-escpass -t upload
+```
+
+**Enter:** open the COM port at 115200 and type:
+
+```
+esc passthrough on
+```
+
+It will reject the request if armed, force motors to zero, suspend DShot on all
+four pins, and print `PASSTHROUGH ACTIVE (DRY-RUN)`.
+
+**Status:** `esc passthrough status` — prints active/idle, byte count, timeout.
+
+**Exit (any of):**
+- type `esc passthrough off` (or just `exit`) on the port, or
+- wait out the inactivity timeout (`ESC_PASSTHROUGH_TIMEOUT_MS`, default 60 s), or
+- power-cycle the board.
+
+On exit it rebuilds the DShot drivers (`DShot RESTORED motor=N`) and the FCU
+returns to normal mode **disarmed** — it never auto-arms or spins motors.
+
+**Expected configurator (once the real bridge lands):** the
+[AM32 configurator](https://github.com/AlkaMotors/AM32-MultiRotor-ESC-firmware)
+or [esc-configurator.com](https://esc-configurator.com) (Web Serial), which drive
+AM32 through the MSP + 4-way interface. *Today's dry-run is not detected by them.*
+
+**Compile/runtime flags:**
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `ENABLE_ESC_PASSTHROUGH` | `0` | master gate; `1` compiles the feature in |
+| `ESC_PASSTHROUGH_TIMEOUT_MS` | `60000` | auto-exit after this much serial inactivity |
+| `ESC_PASSTHROUGH_DEBUG_LOGS` | `0` | verbose dry-run byte logging |
+
+**Known limitations:**
+- Dry-run only: bytes are **not** forwarded to the ESC; no real configuration.
+- The vendored `lib/easy-esc-esp32` passthrough is a non-functional placeholder
+  and is deliberately **not** used for protocol (only its real pin handoff is).
+- USB logging is paused during passthrough but not yet fully muted — fine for the
+  dry-run, must be hardened before the real binary bridge.
+
+**Recovering normal firmware upload if anything acts weird:** passthrough does
+not touch the bootloader or upload path, so a normal flash always works. If a
+session is stuck, power-cycle (drops back to normal FCU mode), or re-flash the
+plain flight env over USB:
+
+```
+pio run -e esp32-s3-mini -t upload
+```
+
+If the board won't enumerate, enter the ROM bootloader manually (hold **BOOT**,
+tap **RESET**, release **BOOT**) and flash again — this is the standard ESP32-S3
+recovery and is unaffected by this feature.
+
+### Fixing a stuck AM32 3D / reversible mode (the "~50% thrust cap")
+
+**Symptom:** logged DShot rises normally to ~1900, but physical thrust stops
+increasing around ~50% throttle. **Cause:** AM32's `bi_direction` (3D/reversible
+throttle) flag got enabled and **saved to ESC flash** — typically while toggling
+"bidirectional," which sends **DShot command 10 (3D ON)**. In 3D mode DShot
+`48–1047` is the *entire forward range* (max at 1047 ≈ 54% of a 48→1900 sweep),
+then `1048` is neutral and `1049–2047` is reverse. It **persists across reboots
+and survives the FCU switching back to non-bidirectional DShot** — it lives in the
+ESC, not the FCU. (AM32 docs: cmd 12 `saveEEpromSettings()` persists `bi_direction`.)
+
+> **Command numbers (verified):** `9` = 3D **OFF**, `10` = 3D **ON**, `12` = SAVE.
+> A common write-up says "10 = off" — that is **wrong**; sending 10 makes it worse.
+
+**Fix from the FCU (no extra hardware)** — flash the passthrough/command env,
+open the COM port (115200), **props off, disarmed**, and run:
+
+```
+esc fix3d
+```
+
+This stops the motors, sends **DShot cmd 9 (3D OFF) ×20** then **cmd 12 (SAVE) ×20**
+to all four ESCs (AM32 needs ≥6 consecutive; the telemetry/ack bit is set as the
+spec requires), then returns to a disarmed/zero state. **Power-cycle the ESC**, then
+verify thrust now rises smoothly to full.
+
+Manual escape hatch (advanced — sends any DShot special command 1–47 to all motors,
+disarmed, props off):
+
+```
+esc dshotcmd 9     # 3D mode OFF
+esc dshotcmd 12    # save settings
+```
+
+(Other useful ones: `20`/`21` = spin direction normal/reversed, then `12` to save.)
+
+**Fastest external path (recommended to confirm the fix) — AM32 Configurator:**
+1. Connect the ESC's signal + GND pad to a **USB linker** (a ~$5 BLHeli/AM32 USB
+   linker), or use [esc-configurator.com](https://esc-configurator.com) /
+   the AM32 configurator over Web Serial.
+2. Open the ESC, find **"Bidirectional" / 3D / reversible mode → turn OFF**
+   (leave *Bidirectional DShot*, i.e. RPM telemetry, as you want it — different
+   setting). Fix **Motor direction** and set **Motor KV = 920** while you're there.
+3. **Save**, power-cycle, re-test. This reads back the actual stored settings so
+   you can *confirm* `bi_direction = 0`, which `esc fix3d` alone cannot show.
+
 ## Filtering And Dynamic Notch
 
 Dynamic throttle-mapped gyro notch is enabled in the main env:
@@ -198,6 +324,39 @@ RPM-filter bring-up flags:
 
 `FCU_RPM_MOTOR_POLES` is the rotor bell magnet count, not stator teeth or coil
 count.
+
+## Mag Trim & Calibration
+
+The PID webserver's **Config** tab has a **Compass & heading trim** card (next to
+**Magnetometer calibration**) showing live heading from the magnetometer, with
+controls to correct it. Endpoints: `GET`/`POST /api/settings` (`{magTrimDeg}`)
+and `POST /api/calibrate?mag=1`.
+
+**Heading-trim slider (−180…+180°)** — a constant offset added to the compass
+heading *after* calibration. Use it to remove the small residual left once
+hard-iron calibration is done, and to apply your local **magnetic declination**
+(magnetic vs. true north). Dragging the slider only updates the read-out; press
+**Save trim NVS** to apply it and persist it (`magTrimDeg` in NVS).
+
+**Colour-coded field bar** — total field strength in µT. Earth's field is ~50 µT:
+
+- **Green (40–65 µT):** healthy — calibrated, no interference.
+- **Yellow (65–90 µT):** marginal — soft interference or partial calibration.
+- **Red (> 90 µT):** too strong — uncalibrated hard-iron or nearby metal/current.
+  Heading is unreliable and drops out at the 95 µT validity ceiling (the needle
+  greys out when `valid==0`).
+
+**Calibrating** — press **Start mag cal**, then spin the craft slowly through
+**all axes** (figure-8s + roll/pitch/yaw) for ~30 s, **away from metal** (no
+steel desks, PCs, tools, or rebar floors), with the battery and all hardware
+mounted. Calibration is saved automatically when it finishes.
+
+After a good calibration the field bar should sit green and steady, and the
+residual **heading trim needed should be < ±5°**. If you still need a large trim,
+the calibration is contaminated — **recalibrate away from metal**.
+
+> The trim is applied live but only survives a reboot if you press **Save trim
+> NVS**. Writes are refused while armed or throttle is non-zero.
 
 ## Build And Flash
 

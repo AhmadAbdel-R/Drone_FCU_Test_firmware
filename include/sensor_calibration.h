@@ -82,8 +82,8 @@ class BootCalibration {
 
   struct Result {
     // Accelerometer body-frame offset, units of g. Subtract this from raw
-    // accel reads — the corrected reading should be (0, 0, -1g) on a level
-    // platform. EKF accepts this directly.
+    // accel reads. The attitude estimator's roll equation is atan2(ay, az),
+    // so a level platform must correct to (0, 0, +1g).
     math3::Vector3 accel_offset_g;
     // Ground reference pressure in Pa. The current FCU code captures this
     // as the FIRST baro sample; the calibrator improves on it by averaging.
@@ -155,11 +155,10 @@ class BootCalibration {
 
     if (accel_count_ >= cfg_.target_samples) {
       const float n = static_cast<float>(accel_count_);
-      // Average accel. Expected reading on a level platform = (0, 0, -1) g.
-      // Offset = avg_reading - expected. Add 1 to z to express the offset
-      // relative to the expected -1g.
+      // Average accel. Expected reading on a level platform = (0, 0, +1) g.
+      // Offset = avg_reading - expected, matching updateAttitudeFromImu().
       result_.accel_offset_g = accel_sum_ * (1.0f / n);
-      result_.accel_offset_g.z += 1.0f;
+      result_.accel_offset_g.z -= 1.0f;
       if (baro_count_ > 0) {
         result_.baro_ground_pa = baro_sum_ / static_cast<float>(baro_count_);
       }

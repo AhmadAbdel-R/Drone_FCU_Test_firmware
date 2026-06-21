@@ -168,6 +168,11 @@ Status EscController::setMotorRaw(uint8_t motor, uint16_t raw)
     return _output.setMotorThrottleRaw(motor, raw);
 }
 
+Status EscController::sendMotorCommandFrame(uint8_t motor, uint16_t command)
+{
+    return _output.sendMotorCommandFrame(motor, command);
+}
+
 Status EscController::setAllRaw(uint16_t raw)
 {
     return _output.setAllMotorsThrottleRaw(raw);
@@ -353,6 +358,11 @@ gpio_num_t EscController::lastDriverErrorPin() const
 MotorTelemetry EscController::motorTelemetry(uint8_t motor) const
 {
     return _output.motorTelemetry(motor);
+}
+
+Status EscController::requestMotorUartTelemetry(uint8_t motor)
+{
+    return _output.requestMotorUartTelemetry(motor);
 }
 
 EscDshotOutput &EscController::output()

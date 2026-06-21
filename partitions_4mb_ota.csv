@@ -1,0 +1,27 @@
+# Dual-slot OTA partition table for the 4 MB ESP32-S3-MINI-1 (2026-06).
+#
+# Replaces partitions_4mb.csv (single 3 MB factory app, no OTA possible).
+# Migration requires ONE last USB flash; after that, firmware updates can go
+# over WiFi (wifi_manager.cpp: POST /ota, disarmed-only).
+#
+# Layout rationale:
+#  * nvs KEEPS offset 0x9000 but shrinks 0x6000 -> 0x5000. The Arduino
+#    framework hardcodes boot_app0.bin at 0xE000 on every USB flash
+#    (framework platformio-build.py), which was ALREADY overwriting the old
+#    table's 6th NVS page and the phy_init partition on each upload. The five
+#    pages 0x9000-0xE000 are exactly the region that has always survived, so
+#    saved PID gains / calibration carry over unchanged.
+#  * otadata at 0xE000 = the standard Arduino location boot_app0.bin targets.
+#  * phy_init dropped: Arduino builds compile PHY init data into the app
+#    (and the old partition was being clobbered by boot_app0 anyway).
+#  * spiffs dropped: verified unused (no SPIFFS/LittleFS/FFat references).
+#  * app slots 0x1F0000 (1.94 MB) each; current wireless image is ~1.13 MB.
+#    board_upload.maximum_size in platformio.ini must equal 2031616.
+#  * coredump kept (same size) so crash post-mortems keep working.
+#
+# Name,    Type, SubType,  Offset,   Size,     Flags
+nvs,       data, nvs,      0x9000,   0x5000,
+otadata,   data, ota,      0xE000,   0x2000,
+app0,      app,  ota_0,    0x10000,  0x1F0000,
+app1,      app,  ota_1,    0x200000, 0x1F0000,
+coredump,  data, coredump, 0x3F0000, 0x10000,

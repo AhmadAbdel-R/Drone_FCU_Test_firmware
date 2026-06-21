@@ -57,7 +57,23 @@ class FcuPidController {
     terms_ = FcuPidTerms{};
   }
 
-  FcuPidTerms update(float setpoint, float measurement, float dtSeconds) {
+  // allowIntegration (default true, so existing callers are unchanged) lets the
+  // caller freeze — NOT reset — the integrator for this tick. The flight loop
+  // uses it to stop I accumulation while (a) commanded throttle is too low for
+  // the axis to act on the airframe and (b) the mixer reported motor saturation
+  // on the previous tick (clipped motors can't realize more moment, so further
+  // integration is pure windup). Freezing preserves the trim already learned;
+  // resetting would throw it away and bump the craft when authority returns.
+  FcuPidTerms update(float setpoint, float measurement, float dtSeconds,
+                     bool allowIntegration = true) {
+    // Non-finite input guard: a NaN/Inf setpoint, measurement, or dt must never
+    // reach the motors or poison previousError_/integral_ state. Hold the last
+    // published terms (a 2 ms stale output is safer than snapping to zero
+    // mid-flight) and skip all state updates for this tick.
+    if (!isfinite(setpoint) || !isfinite(measurement) || !isfinite(dtSeconds)) {
+      return terms_;
+    }
+
     const float error = setpoint - measurement;
 
     // ---- Derivative source -------------------------------------------------
@@ -103,7 +119,9 @@ class FcuPidController {
     // controller sees an error it can never zero out because the rig holds
     // the airframe still) without changing behavior when the controller is
     // genuinely doing work.
-    if (dtSeconds > 0.0f) {
+    // allowIntegration=false (caller-side gate) skips the commit entirely while
+    // leaving the stored integral untouched, so I resumes from the same trim.
+    if (allowIntegration && dtSeconds > 0.0f) {
       const float tentativeIntegral = constrain(integral_ + error * dtSeconds,
                                                 config_.integralMin, config_.integralMax);
       const float tentativeOutput =

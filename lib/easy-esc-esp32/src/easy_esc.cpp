@@ -154,6 +154,11 @@ bool EasyEsc::setMotorRaw(uint8_t motor, uint16_t raw)
     return applyStatus(_ctrl.setMotorRaw(motor, raw));
 }
 
+bool EasyEsc::sendMotorCommandFrame(uint8_t motor, uint16_t command)
+{
+    return applyStatus(_ctrl.sendMotorCommandFrame(motor, command));
+}
+
 bool EasyEsc::setMotorPercent(uint8_t motor, float percent)
 {
     return applyStatus(_ctrl.motor(motor).spinPercent(percent));
@@ -417,6 +422,11 @@ MotorTelemetry EasyEsc::motorTelemetry(uint8_t motor) const
     return _ctrl.motorTelemetry(motor);
 }
 
+Status EasyEsc::requestMotorUartTelemetry(uint8_t motor)
+{
+    return _ctrl.requestMotorUartTelemetry(motor);
+}
+
 Status EasyEsc::lastStatus() const
 {
     return _lastStatus;
@@ -539,6 +549,11 @@ bool EasyEscMotor::stop()
 bool EasyEscMotor::spinRaw(uint16_t raw)
 {
     return _esc.setMotorRaw(0, raw);
+}
+
+bool EasyEscMotor::sendDshotCommandFrame(uint16_t command)
+{
+    return _esc.sendMotorCommandFrame(0, command);
 }
 
 bool EasyEscMotor::spinPercent(float percent)
@@ -699,6 +714,11 @@ gpio_num_t EasyEscMotor::lastRmtErrorPin() const
 MotorTelemetry EasyEscMotor::telemetry() const
 {
     return _esc.motorTelemetry(0);
+}
+
+bool EasyEscMotor::requestUartTelemetry()
+{
+    return _esc.requestMotorUartTelemetry(0) == Status::Ok;
 }
 
 Status EasyEscMotor::lastStatus() const

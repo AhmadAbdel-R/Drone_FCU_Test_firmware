@@ -18,9 +18,9 @@
 // ADC setup:
 //   * Pin FCU_PIN_BATT_ADC. Set as analog input with 11 dB attenuation
 //     (full 3.3 V range).
-//   * Divider gain FCU_BATT_DIVIDER_GAIN multiplies ADC voltage → pack
-//     voltage. Default 5.090909 was calibrated against a 16.80 V reading
-//     where the FCU initially reported 18.30 V (so 5.545455 × 16.80/18.30).
+//   * Divider gain FCU_BATT_DIVIDER_GAIN multiplies ADC voltage -> pack
+//     voltage. Current default 5.520017 includes the ADC=2.48 V / pack=14.04 V
+//     bench point plus a 17.23 V web vs 16.80 V meter correction.
 //
 // Sampling:
 //   * 16 oversampled reads per poll (BATT_OVERSAMPLE_COUNT), 150 µs apart.

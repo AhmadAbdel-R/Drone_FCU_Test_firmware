@@ -51,16 +51,16 @@ namespace {
 #define MFFT_PIN_IMU_CS 14
 #endif
 #ifndef MFFT_MOTOR1_GPIO
-#define MFFT_MOTOR1_GPIO 39  // front-left
+#define MFFT_MOTOR1_GPIO 39  // front-right
 #endif
 #ifndef MFFT_MOTOR2_GPIO
-#define MFFT_MOTOR2_GPIO 40  // rear-left
+#define MFFT_MOTOR2_GPIO 40  // rear-right
 #endif
 #ifndef MFFT_MOTOR3_GPIO
-#define MFFT_MOTOR3_GPIO 41  // front-right
+#define MFFT_MOTOR3_GPIO 41  // front-left
 #endif
 #ifndef MFFT_MOTOR4_GPIO
-#define MFFT_MOTOR4_GPIO 42  // rear-right
+#define MFFT_MOTOR4_GPIO 42  // rear-left
 #endif
 #ifndef MOTOR_FFT_SERIAL_BAUD
 #define MOTOR_FFT_SERIAL_BAUD 921600UL
@@ -743,6 +743,52 @@ void dumpBufferedSweepToSerial() {
   gSweepDumpTarget = kSweepTargetNone;
 }
 
+// Print the EXACT one-way (non-bidirectional) DShot frame the firmware emits for
+// a raw value, WITHOUT touching the motors. This is a pure function of the input
+// and mirrors DShotRMT's normal-mode encoding byte-for-byte:
+//   - _buildDShotPacket():   throttle_value = value & 0x7FF, telemetric_request = 0
+//   - _calculateCRC():       crc = (d ^ d>>4 ^ d>>8) & 0xF, NOT inverted (bidir only)
+//   - _buildDShotFrameValue: frame = ((throttle<<1 | telem) << 4) | crc
+// Use it to prove 950 / 1400 / 1900 encode to three DISTINCT 16-bit frames
+// (0x76CD / 0xAF05 / 0xED8B) on the wire. The values match what a logic analyser
+// should capture on the motor signal pin for each command.
+void printDshotFrame(uint16_t value) {
+  // Match the driver's range handling: 0 is the MOTOR_STOP/disarm command;
+  // anything else is constrained into the 48..2047 throttle window before
+  // encoding (see DShotRMT::sendThrottle + EscDshotOutput::clampRawThrottle).
+  uint16_t raw = value;
+  const char* note = "";
+  if (value == 0) {
+    note = " (=> MOTOR_STOP / disarm command, not a throttle frame)";
+  } else if (raw < kDshotMin) {
+    raw = kDshotMin;
+    note = " (clamped UP to DShot min 48)";
+  } else if (raw > kDshotMax) {
+    raw = kDshotMax;
+    note = " (clamped DOWN to DShot max 2047)";
+  }
+
+  const uint16_t throttle11 = static_cast<uint16_t>(raw & 0x07FFu);  // 11-bit field
+  const uint16_t telem = 0u;                                         // non-bidir => 0
+  const uint16_t dataForCrc = static_cast<uint16_t>((throttle11 << 1) | telem);
+  const uint16_t crc =
+      static_cast<uint16_t>((dataForCrc ^ (dataForCrc >> 4) ^ (dataForCrc >> 8)) & 0x000Fu);
+  const uint16_t frame16 = static_cast<uint16_t>((dataForCrc << 4) | crc);
+
+  char bits[17];
+  for (int b = 0; b < 16; ++b) bits[b] = ((frame16 >> (15 - b)) & 1u) ? '1' : '0';
+  bits[16] = '\0';
+
+  Serial.printf("[DFRAME] in=%u raw=%u throttle11=%u telem=%u crc=0x%X frame16=0x%04X bin=%s%s\n",
+                static_cast<unsigned>(value),
+                static_cast<unsigned>(raw),
+                static_cast<unsigned>(throttle11),
+                static_cast<unsigned>(telem),
+                static_cast<unsigned>(crc),
+                static_cast<unsigned>(frame16),
+                bits, note);
+}
+
 void printHelp() {
   Serial.println("[STATUS] motor FFT test firmware commands:");
   Serial.println("[STATUS]   RUN_SWEEP <M1|M2|M3|M4|ALL> [max step hold_ms]");
@@ -754,6 +800,8 @@ void printHelp() {
   Serial.println("[STATUS]   TEST_MOTOR <id 1..4> <dshot 0 or 48..2047>");
   Serial.println("[STATUS]   TEST_ALL <dshot 0 or 48..2047>   spin ALL motors together");
   Serial.println("[STATUS]   STOP");
+  Serial.println("[STATUS]   DFRAME [raw]               print encoded 16-bit DShot frame (no motor spin)");
+  Serial.println("[STATUS]      no arg => prints 950/1400/1900 so you can confirm distinct frames");
   Serial.println("[STATUS]   LOG_START  /  LOG_STOP    manual CSV stream toggle");
 #if ENABLE_DYNAMIC_NOTCH
   Serial.println("[STATUS]   NOTCH <ON|OFF|STATUS>     toggle dynamic notch on captured gyro");
@@ -992,6 +1040,29 @@ void handleCommand(char* line) {
     printHelp();
     return;
   }
+  // DFRAME [raw] — encode-only diagnostic. Prints the exact non-bidirectional
+  // 16-bit DShot frame for a raw value without spinning any motor. With no
+  // argument it dumps the three canonical bench values so you can eyeball that
+  // 950 / 1400 / 1900 really do produce different frames (i.e. the firmware is
+  // NOT collapsing mid-to-high throttle into one value).
+  if (ciStartsWith(line, "DFRAME")) {
+    int value = -1;
+    if (std::sscanf(line, "%*s %d", &value) == 1) {
+      if (value < 0 || value > static_cast<int>(kDshotMax)) {
+        Serial.printf("[STATUS] ERR DFRAME value must be 0 or %u..%u\n",
+                      static_cast<unsigned>(kDshotMin), static_cast<unsigned>(kDshotMax));
+        return;
+      }
+      printDshotFrame(static_cast<uint16_t>(value));
+    } else {
+      Serial.println("[STATUS] DFRAME canonical non-bidir DShot300 frames "
+                     "(telemetry bit=0, CRC not inverted):");
+      printDshotFrame(950);
+      printDshotFrame(1400);
+      printDshotFrame(1900);
+    }
+    return;
+  }
 #if ENABLE_DYNAMIC_NOTCH
   // NOTCH ON / OFF / STATUS — toggle whether the next RUN_SWEEP applies the
   // dynamic notch to captured gyro. Refuses to change while a sweep is
@@ -1201,6 +1272,11 @@ void setup() {
   Serial.println();
   Serial.println("================ MOTOR FFT TEST FIRMWARE ================");
   Serial.printf("[STATUS] serial baud=%lu\n", static_cast<unsigned long>(MOTOR_FFT_SERIAL_BAUD));
+  // Make the flashed image self-identify: this test firmware ALWAYS builds the
+  // normal one-way DShot path (motors constructed with bidirectionalDshot=false;
+  // FCU_DSHOT_BIDIR is never defined in env:fcu_motor_fft_test). BDShot lives in
+  // the separate esp32-s3-mini-wireless-bdshot bench env.
+  Serial.println("[DSHOT] mode=DSHOT300 bidir=0 (normal one-way DShot; use DFRAME to dump encoded frames)");
   Serial.println("[STATUS] WARNING: this firmware drives motors directly.");
   Serial.println("[STATUS] REMOVE PROPS for motor mapping and identification.");
   Serial.println("[STATUS] Prop-on tests: airframe MUST be mechanically restrained.");

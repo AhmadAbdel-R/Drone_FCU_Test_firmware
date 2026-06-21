@@ -13,8 +13,8 @@
 //        - tilt back    (nose up)    -> rear  motors faster
 //        - tilt right   (right wing down) -> right motors faster
 //        - tilt left    (left wing  down) -> left  motors faster
-//        - yaw CW              -> CW  motors faster (M2+M3)
-//        - yaw CCW             -> CCW motors faster (M1+M4)
+//        - yaw CW              -> CW  motors faster (M1+M4)
+//        - yaw CCW             -> CCW motors faster (M2+M3)
 //
 // SAFETY ASSUMPTIONS:
 //   - Props OFF. Always.
@@ -87,17 +87,17 @@ constexpr uint16_t kTiltBaseDshot = 250;      // base spin during tilt tests
 constexpr uint16_t kTiltMaxDshot  = 500;      // mixer output clamp during tilt
 constexpr uint32_t kImuLogPeriodMs = 50;      // 20 Hz logging during phases
 
-// ---- Verified motor layout (user-confirmed 2026-05) -----------------------
+// ---- Verified motor layout (user-confirmed 2026-06) -----------------------
 // PHYSICAL position when looking down at the drone:
-//   M1 (GPIO 39) = FRONT-LEFT,  CCW
-//   M2 (GPIO 40) = REAR-LEFT,   CW
-//   M3 (GPIO 41) = FRONT-RIGHT, CW
-//   M4 (GPIO 42) = REAR-RIGHT,  CCW
+//   M1 (GPIO 39) = FRONT-RIGHT, CW
+//   M2 (GPIO 40) = REAR-RIGHT,  CCW
+//   M3 (GPIO 41) = FRONT-LEFT,  CCW
+//   M4 (GPIO 42) = REAR-LEFT,   CW
 //
 //   FRONT
-//     M1 (CCW)        M3 (CW)
+//     M3 (CCW)        M1 (CW)
 //                X
-//     M2 (CW)         M4 (CCW)
+//     M4 (CW)         M2 (CCW)
 //   REAR
 //
 // This mirrors the flight firmware mixer in main.cpp.
@@ -285,10 +285,10 @@ SimMotors simulateMixer(float gx_dps, float gy_dps, float gz_dps,
   const float roll  = kRateP * (rollRateSetpoint - gx_dps);
   const float pitch = kRateP * (pitchRateSetpoint - gy_dps);
   const float yaw   = kYawRateP * (0.0f - gz_dps);
-  // Mixer for verified layout (M1=FL CCW, M2=RL CW, M3=FR CW, M4=RR CCW):
-  //   left  side (M1, M2) gets +roll, right side (M3, M4) gets -roll
+  // Mixer for verified layout (M1=FR CW, M2=RR CCW, M3=FL CCW, M4=RL CW):
+  //   left  side (M3, M4) gets +roll, right side (M1, M2) gets -roll
   //   front (M1, M3) gets -pitch, rear (M2, M4) gets +pitch
-  //   CCW (M1, M4) gets +yaw, CW  (M2, M3) gets -yaw
+  //   CCW (M2, M3) gets +yaw, CW  (M1, M4) gets -yaw
   auto clamp = [](float v) -> uint16_t {
     int i = static_cast<int>(v + 0.5f);
     if (i < 48) i = 48;
@@ -296,10 +296,10 @@ SimMotors simulateMixer(float gx_dps, float gy_dps, float gz_dps,
     return static_cast<uint16_t>(i);
   };
   return {
-    clamp(base + roll - pitch + yaw),  // M1 front-left,  CCW
-    clamp(base + roll + pitch - yaw),  // M2 rear-left,   CW
-    clamp(base - roll - pitch - yaw),  // M3 front-right, CW
-    clamp(base - roll + pitch + yaw),  // M4 rear-right,  CCW
+    clamp(base - roll - pitch - yaw),  // M1 front-right, CW
+    clamp(base - roll + pitch + yaw),  // M2 rear-right,  CCW
+    clamp(base + roll - pitch + yaw),  // M3 front-left,  CCW
+    clamp(base + roll + pitch - yaw),  // M4 rear-left,   CW
   };
 }
 
@@ -322,22 +322,22 @@ void printPhaseIntro(Phase p) {
       Serial.println("[PROMPT] Each motor will spin for 5s at low speed.");
       Serial.println("[PROMPT] Note CW or CCW (viewed from ABOVE) for each.");
       Serial.println("[PROMPT] Expected (user-verified layout):");
-      Serial.println("[PROMPT]   M1=FRONT-LEFT  CCW");
-      Serial.println("[PROMPT]   M2=REAR-LEFT   CW");
-      Serial.println("[PROMPT]   M3=FRONT-RIGHT CW");
-      Serial.println("[PROMPT]   M4=REAR-RIGHT  CCW");
+      Serial.println("[PROMPT]   M1=FRONT-RIGHT CW");
+      Serial.println("[PROMPT]   M2=REAR-RIGHT  CCW");
+      Serial.println("[PROMPT]   M3=FRONT-LEFT  CCW");
+      Serial.println("[PROMPT]   M4=REAR-LEFT   CW");
       break;
     case Phase::MOTOR_M1:
-      Serial.println("[PROMPT] >>> WATCHING: M1 (FRONT-LEFT). Expected: CCW <<<");
+      Serial.println("[PROMPT] >>> WATCHING: M1 (FRONT-RIGHT). Expected: CW <<<");
       break;
     case Phase::MOTOR_M2:
-      Serial.println("[PROMPT] >>> WATCHING: M2 (REAR-LEFT). Expected: CW <<<");
+      Serial.println("[PROMPT] >>> WATCHING: M2 (REAR-RIGHT). Expected: CCW <<<");
       break;
     case Phase::MOTOR_M3:
-      Serial.println("[PROMPT] >>> WATCHING: M3 (FRONT-RIGHT). Expected: CW <<<");
+      Serial.println("[PROMPT] >>> WATCHING: M3 (FRONT-LEFT). Expected: CCW <<<");
       break;
     case Phase::MOTOR_M4:
-      Serial.println("[PROMPT] >>> WATCHING: M4 (REAR-RIGHT). Expected: CCW <<<");
+      Serial.println("[PROMPT] >>> WATCHING: M4 (REAR-LEFT). Expected: CW <<<");
       break;
     case Phase::THROTTLE_INTRO:
       Serial.println("[PROMPT] PHASE 2: SMOOTH THROTTLE RAMP");
@@ -375,7 +375,7 @@ void printPhaseIntro(Phase p) {
       break;
     case Phase::TILT_RIGHT_PREP:
       Serial.println("[PROMPT] LEVEL the drone. Next: TILT RIGHT (right wing DOWN)");
-      Serial.println("[PROMPT] Expected: RIGHT motors (M3+M4) speed up, LEFT slow down.");
+      Serial.println("[PROMPT] Expected: RIGHT motors (M1+M2) speed up, LEFT slow down.");
       Serial.println("[PROMPT] 5 seconds to get ready, then HOLD for 8s.");
       break;
     case Phase::TILT_RIGHT:
@@ -383,7 +383,7 @@ void printPhaseIntro(Phase p) {
       break;
     case Phase::TILT_LEFT_PREP:
       Serial.println("[PROMPT] LEVEL the drone. Next: TILT LEFT (left wing DOWN)");
-      Serial.println("[PROMPT] Expected: LEFT motors (M1+M2) speed up, RIGHT slow down.");
+      Serial.println("[PROMPT] Expected: LEFT motors (M3+M4) speed up, RIGHT slow down.");
       Serial.println("[PROMPT] 5 seconds to get ready, then HOLD for 8s.");
       break;
     case Phase::TILT_LEFT:
@@ -391,7 +391,7 @@ void printPhaseIntro(Phase p) {
       break;
     case Phase::YAW_CW_PREP:
       Serial.println("[PROMPT] LEVEL the drone. Next: YAW CW (rotate clockwise viewed from above)");
-      Serial.println("[PROMPT] Expected: CW motors (M2+M3) speed up to apply counter-torque.");
+      Serial.println("[PROMPT] Expected: CW motors (M1+M4) speed up to apply counter-torque.");
       Serial.println("[PROMPT] 5 seconds to get ready, then HOLD twisted for 8s.");
       break;
     case Phase::YAW_CW:
@@ -399,7 +399,7 @@ void printPhaseIntro(Phase p) {
       break;
     case Phase::YAW_CCW_PREP:
       Serial.println("[PROMPT] LEVEL the drone. Next: YAW CCW (rotate counterclockwise)");
-      Serial.println("[PROMPT] Expected: CCW motors (M1+M4) speed up to apply counter-torque.");
+      Serial.println("[PROMPT] Expected: CCW motors (M2+M3) speed up to apply counter-torque.");
       Serial.println("[PROMPT] 5 seconds to get ready, then HOLD twisted for 8s.");
       break;
     case Phase::YAW_CCW:
@@ -507,7 +507,7 @@ void tickTiltLog(uint32_t now, const char* tag) {
                   tag, static_cast<unsigned long>(now),
                   static_cast<double>(gx), static_cast<double>(gy), static_cast<double>(gz),
                   static_cast<double>(ax), static_cast<double>(ay), static_cast<double>(az));
-    Serial.printf("[PID_SIM] %s t=%lu m=[%u,%u,%u,%u] (M1=FL M2=RL M3=FR M4=RR)\n",
+    Serial.printf("[PID_SIM] %s t=%lu m=[%u,%u,%u,%u] (M1=FR M2=RR M3=FL M4=RL)\n",
                   tag, static_cast<unsigned long>(now),
                   static_cast<unsigned>(sm.m1), static_cast<unsigned>(sm.m2),
                   static_cast<unsigned>(sm.m3), static_cast<unsigned>(sm.m4));

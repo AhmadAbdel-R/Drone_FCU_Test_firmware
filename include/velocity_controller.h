@@ -7,7 +7,7 @@
 // VelocityController
 // -----------------------------------------------------------------------------
 // Outer loop above the attitude/rate PIDs. Takes a desired horizontal velocity
-// (vx, vy in m/s, NED body-relative frame) and a desired vertical velocity
+// (vx, vy in m/s, body forward/right frame) and a desired vertical velocity
 // (vz, m/s, positive = up) and produces:
 //   - target roll angle (deg)        — for vy correction
 //   - target pitch angle (deg)       — for vx correction (nose down = +vx)
@@ -71,8 +71,9 @@ class VelocityController {
     haveLast_ = false;
   }
 
-  // Run one tick. vxMeas/vyMeas are NED-frame measured horizontal velocity
-  // (m/s); targets are NED-frame desired. vzMeas is vertical (positive up).
+  // Run one tick. vxMeas/vyMeas and targets are body-frame horizontal velocity
+  // (forward/right, m/s). Rotate NED GPS/EKF velocity through yaw before handoff.
+  // vzMeas is vertical (positive up).
   // dtSeconds is the loop period (PID tick period, typically 0.002 for 500 Hz).
   Output update(float targetVx, float targetVy, float targetVz,
                 float vxMeas,   float vyMeas,   float vzMeas,

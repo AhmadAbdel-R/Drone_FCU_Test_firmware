@@ -106,6 +106,10 @@ public:
     Status setAllRaw(uint16_t raw);
     Status stopAll();
 
+    // Send one DShot special command frame (1..47) on a motor. See
+    // EscDshotOutput::sendMotorCommandFrame for the caller's responsibilities.
+    Status sendMotorCommandFrame(uint8_t motor, uint16_t command);
+
     void setSignalTimeoutMs(uint32_t timeoutMs);
     uint32_t signalTimeoutMs() const;
     void setHoldArmOnSignalTimeout(bool enabled);
@@ -140,6 +144,8 @@ public:
     int8_t lastDriverErrorMotor() const;
     gpio_num_t lastDriverErrorPin() const;
     MotorTelemetry motorTelemetry(uint8_t motor) const;
+    // One-shot KISS/TLM-wire telemetry request — see EscDshotOutput.
+    Status requestMotorUartTelemetry(uint8_t motor);
 
     EscDshotOutput &output();
     EscPassthrough &passthrough();

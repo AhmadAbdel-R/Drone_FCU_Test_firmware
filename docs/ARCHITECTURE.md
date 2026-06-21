@@ -73,10 +73,10 @@ The current flight path still uses the legacy attitude/rate controller unless
 
 | Motor | Position | Direction | GPIO |
 |---|---|---|---|
-| M1 | Front-left | CCW | 39 |
-| M2 | Rear-left | CW | 40 |
-| M3 | Front-right | CW | 41 |
-| M4 | Rear-right | CCW | 42 |
+| M1 | Front-right | CW | 39 |
+| M2 | Rear-right | CCW | 40 |
+| M3 | Front-left | CCW | 41 |
+| M4 | Rear-left | CW | 42 |
 
 DShot300 is the default. Bidirectional DShot and RPM filtering are optional and
 compile-gated.

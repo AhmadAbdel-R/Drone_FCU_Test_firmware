@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "control_protocol.h"
+#include "log_router.h"  // transition log goes through the non-blocking ring
 
 // =============================================================================
 // Flight State Machine — unified FCU operating-mode descriptor.
@@ -576,7 +577,8 @@ class FlightStateMachine {
     state_ = target;
     stateEnteredMs_ = nowMs;
     transitionCount_++;
-    Serial.printf("[FSM] %s -> %s (reason=%s, t=%lu, count=%lu)\n",
+    fcu_log::logf(fcu_log::Level::Info,
+                  "[FSM] %s -> %s (reason=%s, t=%lu, count=%lu)\n",
                   name(prev), name(target),
                   reason ? reason : "?",
                   static_cast<unsigned long>(nowMs),

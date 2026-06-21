@@ -16,9 +16,8 @@
 // NMEA support:
 //   * $GPGGA — primary parse target. Provides fix quality, sat count, lat,
 //     lon, altitude (mean sea level meters → stored as decimeters).
-//   * $GPRMC — secondary, future. Provides ground speed + course, which
-//     velocity_controller will need for proper feedback. NOT YET PARSED;
-//     a TODO marker lives in parseGpsLine().
+//   * $GPRMC — secondary. Provides ground speed + true course, converted to
+//     local NED horizontal velocity for EKF/autonomy diagnostics.
 //   * All other sentences are silently dropped.
 //
 // Coordinate format:
@@ -63,7 +62,17 @@ struct GpsState {
   int32_t latE7 = 0;                     // latitude, degrees × 1e7
   int32_t lonE7 = 0;                     // longitude, degrees × 1e7
   int16_t altDm = 0;                     // altitude MSL, decimeters
-  uint32_t lastSentenceMs = 0;           // millis() of last successful parse
+  uint32_t lastSentenceMs = 0;           // millis() of last successful GGA parse
+  bool groundSpeedValid = false;         // true when latest RMC speed parsed
+  bool courseValid = false;              // true when latest RMC COG parsed
+  bool velocityValid = false;            // speed + course usable as NED velocity
+  uint16_t groundSpeedKmh10 = 0;         // km/h * 10 for CRSF GPS telemetry
+  uint16_t courseCentiDeg = 0;           // true course, deg * 100, 0..36000
+  float groundSpeedMs = 0.0f;            // m/s
+  float courseDeg = 0.0f;                // true course over ground
+  float velNorthMs = 0.0f;               // NED horizontal velocity, north +
+  float velEastMs = 0.0f;                // NED horizontal velocity, east +
+  uint32_t lastRmcMs = 0;                // millis() of last successful RMC parse
   char line[128] = {};                   // private NMEA accumulator
   size_t lineLen = 0;                    // chars currently in `line`
 };

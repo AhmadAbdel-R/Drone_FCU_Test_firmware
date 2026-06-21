@@ -82,6 +82,14 @@ public:
     dshot_telemetry_stats_t getTelemetryStats() const;
     void resetTelemetryStats();
 
+    // One-shot UART-telemetry request (separate-wire KISS/BLHeli32 telemetry,
+    // NOT bidirectional DShot): the NEXT sendThrottle() frame carries the
+    // telemetry-request bit, prompting this ESC to emit one 10-byte KISS frame
+    // on its TLM wire. No-op in bidirectional mode (the bit is already set and
+    // answered on the signal line). Thread-safe: may be called from a
+    // different task than the one calling sendThrottle().
+    void requestTelemetrySignal() { _uart_telemetry_request_atomic.store(true); }
+
     // Getters for DShot info
     dshot_mode_t getMode() const { return _mode; }
     bool isBidirectional() const { return _is_bidirectional; }
@@ -129,6 +137,7 @@ private:
     uint16_t _tx_payload = 0;                // Async RMT TX payload storage; must outlive rmt_transmit().
 
     // Telemetry Related Variables
+    std::atomic<bool> _uart_telemetry_request_atomic = false;             // One-shot: set telemetry bit on next throttle frame (UART/KISS telemetry)
     std::atomic<uint32_t> _last_erpm_atomic = 0;                          // Atomically stored last received eRPM value
     std::atomic<bool> _telemetry_ready_flag_atomic = false;               // Atomically stored flag indicating new telemetry data
     std::atomic<dshot_telemetry_data_t> _last_telemetry_data_atomic = {}; // Atomically stored last received full telemetry data

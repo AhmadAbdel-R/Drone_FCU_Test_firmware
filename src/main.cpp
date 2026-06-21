@@ -94,12 +94,15 @@
 #include <easy_esc.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/queue.h>
 
 #include <esp_err.h>
 #include <esp_heap_caps.h>
 #include <esp_system.h>
 #include <esp_task_wdt.h>
 #include <driver/gpio.h>
+#include <soc/rtc_cntl_reg.h>
+#include <soc/soc.h>
 
 #include <array>
 #include <atomic>
@@ -112,8 +115,12 @@
 #include "control_protocol.h"
 #include "fcu_nvs.h"
 #include "DynamicNotchFilter.h"
+#include "notch_analysis.h"
+#include "diag_capture.h"
 #include "RpmNotchFilter.h"
 #include "fcu_pid.h"
+#include "log_router.h"     // non-blocking log ring (USB + optional WiFi UDP sinks)
+#include "wifi_manager.h"   // disarmed-only WiFi lifecycle (logging/OTA, default OFF)
 
 // Per-module interface headers (implementations follow in this file under
 // matching `// [...]` section markers — see the file map above).
@@ -125,12 +132,14 @@
 #include "battery_module.h"
 #include "gps_module.h"
 #include "motor_module.h"
+#include "esc_usb_passthrough.h"    // USB-CDC ESC passthrough mode (gated; default OFF)
 #include "nrf_telemetry.h"
 #include "ibus_receiver.h"          // 32-byte iBUS frame parser (header-only)
 #include "ibus_control.h"           // FCU-side bridge → ControlPacket
 #include "crsf_receiver.h"          // ELRS/CRSF frame parser (header-only)
 #include "crsf_control.h"           // FCU-side ELRS bridge → ControlPacket
-#include "camera_gimbal.h"          // FPV pan/tilt servo driver (LEDC, header-only)
+#include "crsf_telemetry.h"         // FCU-originated CRSF telemetry frames
+#include "camera_gimbal.h"          // FPV pan/tilt servo driver (ESP32Servo-backed)
 #include "flight_control.h"
 
 // Autonomy controllers — each header-only, NVS-tunable via fcu_nvs.h.
@@ -155,7 +164,9 @@
 #include "gain_schedule.h"
 #include "sensor_calibration.h"
 #include "mag_calibration.h"
+#include "external_mag.h"
 #include "led_blinker.h"
+#include "fcu_ble_config.h"
 
 // Compile-time gate for the new GNC stack. Defaults DISABLED.
 // ENABLE_EXPERIMENTAL_EKF        = 1 → EKF runs in shadow (estimate published,
@@ -170,14 +181,34 @@
 #ifndef ENABLE_EXPERIMENTAL_EKF_CONTROL
 #define ENABLE_EXPERIMENTAL_EKF_CONTROL 0
 #endif
+// EKF-velocity → autonomy seam. When 1, getAutonomyVelocityNed() hands the
+// EKF's loop-rate fused NED velocity to the (future) POS_HOLD velocity loop
+// instead of low-rate GPS. OFF by default — enable only after flight-validating
+// the EKF in shadow. The closed-loop sim (ekf_sim_test S9) proves the estimate
+// is good enough to hold velocity.
+#ifndef FCU_USE_EKF_VELOCITY
+#define FCU_USE_EKF_VELOCITY 0
+#endif
+// One-flight EKF shadow capture: emit [EKF] lines comparing the EKF estimate to
+// the live complementary filter (+ velocity/bias/health) for offline validation.
+// OFF by default (serial bandwidth); enable for a shadow-validation flight.
+#ifndef FCU_EKF_SHADOW_LOG
+#define FCU_EKF_SHADOW_LOG 0
+#endif
+#ifndef FCU_EKF_SHADOW_LOG_HZ
+#define FCU_EKF_SHADOW_LOG_HZ 10U
+#endif
 
 // State machines / managers.
 #include "auto_takeoff.h"
 #include "autonomy_uart.h"
+#include "esc_uart_telemetry.h"     // KISS TLM-wire parser (UART2, FCU_ESC_TELEM)
 #include "failsafe_manager.h"
+#include "fcu_configurator.h"
 #include "flight_state_machine.h"
 
-// PID webserver (compile-out via ENABLE_PID_WEBSERVER=0).
+// PID webserver (compile-out via ENABLE_PID_WEBSERVER=0). The USB
+// configurator reuses the same backend callbacks when ENABLE_USB_CONFIG=1.
 #include "pid_webserver.h"
 
 // Compile-time feature flags for the new autonomy controllers. Defaults
@@ -216,11 +247,34 @@
 #ifndef FCU_ENABLE_ALTITUDE_HOLD
 #define FCU_ENABLE_ALTITUDE_HOLD 1
 #endif
+// WiFi credentials + HTTP auth token are SECRET. They are NOT in
+// platformio.ini (which is committed) — they come from an untracked, gitignored
+// local header. Both WiFi consumers share the same secrets: the bench-only
+// PID-web tuner AND the flight-build wireless features (FCU_ENABLE_WIFI_LOGGING
+// / FCU_ENABLE_WIFI_OTA via wifi_manager.h, which defines FCU_WIFI_STACK_ENABLED).
+// Any build that needs WiFi fails loudly if the header is missing rather than
+// silently falling back to an empty/default credential.
+#if ENABLE_PID_WEBSERVER || FCU_WIFI_STACK_ENABLED
+#if defined(__has_include)
+#if __has_include("pidweb_secrets.h")
+#include "pidweb_secrets.h"
+#endif
+#endif
+#if !defined(FCU_PID_WIFI_SSID) || !defined(FCU_PID_WIFI_PASS) || \
+    !defined(FCU_PID_AUTH_TOKEN)
+#error "WiFi-enabled build requires FCU_PID_WIFI_SSID, FCU_PID_WIFI_PASS, and FCU_PID_AUTH_TOKEN. Copy src/pidweb_secrets.h.example to src/pidweb_secrets.h (gitignored) and fill it in."
+#endif
+#endif  // ENABLE_PID_WEBSERVER || FCU_WIFI_STACK_ENABLED
+// Harmless defaults so non-PID-web builds (where these are unused) still compile
+// if anything references them.
 #ifndef FCU_PID_WIFI_SSID
 #define FCU_PID_WIFI_SSID ""
 #endif
 #ifndef FCU_PID_WIFI_PASS
 #define FCU_PID_WIFI_PASS ""
+#endif
+#ifndef FCU_PID_AUTH_TOKEN
+#define FCU_PID_AUTH_TOKEN ""
 #endif
 #ifndef FCU_PID_WIFI_TIMEOUT_MS
 #define FCU_PID_WIFI_TIMEOUT_MS 10000U
@@ -265,6 +319,12 @@
 #endif
 #ifndef FCU_GYRO_ANOMALY_RAW_FILTER_DELTA_DPS
 #define FCU_GYRO_ANOMALY_RAW_FILTER_DELTA_DPS 80.0f
+#endif
+// [LVLDIAG] Emit rate (Hz) for the one-line left-veer / low-M3 diagnostic logger
+// in updateControlLoop(). 0 = compiled out (zero overhead). Enable per-env with
+// -D FCU_LEVEL_DIAG_LOG_HZ=50 (e.g. 25-50) for a restrained bench/takeoff capture.
+#ifndef FCU_LEVEL_DIAG_LOG_HZ
+#define FCU_LEVEL_DIAG_LOG_HZ 0
 #endif
 #ifndef FCU_ENABLE_DEBUG_TELEMETRY
 #define FCU_ENABLE_DEBUG_TELEMETRY 1
@@ -382,6 +442,79 @@
 #endif
 #ifndef FCU_ENABLE_MAG_YAW_FUSION
 #define FCU_ENABLE_MAG_YAW_FUSION 1
+#endif
+// ---- External MMC5603 magnetometer (I2C / STEMMA QT) ----------------------
+// Optional cleaner yaw drift reference, off the airframe noise. Compiled out
+// when FCU_ENABLE_EXTERNAL_MAG=0. See include/external_mag.h.
+#ifndef FCU_ENABLE_EXTERNAL_MAG
+#define FCU_ENABLE_EXTERNAL_MAG 0
+#endif
+// Body-axis remap for the external chip (independent of the IMU/onboard-mag map
+// because it is a separate sensor that can be mounted in any orientation).
+// axis: 0=sensorX, 1=sensorY, 2=sensorZ; sign flips the selected axis.
+#ifndef FCU_EXTMAG_BODY_X_AXIS
+#define FCU_EXTMAG_BODY_X_AXIS 0
+#endif
+#ifndef FCU_EXTMAG_BODY_X_SIGN
+#define FCU_EXTMAG_BODY_X_SIGN 1.0f
+#endif
+#ifndef FCU_EXTMAG_BODY_Y_AXIS
+#define FCU_EXTMAG_BODY_Y_AXIS 1
+#endif
+#ifndef FCU_EXTMAG_BODY_Y_SIGN
+#define FCU_EXTMAG_BODY_Y_SIGN 1.0f
+#endif
+#ifndef FCU_EXTMAG_BODY_Z_AXIS
+#define FCU_EXTMAG_BODY_Z_AXIS 2
+#endif
+#ifndef FCU_EXTMAG_BODY_Z_SIGN
+#define FCU_EXTMAG_BODY_Z_SIGN 1.0f
+#endif
+#ifndef FCU_EXTMAG_FIELD_MIN_UT
+#define FCU_EXTMAG_FIELD_MIN_UT 15.0f
+#endif
+#ifndef FCU_EXTMAG_FIELD_MAX_UT
+#define FCU_EXTMAG_FIELD_MAX_UT 95.0f
+#endif
+#ifndef FCU_EXTMAG_STALE_MS
+#define FCU_EXTMAG_STALE_MS 250U
+#endif
+#ifndef FCU_EXTMAG_ODR_HZ
+#define FCU_EXTMAG_ODR_HZ 75U
+#endif
+// Per-tick external heading slew gate: a jump beyond this between accepted
+// samples is treated as interference and suppresses the correction (bounded run
+// so a genuine fast yaw is accepted after FCU_EXTMAG_HEADING_JUMP_MAX_REJECT).
+#ifndef FCU_EXTMAG_HEADING_JUMP_DEG
+#define FCU_EXTMAG_HEADING_JUMP_DEG 60.0f
+#endif
+#ifndef FCU_EXTMAG_HEADING_JUMP_MAX_REJECT
+#define FCU_EXTMAG_HEADING_JUMP_MAX_REJECT 8
+#endif
+// Slow yaw-correction gain [0,1]. 0 = SHADOW: the compass is detected, logged,
+// calibrated and telemetered but has NO authority over yaw until raised from the
+// web UI after bench validation. Multiplies the slow complementary pull.
+#ifndef FCU_MAG_YAW_CORR_GAIN_DEFAULT
+#define FCU_MAG_YAW_CORR_GAIN_DEFAULT 0.0f
+#endif
+// ---- Magnetometer DISPLAY filter (compass/telemetry only; NOT flight control) ----
+// EMA-smooths heading + field, gates impulse spikes, and debounces the trusted
+// flag so the dashboard needle / field bar / valid flag stop jittering.
+// FCU_MAG_FILTER 0 = passthrough (raw, as before).
+#ifndef FCU_MAG_FILTER
+#define FCU_MAG_FILTER 1
+#endif
+#ifndef FCU_MAG_FILTER_TAU_S
+#define FCU_MAG_FILTER_TAU_S 0.15f      // heading/field EMA time constant (s)
+#endif
+#ifndef FCU_MAG_SPIKE_REJECT_UT
+#define FCU_MAG_SPIKE_REJECT_UT 30.0f   // |field - smoothed| over this = impulse, reject
+#endif
+#ifndef FCU_MAG_SPIKE_MAX_REJECT
+#define FCU_MAG_SPIKE_MAX_REJECT 8      // accept after this many rejects (real level shift)
+#endif
+#ifndef FCU_MAG_VALID_DEBOUNCE
+#define FCU_MAG_VALID_DEBOUNCE 3        // consecutive samples before flipping the valid flag
 #endif
 #ifndef FCU_ATT_ACCEL_MIN_G
 #define FCU_ATT_ACCEL_MIN_G 0.85f
@@ -517,6 +650,44 @@ static_assert((USE_ELRS_CRSF_CONTROL + USE_IBUS_CONTROL + USE_NRF_CONTROL) <= 1,
               "Enable at most one manual control source "
               "(USE_ELRS_CRSF_CONTROL / USE_FLYSKY_IBUS_CONTROL / USE_NRF24_CONTROL)");
 
+// ---- Wireless logging / OTA flags (see include/wifi_manager.h) -------------
+// FCU_ENABLE_WIFI_LOGGING / FCU_ENABLE_WIFI_OTA / FCU_ENABLE_BLE_LOGGING all
+// default 0 in wifi_manager.h; FCU_WIFI_STACK_ENABLED is derived there. The
+// AUX-switch toggle below adds the only runtime enable path for flight builds.
+#ifndef FCU_ENABLE_RADIO_WIFI_TOGGLE
+#define FCU_ENABLE_RADIO_WIFI_TOGGLE 0
+#endif
+// 1-based CRSF channel for the WiFi toggle. 0 = unmapped (the toggle feature
+// then refuses to compile). On this airframe: CH1-4 sticks, CH5 arm, CH6/CH7
+// are the camera gimbal, so use CH9+ for WiFi.
+#ifndef FCU_WIFI_TOGGLE_AUX_CHANNEL
+#define FCU_WIFI_TOGGLE_AUX_CHANNEL 0
+#endif
+// AUX switch must hold a new position this long before it counts (debounce on
+// top of the crsfSwitchIsHigh() voltage hysteresis).
+#ifndef FCU_WIFI_TOGGLE_DEBOUNCE_MS
+#define FCU_WIFI_TOGGLE_DEBOUNCE_MS 750U
+#endif
+#if FCU_ENABLE_RADIO_WIFI_TOGGLE
+  #if !FCU_WIFI_STACK_ENABLED
+  #error "FCU_ENABLE_RADIO_WIFI_TOGGLE=1 needs a WiFi feature to toggle: set FCU_ENABLE_WIFI_LOGGING=1 and/or FCU_ENABLE_WIFI_OTA=1."
+  #endif
+  #if !USE_ELRS_CRSF_CONTROL
+  #error "FCU_ENABLE_RADIO_WIFI_TOGGLE=1 requires the ELRS/CRSF control link (USE_ELRS_CRSF_CONTROL=1)."
+  #endif
+  #if (FCU_WIFI_TOGGLE_AUX_CHANNEL) < 1 || (FCU_WIFI_TOGGLE_AUX_CHANNEL) > 16
+  #error "Set FCU_WIFI_TOGGLE_AUX_CHANNEL to the 1-based CRSF channel of a free AUX switch (e.g. 9). It is deliberately unmapped by default."
+  #endif
+  #if (FCU_WIFI_TOGGLE_AUX_CHANNEL) <= 6
+  #error "FCU_WIFI_TOGGLE_AUX_CHANNEL conflicts with sticks (CH1-4), arm (CH5), or camera pan (CH6). Use CH9+."
+  #endif
+#endif
+// The flight-build WiFi stack and the bench-only PID-web tuner must not own
+// WiFi in the same image (two initializers, and pidweb images are non-flyable).
+#if FCU_WIFI_STACK_ENABLED && defined(ENABLE_PID_WEBSERVER) && ENABLE_PID_WEBSERVER
+#error "FCU_ENABLE_WIFI_LOGGING/OTA cannot be combined with ENABLE_PID_WEBSERVER (bench-only env owns WiFi there)."
+#endif
+
 #ifndef FCU_PIN_NRF_MOSI
 #define FCU_PIN_NRF_MOSI 4
 #endif
@@ -643,6 +814,30 @@ static_assert((USE_ELRS_CRSF_CONTROL + USE_IBUS_CONTROL + USE_NRF_CONTROL) <= 1,
 #ifndef CRSF_DEBUG_LOG_PERIOD_MS
 #define CRSF_DEBUG_LOG_PERIOD_MS 1000U
 #endif
+// FC-originated telemetry sent back through the ELRS receiver to EdgeTX.
+// Battery/attitude/GPS are deliberately slower than RC decoding and each CRSF
+// task tick sends at most one telemetry frame after checking UART TX space.
+#ifndef CRSF_FC_TELEMETRY
+#define CRSF_FC_TELEMETRY 1
+#endif
+#ifndef CRSF_TLM_BATTERY_PERIOD_MS
+#define CRSF_TLM_BATTERY_PERIOD_MS 1000U
+#endif
+#ifndef CRSF_TLM_ATTITUDE_PERIOD_MS
+#define CRSF_TLM_ATTITUDE_PERIOD_MS 200U
+#endif
+#ifndef CRSF_TLM_GPS_PERIOD_MS
+#define CRSF_TLM_GPS_PERIOD_MS 1000U
+#endif
+#ifndef CRSF_TLM_GPS_STALE_MS
+#define CRSF_TLM_GPS_STALE_MS 2500U
+#endif
+// Flight-mode text sensor ("FM" on EdgeTX) — the observer FSM state name
+// (IDLE / STABILIZE / FAILSAFE / ...). Re-sent immediately on a state change
+// so arm/failsafe transitions show on the handset without waiting a period.
+#ifndef CRSF_TLM_FLIGHTMODE_PERIOD_MS
+#define CRSF_TLM_FLIGHTMODE_PERIOD_MS 500U
+#endif
 
 // ===== FPV camera pan/tilt servos =====
 // HARDWARE-CHANGE NOTE: these two outputs REUSE the GPIOs vacated by the
@@ -650,8 +845,8 @@ static_assert((USE_ELRS_CRSF_CONTROL + USE_IBUS_CONTROL + USE_NRF_CONTROL) <= 1,
 //     PAN_SERVO_PIN  = FCU_PIN_CTRL_CSN  (old control-radio chip-select pad)
 //     TILT_SERVO_PIN = FCU_PIN_CTRL_IRQ  (old control-radio IRQ pad)
 // On the ESP32-S3 both are ordinary GPIOs — no input-only, strapping, or
-// SPI-flash restriction — so they are valid LEDC PWM outputs. The servo PWM
-// runs on the LEDC peripheral, fully independent of the motor DShot (RMT)
+// SPI-flash restriction — so they are valid servo PWM outputs. The servo PWM
+// is independent of the motor DShot (RMT)
 // timers, so it cannot disturb motor output. (The telemetry nRF24 on TELM_*
 // pads is UNTOUCHED.) See camera_gimbal.h.
 #ifndef PAN_SERVO_PIN
@@ -688,10 +883,26 @@ static_assert((USE_ELRS_CRSF_CONTROL + USE_IBUS_CONTROL + USE_NRF_CONTROL) <= 1,
 #endif
 // Which CRSF channels drive the gimbal (1-based, per the channel map above).
 #ifndef CAMERA_PAN_CHANNEL
-#define CAMERA_PAN_CHANNEL 7
+#define CAMERA_PAN_CHANNEL 6
 #endif
 #ifndef CAMERA_TILT_CHANNEL
-#define CAMERA_TILT_CHANNEL 8
+#define CAMERA_TILT_CHANNEL 7
+#endif
+// 3-position aux-switch decode thresholds (µs). Below LOW => one mechanical end,
+// above HIGH => the other end, in between => centre. CRSF switch detents sit near
+// 1000/1500/2000 µs, so 1300/1700 give wide, glitch-proof guard bands.
+#ifndef CAMERA_AUX_LOW_US
+#define CAMERA_AUX_LOW_US 1300
+#endif
+#ifndef CAMERA_AUX_HIGH_US
+#define CAMERA_AUX_HIGH_US 1700
+#endif
+// The WiFi toggle switch must not share a channel with the gimbal axes.
+#if FCU_ENABLE_RADIO_WIFI_TOGGLE && USE_CAMERA_PAN_TILT
+  #if (FCU_WIFI_TOGGLE_AUX_CHANNEL) == (CAMERA_PAN_CHANNEL) || \
+      (FCU_WIFI_TOGGLE_AUX_CHANNEL) == (CAMERA_TILT_CHANNEL)
+  #error "FCU_WIFI_TOGGLE_AUX_CHANNEL collides with a camera gimbal channel (CAMERA_PAN/TILT_CHANNEL). Use a free CH9+ switch."
+  #endif
 #endif
 
 static constexpr int PIN_NRF_MOSI = FCU_PIN_NRF_MOSI;
@@ -722,6 +933,12 @@ static constexpr uint8_t CRSF_UART_INDEX = CRSF_UART_NUM;
 static constexpr uint32_t CRSF_UART_BAUD_HZ = CRSF_BAUD;
 static constexpr uint32_t CRSF_LINK_TIMEOUT = CRSF_LINK_TIMEOUT_MS;
 static constexpr uint32_t CRSF_TASK_PERIOD = CRSF_TASK_PERIOD_MS;
+static constexpr bool CRSF_FC_TELEMETRY_ENABLED = (CRSF_FC_TELEMETRY != 0);
+static constexpr uint32_t CRSF_TLM_BATTERY_PERIOD = CRSF_TLM_BATTERY_PERIOD_MS;
+static constexpr uint32_t CRSF_TLM_ATTITUDE_PERIOD = CRSF_TLM_ATTITUDE_PERIOD_MS;
+static constexpr uint32_t CRSF_TLM_GPS_PERIOD = CRSF_TLM_GPS_PERIOD_MS;
+static constexpr uint32_t CRSF_TLM_GPS_STALE = CRSF_TLM_GPS_STALE_MS;
+static constexpr uint32_t CRSF_TLM_FLIGHTMODE_PERIOD = CRSF_TLM_FLIGHTMODE_PERIOD_MS;
 #if USE_ELRS_CRSF_CONTROL
 static_assert(PIN_CRSF_RX >= 0, "FCU CRSF RX pin must be configured");
 #endif
@@ -734,7 +951,7 @@ static constexpr int PIN_TILT_SERVO = TILT_SERVO_PIN;
 static_assert(PIN_PAN_SERVO >= 0 && PIN_TILT_SERVO >= 0,
               "Camera pan/tilt enabled but PAN_SERVO_PIN / TILT_SERVO_PIN unset");
 // The servos reuse the old nRF24 CONTROL pads; that radio MUST be off or the
-// SPI driver and LEDC would fight over the same GPIOs.
+// SPI driver and servo output would fight over the same GPIOs.
 static_assert(USE_NRF_CONTROL == 0,
               "USE_CAMERA_PAN_TILT reuses the nRF24 CONTROL GPIOs — disable USE_NRF24_CONTROL");
 #endif
@@ -812,10 +1029,10 @@ static constexpr int PIN_BMP_SCL = FCU_PIN_BMP_SCL;
 #define FCU_PIN_BATT_ADC 2
 #endif
 #ifndef FCU_BATT_DIVIDER_GAIN
-// Multiplier from ADC voltage to pack voltage. Default assumes the 4S monitor
-// divider plus ADC calibration. Bench calibration: FCU reported 18.30 V when
-// the pack measured 16.80 V, so 5.545455 * (16.80 / 18.30) = 5.090909.
-#define FCU_BATT_DIVIDER_GAIN 5.090909f
+// Multiplier from ADC voltage to pack voltage. Bench calibration sequence:
+// 14.04 V / 2.48 V = 5.661290, then web read 17.23 V while pack was 16.80 V,
+// so 5.661290 * (16.80 / 17.23) = 5.520017.
+#define FCU_BATT_DIVIDER_GAIN 5.520017f
 #endif
 #ifndef FCU_BATT_LOW_VOLTS
 #define FCU_BATT_LOW_VOLTS 14.0f
@@ -868,12 +1085,25 @@ static constexpr float MAG_FIELD_MIN_UT = FCU_MAG_FIELD_MIN_UT;
 static constexpr float MAG_FIELD_MAX_UT = FCU_MAG_FIELD_MAX_UT;
 static constexpr float MAG_YAW_TAU_S = FCU_MAG_YAW_TAU_S;
 static constexpr bool MAG_YAW_FUSION_ENABLED = (FCU_ENABLE_MAG_YAW_FUSION != 0);
+// External-mag tunables (mirrors of the FCU_EXTMAG_* macros).
+static constexpr int EXTMAG_BODY_X_AXIS = FCU_EXTMAG_BODY_X_AXIS;
+static constexpr int EXTMAG_BODY_Y_AXIS = FCU_EXTMAG_BODY_Y_AXIS;
+static constexpr int EXTMAG_BODY_Z_AXIS = FCU_EXTMAG_BODY_Z_AXIS;
+static constexpr float EXTMAG_BODY_X_SIGN = FCU_EXTMAG_BODY_X_SIGN;
+static constexpr float EXTMAG_BODY_Y_SIGN = FCU_EXTMAG_BODY_Y_SIGN;
+static constexpr float EXTMAG_BODY_Z_SIGN = FCU_EXTMAG_BODY_Z_SIGN;
+static constexpr float EXTMAG_FIELD_MIN_UT = FCU_EXTMAG_FIELD_MIN_UT;
+static constexpr float EXTMAG_FIELD_MAX_UT = FCU_EXTMAG_FIELD_MAX_UT;
+static constexpr uint32_t EXTMAG_STALE_MS = FCU_EXTMAG_STALE_MS;
+static constexpr uint8_t EXTMAG_ODR_HZ = static_cast<uint8_t>(FCU_EXTMAG_ODR_HZ);
+static constexpr float EXTMAG_HEADING_JUMP_DEG = FCU_EXTMAG_HEADING_JUMP_DEG;
+static constexpr uint8_t EXTMAG_HEADING_JUMP_MAX_REJECT = FCU_EXTMAG_HEADING_JUMP_MAX_REJECT;
 static constexpr float ATT_ACCEL_MIN_G = FCU_ATT_ACCEL_MIN_G;
 static constexpr float ATT_ACCEL_MAX_G = FCU_ATT_ACCEL_MAX_G;
 static constexpr uint16_t GYRO_BIAS_CAL_SAMPLES = FCU_GYRO_BIAS_CAL_SAMPLES;
 
 // DShot motor pins. Output arrays use verified motor-number order:
-// M1 front-left (CCW), M2 rear-left (CW), M3 front-right (CW), M4 rear-right (CCW).
+// M1 front-right (CW), M2 rear-right (CCW), M3 front-left (CCW), M4 rear-left (CW).
 static constexpr int MOTOR0_GPIO = 39;  // M1
 static constexpr int MOTOR1_GPIO = 40;  // M2
 static constexpr int MOTOR2_GPIO = 41;  // M3
@@ -1116,6 +1346,10 @@ static constexpr uint8_t BATT_OVERSAMPLE_COUNT = 16;
 static constexpr float BATT_EMA_ALPHA = 0.10f;
 static constexpr uint32_t GPS_BAUD = 9600;
 static constexpr size_t GPS_MAX_BYTES_PER_POLL = 96;
+#ifndef FCU_GPS_RMC_VELOCITY_STALE_MS
+#define FCU_GPS_RMC_VELOCITY_STALE_MS 2500U
+#endif
+static constexpr uint32_t GPS_RMC_VELOCITY_STALE_MS = FCU_GPS_RMC_VELOCITY_STALE_MS;
 static constexpr uint32_t PI_UART_BAUD = 115200;
 static constexpr uint8_t TOF_I2C_ADDRESS = 0x29;
 static constexpr uint16_t TOF_EXPECTED_SENSOR_ID = 0xEACC;
@@ -1169,6 +1403,31 @@ static constexpr float DYNAMIC_NOTCH_HIGH_CMD_HZ = DYN_NOTCH_HIGH_CMD_HZ;
 static constexpr bool DYNAMIC_NOTCH_DEBUG_ENABLED = (DYN_NOTCH_DEBUG != 0);
 static constexpr float MAX_ANGLE_SETPOINT_DEG = 15.0f;
 
+// ---- Persistent level correction + manual trim ------------------------------
+// The board-level / mounting correction (roll/pitch offset) and the manual
+// roll/pitch trim are subtracted from the ESTIMATED attitude ONCE, at the
+// outer (angle) loop, so a physically level frame reads zero error and the
+// mixer stops biasing two motors. These are loaded from NVS at boot and never
+// touched by the per-boot stationary cal. Limits below double as the NVS
+// validation envelope (a record outside them is rejected as corrupt).
+static constexpr float LEVEL_CAL_MAX_OFFSET_DEG = 15.0f;  // reject mounting offset beyond this
+static constexpr float LEVEL_TRIM_MAX_DEG       = 10.0f;  // manual trim clamp (each axis)
+static constexpr float LEVEL_TRIM_STEP_DEG      = 0.5f;   // web "small step" increment
+// "Calibrate Level & Save": average this many attitude samples while the frame
+// is verified stationary. ~400 @ 500 Hz ≈ 0.8 s of data after the settle gate.
+static constexpr uint16_t LEVEL_CAL_SAMPLES              = 400;
+static constexpr float    LEVEL_CAL_GYRO_STATIONARY_DPS  = 2.0f;   // per-axis gyro motion gate
+static constexpr float    LEVEL_CAL_ACCEL_MIN_G          = 0.90f;  // |accel| window (gravity only)
+static constexpr float    LEVEL_CAL_ACCEL_MAX_G          = 1.10f;
+static constexpr uint16_t LEVEL_CAL_MAX_REJECTS          = 60;     // abort if this many non-stationary
+// Level-cal failure codes (surfaced to the dashboard so the operator sees WHY).
+static constexpr uint8_t LEVELCAL_ERR_NONE     = 0;
+static constexpr uint8_t LEVELCAL_ERR_MOTION   = 1;  // too much movement during capture
+static constexpr uint8_t LEVELCAL_ERR_ACCEL    = 2;  // accel magnitude out of gravity window
+static constexpr uint8_t LEVELCAL_ERR_RANGE    = 3;  // resulting offset beyond LEVEL_CAL_MAX_OFFSET_DEG
+static constexpr uint8_t LEVELCAL_ERR_NVS      = 4;  // NVS write or read-back verify failed
+static constexpr uint8_t LEVELCAL_ERR_NOT_IDLE = 5;  // armed / throttle / not bench-idle
+
 // Recovery authority knobs. Both ceilings combine to limit how aggressively
 // the controller can fight a large tilt:
 //
@@ -1196,6 +1455,39 @@ static constexpr float MAX_ANGLE_SETPOINT_DEG = 15.0f;
 static constexpr float MAX_ANGLE_RATE_SETPOINT_DPS = FCU_MAX_ANGLE_RATE_SETPOINT_DPS;
 static constexpr float MAX_YAW_RATE_SETPOINT_DPS = 100.0f;
 static constexpr float PID_OUTPUT_LIMIT_RAW = FCU_PID_OUTPUT_LIMIT_RAW;
+
+// ---- Armed-idle (active-flight-path safety fix, 2026-06) -------------------
+// Old behavior: throttle 0 while ARMED called forceMotorStop() — props stopped
+// and PID integrators were wiped, so a mid-air throttle chop meant total
+// thrust loss + controller amnesia. Market FCUs (Betaflight/INAV/ArduCopter)
+// instead hold an idle motor command while armed and only hard-stop on
+// disarm / failsafe / touchdown.
+//
+// New behavior (FCU_ARMED_IDLE_ENABLE=1, default): while allowFlight is true
+// and commanded throttle is 0, every motor is held at ARMED_IDLE_MOTOR_RAW
+// (= MOTOR_OUTPUT_MIN_ACTIVE_RAW = DShot 48, the codebase's existing minimum
+// active command — no new magic number) and the rate PIDs keep running with
+// the integrator frozen. Raising throttle resumes normal flight instantly.
+//
+// !! BEHAVIOR CHANGE THE PILOT MUST KNOW: arming (CH5 high after safe-boot)
+// now SPINS THE PROPS at idle on the ground, like every market FCU. Verify
+// props-off first; set FCU_ARMED_IDLE_ENABLE=0 to restore the legacy
+// stop-at-zero-throttle behavior.
+//
+// TODO(hardware): confirm these ESCs spin reliably at DShot 48 (some need
+// 60-80 for clean startup under prop load). Bench-verify before flight.
+#ifndef FCU_ARMED_IDLE_ENABLE
+#define FCU_ARMED_IDLE_ENABLE 1
+#endif
+static constexpr bool ARMED_IDLE_ENABLED = (FCU_ARMED_IDLE_ENABLE != 0);
+static constexpr uint16_t ARMED_IDLE_MOTOR_RAW = MOTOR_OUTPUT_MIN_ACTIVE_RAW;
+
+// Below this commanded throttle (percent) the rate-PID integrators are FROZEN
+// (held, not reset): the airframe is on the ground or has no meaningful
+// authority, so integrating attitude error is pure windup. 5% matches the
+// existing "meaningful throttle" threshold used for manual-override detection
+// (packet.throttlePercent > 5 in updateControlLoop / flight_state_machine.h).
+static constexpr uint8_t PID_ITERM_MIN_THROTTLE_PCT = 5;
 
 // ---- Inner-loop (rate PID) derivative + integral hardening -----------------
 // Shapes the rate PIDs only (roll/pitch/yaw via configurePidAxis). Logged at
@@ -1225,7 +1517,7 @@ static constexpr float PID_DTERM_LPF_HZ = FCU_PID_DTERM_LPF_HZ;
 static constexpr float PID_INTEGRAL_LIMIT_RAW = FCU_PID_INTEGRAL_LIMIT_RAW;
 
 // Conservative first-flight gains for the current heavy quad layout:
-// M1 FL CCW, M2 RL CW, M3 FR CW, M4 RR CCW. The bench logs show clean
+// M1 FR CW, M2 RR CCW, M3 FL CCW, M4 RL CW. The bench logs show clean
 // roll/pitch/yaw axis signs but visible prop/guard vibration risk, so D stays
 // at zero until prop balance and soft-mounting are verified under [TUNE_DBG].
 static constexpr int16_t DEFAULT_RATE_ROLL_P_MILLI = 0;
@@ -1288,6 +1580,55 @@ static constexpr uint16_t FCU_RMT_TX_BUFFER_SYMBOLS = 48;
 #define FCU_DSHOT_BIDIR 0
 #endif
 static constexpr bool BIDIR_DSHOT_ENABLED = (FCU_DSHOT_BIDIR != 0);
+
+// ---- ESC UART telemetry (KISS / BLHeli_32 / AM32 "TLM" wire) ----------------
+// The ESC's TLM pad emits a 10-byte KISS frame (temp / volts / amps / mAh /
+// eRPM) at 115200 8N1 whenever a DShot frame carries the telemetry-request
+// bit. The FCU polls one motor at a time (shared wire on a 4-in-1) from the
+// sensor task; see esc_uart_telemetry.h and pollEscUartTelemetry().
+//
+// HARDWARE: ESC TLM pad -> GPIO FCU_PIN_ESC_TELEM (default 15 = the freed
+// nRF24 CTRL_CE pad, the last unused control-radio pin; CSN 7 and IRQ 16 are
+// the camera servos), common ground. Requires an ESC firmware that implements
+// KISS telemetry (BLHeli_32, AM32, KISS — plain BLHeli_S does NOT).
+// GPIO 15 is only safe because USE_NRF_CONTROL=0 (the control radio's
+// prepareRadioControlPins() would otherwise drive it) and the iBus fallback
+// (whose default RX pin is also 15) is off — both enforced below.
+//
+// RESOURCE TRADE: the S3 has only three UARTs and all are allocated, so this
+// feature REUSES UART2 (RX-only) and is therefore mutually exclusive with the
+// Pi autonomy link. It also conflicts with bidirectional DShot, which owns
+// the telemetry-request bit (and provides eRPM on the signal wire instead).
+// Default OFF until the TLM wire is physically connected and bench-verified.
+#ifndef FCU_ESC_TELEM
+#define FCU_ESC_TELEM 0
+#endif
+#ifndef FCU_PIN_ESC_TELEM
+#define FCU_PIN_ESC_TELEM 15
+#endif
+#ifndef FCU_ESC_TELEM_BAUD
+#define FCU_ESC_TELEM_BAUD 115200UL
+#endif
+// Pole pairs for mechanical-RPM display only (14-magnet outrunner = 7).
+#ifndef FCU_ESC_TELEM_POLE_PAIRS
+#define FCU_ESC_TELEM_POLE_PAIRS 7
+#endif
+static constexpr bool ESC_TELEM_ENABLED = (FCU_ESC_TELEM != 0);
+static constexpr int PIN_ESC_TELEM = FCU_PIN_ESC_TELEM;
+static constexpr uint32_t ESC_TELEM_BAUD = FCU_ESC_TELEM_BAUD;
+static constexpr uint16_t ESC_TELEM_POLE_PAIRS = FCU_ESC_TELEM_POLE_PAIRS;
+#if FCU_ESC_TELEM && FCU_ENABLE_AUTONOMY_UART
+#error "FCU_ESC_TELEM and FCU_ENABLE_AUTONOMY_UART both need UART2 (the S3 has only 3 UARTs: 0=CRSF, 1=GPS, 2=this) — enable at most one"
+#endif
+#if FCU_ESC_TELEM && FCU_DSHOT_BIDIR
+#error "FCU_ESC_TELEM polls the DShot telemetry-request bit, which bidirectional DShot permanently asserts — enable at most one"
+#endif
+#if FCU_ESC_TELEM && USE_NRF_CONTROL
+#error "FCU_ESC_TELEM's default pin is the nRF24 control radio's CE pad (GPIO 15) — disable USE_NRF24_CONTROL or move FCU_PIN_ESC_TELEM"
+#endif
+#if FCU_ESC_TELEM && USE_IBUS_CONTROL && (IBUS_RX_PIN == FCU_PIN_ESC_TELEM)
+#error "FCU_ESC_TELEM and the iBus fallback both default to GPIO 15 — move one of IBUS_RX_PIN / FCU_PIN_ESC_TELEM"
+#endif
 
 #ifndef FCU_ENABLE_RPM_FILTER
 #define FCU_ENABLE_RPM_FILTER 0
@@ -1374,6 +1715,18 @@ static constexpr uint32_t HEALTH_LOG_PERIOD_MS = 5000;   // stack high-water + h
 static constexpr uint32_t ESC_STARTUP_SETTLE_MS = 3000;  // hold DSHOT zero after attach/arm
 static constexpr uint16_t PIDWEB_MOTOR_TEST_RAW = 300;
 static constexpr uint32_t PIDWEB_MOTOR_TEST_MS = 300;
+#ifndef FCU_CONFIG_MOTOR_TEST_MAX_RAW
+#define FCU_CONFIG_MOTOR_TEST_MAX_RAW 600U
+#endif
+#ifndef FCU_CONFIG_MOTOR_TEST_MAX_TIMEOUT_MS
+#define FCU_CONFIG_MOTOR_TEST_MAX_TIMEOUT_MS 750U
+#endif
+#ifndef FCU_CONFIG_MOTOR_TEST_SESSION_TIMEOUT_MS
+#define FCU_CONFIG_MOTOR_TEST_SESSION_TIMEOUT_MS 3000U
+#endif
+static constexpr uint16_t CONFIG_MOTOR_TEST_MAX_RAW = FCU_CONFIG_MOTOR_TEST_MAX_RAW;
+static constexpr uint32_t CONFIG_MOTOR_TEST_MAX_TIMEOUT_MS = FCU_CONFIG_MOTOR_TEST_MAX_TIMEOUT_MS;
+static constexpr uint32_t CONFIG_MOTOR_TEST_SESSION_TIMEOUT_MS = FCU_CONFIG_MOTOR_TEST_SESSION_TIMEOUT_MS;
 static constexpr uint32_t TASK_WDT_TIMEOUT_MS = FCU_TASK_WDT_TIMEOUT_MS;
 static constexpr uint32_t FLIGHT_OVERRUN_WARN_US = FCU_FLIGHT_OVERRUN_WARN_US;
 static constexpr uint32_t RADIO_OVERRUN_WARN_US = FCU_RADIO_OVERRUN_WARN_US;
@@ -1422,12 +1775,55 @@ struct GyroCalRuntime {
   bool lastOk = false;
 };
 
+// Level-calibration runtime. Mirrors GyroCalRuntime: a web request sets
+// `requested`, the flight task (sole owner of the attitude estimate) services
+// it across ticks — averaging the estimated roll/pitch while verifying the
+// frame is stationary — then stores the mounting offset and resets the PID
+// integrators. Guarded by gFlightMux. See serviceLevelCalibration().
+struct LevelCalRuntime {
+  bool requested = false;
+  bool active = false;
+  uint16_t accepted = 0;        // stationary samples accumulated
+  uint16_t rejected = 0;        // non-stationary samples (abort if > MAX_REJECTS)
+  uint16_t target = LEVEL_CAL_SAMPLES;
+  double sumRoll = 0.0;
+  double sumPitch = 0.0;
+  double sumRoll2 = 0.0;        // sum of squares → std-dev quality metric
+  double sumPitch2 = 0.0;
+  uint32_t startedMs = 0;
+  uint32_t completedCount = 0;
+  bool lastOk = false;
+  uint8_t lastError = LEVELCAL_ERR_NONE;
+  // Result of the most recent completed capture (for the dashboard).
+  float resultRollOffsetDeg = 0.0f;
+  float resultPitchOffsetDeg = 0.0f;
+  float qualityRollStdDeg = 0.0f;   // sample std-dev = "how still was it"
+  float qualityPitchStdDeg = 0.0f;
+  uint16_t lastSampleCount = 0;
+};
+
 struct MotorSpinRuntime {
   uint8_t requestedMotor = 0;  // 1..4
   uint8_t activeMotor = 0;     // 1..4
   uint32_t startedMs = 0;
   uint32_t completedCount = 0;
 };
+
+#if ENABLE_USB_CONFIG
+struct ConfiguratorMotorTestRuntime {
+  bool sessionArmed = false;
+  bool active = false;
+  uint8_t motorMask = 0;       // bit0=M1 ... bit3=M4
+  uint16_t raw = 0;
+  uint32_t startedMs = 0;
+  uint32_t lastCommandMs = 0;
+  uint32_t outputDeadlineMs = 0;
+  uint32_t sessionDeadlineMs = 0;
+  uint32_t completedCount = 0;
+  uint32_t abortCount = 0;
+  uint8_t lastAbortReason = 0;
+};
+#endif
 
 struct ControlLinkState {
   bool linkActive = false;
@@ -1527,6 +1923,16 @@ struct SensorSnapshot {
   int32_t gpsLonE7 = 0;
   int16_t gpsAltDm = 0;
   uint32_t gpsLastSentenceMs = 0;
+  bool gpsGroundSpeedValid = false;
+  bool gpsCourseValid = false;
+  bool gpsVelocityValid = false;
+  uint16_t gpsGroundSpeedKmh10 = 0;
+  uint16_t gpsCourseCentiDeg = 0;
+  float gpsGroundSpeedMs = 0.0f;
+  float gpsCourseDeg = 0.0f;
+  float gpsVelNorthMs = 0.0f;
+  float gpsVelEastMs = 0.0f;
+  uint32_t gpsLastRmcMs = 0;
   TofState tof;
   BaroState baro;
   BatteryState battery;
@@ -1620,6 +2026,12 @@ struct BenchState {
   uint32_t telemetryPrimaryTxCount = 0;
   uint32_t telemetryAuxTxCount = 0;
   std::array<uint16_t, 4> motorRaw = {0, 0, 0, 0};
+  // Commanded vs accepted (F10): motorRaw is what the mixer COMMANDED;
+  // motorAcceptedRaw is the last value each ESC write actually ACCEPTED
+  // (spinRaw() returned true). motorWriteOkMask bit i = motor i's last write
+  // succeeded. Lets telemetry/logs tell "what we asked for" from "what landed".
+  std::array<uint16_t, 4> motorAcceptedRaw = {0, 0, 0, 0};
+  uint8_t motorWriteOkMask = 0x0F;
 };
 
 class FcuIcm20948 final : public Adafruit_ICM20948 {
@@ -1748,7 +2160,7 @@ IBusReceiver gIbus;
 // roll/pitch/throttle in the packet and pipe the iBUS yaw channel through
 // this side channel instead. Read inside updateControlLoop() and zeroed
 // during link loss or when the autonomy yaw command takes over.
-volatile int8_t gIbusYawStickPercent = 0;
+std::atomic<int8_t> gIbusYawStickPercent{0};
 #endif
 #if USE_ELRS_CRSF_CONTROL
 // ELRS/CRSF RX uses its own HardwareSerial instance on UART0 — the controller
@@ -1760,16 +2172,52 @@ CrsfBridgeState gCrsfBridge;
 // CRSF-driven yaw stick. Same rationale as gIbusYawStickPercent: the 32-byte
 // ControlPacket has no yaw field, so manual yaw rides this side channel, read
 // in updateControlLoop() and zeroed on link loss / autonomy yaw override.
-volatile int8_t gCrsfYawStickPercent = 0;
+std::atomic<int8_t> gCrsfYawStickPercent{0};
 #endif
 #if USE_CAMERA_PAN_TILT
-// FPV pan/tilt servo driver (LEDC peripheral). Ticked from the control-input
+// FPV pan/tilt servo driver. Ticked from the control-input
 // task so servo motion never competes for flight-loop time. See camera_gimbal.h.
 CameraPanTilt gCameraGimbal;
+// Dashboard servo override: when active, serviceCameraGimbal commands these
+// absolute pulse widths instead of the RC sticks. A command timeout hands
+// control back to the RC link so a stale browser can't hold the gimbal forever.
+// The gimbal stays single-writer (control task) — the web only posts targets.
+struct ServoOverride {
+  std::atomic<bool> active{false};
+  std::atomic<uint16_t> panUs{1500};
+  std::atomic<uint16_t> tiltUs{1500};
+  std::atomic<uint32_t> lastCmdMs{0};
+  std::atomic<bool> panInv{false};
+  std::atomic<bool> tiltInv{false};
+};
+ServoOverride gServoOverride;
+static constexpr uint32_t SERVO_CMD_TIMEOUT_MS = 4000;
 #endif
 GyroBiasState gGyroBias;
 GyroCalRuntime gGyroCal;
+LevelCalRuntime gLevelCal;
 MotorSpinRuntime gMotorSpin;
+#if ENABLE_USB_CONFIG
+ConfiguratorMotorTestRuntime gConfigMotorTest;
+#endif
+
+// Live persistent level correction + manual trim (degrees), applied ONCE per
+// flight tick in updateControlLoop as
+//   correctedAttitude = rawAttitude - levelOffset - manualTrim.
+// Loaded from NVS at boot; updated by "Calibrate Level & Save" and the trim
+// controls. Atomic so the flight task reads torn-free while the web task writes.
+// SEPARATE from the accelerometer offset (gCal, corrects the sensor reading)
+// and from the per-boot gyro bias (gGyroBias, temporary) — never folded
+// together, so each correction is applied exactly once and is independently
+// inspectable on the dashboard.
+struct LiveLevelCorrection {
+  std::atomic<float> rollOffsetDeg{0.0f};
+  std::atomic<float> pitchOffsetDeg{0.0f};
+  std::atomic<float> rollTrimDeg{0.0f};
+  std::atomic<float> pitchTrimDeg{0.0f};
+  std::atomic<bool>  loaded{false};   // a valid NVS record was applied at boot
+};
+LiveLevelCorrection gLevelCorr;
 
 bool gRadioBusInitialized = false;
 
@@ -1792,6 +2240,11 @@ AutoTakeoff gAutoTakeoff;
 AutonomyUart gPiAutonomy;
 FailsafeManager gFailsafe;
 fcu_nvs::FcuPidNvs gPidNvs;
+std::atomic<bool> gFailsafeBypass{ALL_FAILSAFES_DISABLED};
+
+static inline bool failsafesBypassed() {
+  return gFailsafeBypass.load(std::memory_order_relaxed);
+}
 
 // New autonomy controllers. All four are unconditionally compiled in so the
 // mode-switch decoder doesn't need #ifdef walls around every call site;
@@ -1810,6 +2263,63 @@ gnc::CascadedController gCascade;
 gnc::GainSchedule gGainSched;
 std::atomic<bool> gEkfReady{false};      // set true after init() succeeds
 volatile bool gEkfShadowOnly = (ENABLE_EXPERIMENTAL_EKF_CONTROL == 0);
+
+// ---- EKF measurement queue — single-owner fix (F4) ------------------------
+// gEkf used to be mutated from BOTH sensorTask (baro/ToF/GPS, core 0) AND
+// flightTask (predictIMU/mag, core 1, 500 Hz) — a cross-core data race on the
+// 15x15 covariance. Now sensorTask only POSTS measurements here and flightTask
+// is the single owner: it drains the queue and applies every update right after
+// predictIMU. All gEkf reads (shadow log, velocity seam) are already
+// flightTask-local, so no cross-task gEkf access remains and no lock is taken
+// in the 500 Hz path.
+struct EkfMeasurement {
+  enum class Type : uint8_t { Baro, Tof, GpsOrigin, GpsUpdate };
+  Type type;
+  uint32_t nowMs;
+  union {
+    float baroAltM;        // Baro: relative altitude (m)
+    uint16_t tofRangeMm;   // Tof: filtered range (mm)
+    struct {               // Gps*: WGS84 lat/lon (rad) + MSL altitude (m)
+      float latRad;
+      float lonRad;
+      float altMsl;
+      float velN;
+      float velE;
+      float velD;
+      bool hasVelocity;
+    } gps;
+  };
+};
+QueueHandle_t gEkfMeasQ = nullptr;
+std::atomic<uint32_t> gEkfMeasDropped{0};   // queue-full drops (diagnostic)
+
+struct EkfDiagSnapshot {
+  bool ready = false;
+  bool attValid = false;
+  bool posValid = false;
+  bool velValid = false;
+  bool gpsValid = false;
+  bool magValid = false;
+  bool innovationFault = false;
+  float yawDeg = 0.0f;
+  float velNed[3] = {0, 0, 0};
+  float posNed[3] = {0, 0, 0};
+  float gpsInnov[3] = {0, 0, 0};
+  float magInnovDeg = 0.0f;
+  uint32_t gpsAccept = 0;
+  uint32_t gpsReject = 0;
+  uint32_t magAccept = 0;
+  uint32_t magReject = 0;
+};
+EkfDiagSnapshot gEkfDiag;  // guarded by gFlightMux; written by flightTask only
+
+// Post an off-core measurement for flightTask to apply. Non-blocking; never
+// called from flightTask itself. Safe before the queue exists (no-op).
+inline void postEkfMeasurement(const EkfMeasurement& m) {
+  if (gEkfMeasQ != nullptr && xQueueSend(gEkfMeasQ, &m, 0) != pdTRUE) {
+    gEkfMeasDropped.fetch_add(1, std::memory_order_relaxed);
+  }
+}
 #endif
 
 // ---- Sensor calibration -----------------------------------------------------
@@ -1853,6 +2363,57 @@ LiveSensorCalibration gCal;
 // to gMagCal.addSample().
 std::atomic<bool> gMagCalActive{false};
 
+// ---- Magnetometer source selection + yaw-correction gain --------------------
+// Runtime config (web-tunable, NVS-backed). Compiled in regardless of the
+// external-mag gate because onboard enable/disable + the gain knob are still
+// meaningful with no external chip. gActiveMagSource is published by the flight
+// task (readImuSample) for telemetry; gMagYawCorrGain defaults to 0 = SHADOW.
+std::atomic<bool>    gMagExtEnabled{true};
+std::atomic<bool>    gMagOnboardEnabled{true};
+std::atomic<bool>    gMagPreferExternal{true};
+std::atomic<float>   gMagYawCorrGain{FCU_MAG_YAW_CORR_GAIN_DEFAULT};
+std::atomic<uint8_t> gActiveMagSource{MAG_SOURCE_NONE};
+
+#if FCU_ENABLE_EXTERNAL_MAG
+// Cross-task snapshot of the external MMC5603. SENSOR TASK is the single writer
+// of every field except headingDeg/headingRejected, which the FLIGHT TASK owns
+// (it needs fresh attitude to tilt-compensate and to run the heading-jump gate).
+// Lock-free hand-off, same pattern as gCal.
+struct ExtMagShared {
+  std::atomic<bool>     ready{false};        // detected + configured at boot
+  std::atomic<bool>     connected{false};    // present + producing fresh samples
+  std::atomic<bool>     healthy{false};      // connected + field magnitude in range
+  std::atomic<float>    mx{0.0f}, my{0.0f}, mz{0.0f};   // corrected body vector (µT)
+  std::atomic<float>    field{0.0f};         // |corrected vector| (µT)
+  std::atomic<float>    headingDeg{0.0f};    // tilt-comped (flight task)
+  std::atomic<bool>     headingRejected{false};         // jump gate (flight task)
+  std::atomic<uint8_t>  rejectReason{EXTMAG_REJECT_NOT_PRESENT};
+  std::atomic<uint32_t> lastUpdateMs{0};
+  std::atomic<uint32_t> readCount{0};
+  std::atomic<uint32_t> failCount{0};
+  std::atomic<uint8_t>  addr{0};
+  std::atomic<uint8_t>  chipId{0};
+};
+ExtMagShared gExtMag;
+
+// LIVE external-mag calibration applied to every external sample (subtract hard
+// iron, multiply diagonal scale, then the 3x3 soft-iron matrix). All defaults
+// reduce to identity, so applying it before a cal is captured is a harmless
+// no-op. Initialised by applyExtMagCalToLive() at boot before tasks spawn.
+struct LiveExtMagCal {
+  std::atomic<float> hard_x{0.0f}, hard_y{0.0f}, hard_z{0.0f};
+  std::atomic<float> scale_x{1.0f}, scale_y{1.0f}, scale_z{1.0f};
+  std::atomic<float> soft[9];   // identity set in applyExtMagCalToLive()
+  std::atomic<bool>  valid{false};
+};
+LiveExtMagCal gExtCal;
+
+// Separate capture state machine for the external chip (the onboard chip uses
+// gMagCal). gExtMagCalActive routes raw external samples into gExtMagCal.
+gnc::MagHardIronCalibrator gExtMagCal;
+std::atomic<bool> gExtMagCalActive{false};
+#endif  // FCU_ENABLE_EXTERNAL_MAG
+
 // ---- Nav status LED ---------------------------------------------------------
 // Independent of the nRF status LEDs (which display CTRL/TELM radio state).
 // Fires a 4-blink burst at ~6 Hz on:
@@ -1861,6 +2422,9 @@ std::atomic<bool> gMagCalActive{false};
 // `gNavFirstFixSeen` latches on the first fix so we don't re-blink every fix.
 LedBlinker gNavLed;
 std::atomic<bool> gNavFirstFixSeen{false};
+std::atomic<bool> gSensorRescanRequested{false};
+std::atomic<uint32_t> gSensorRescanAcceptCount{0};
+std::atomic<uint32_t> gSensorRescanRejectCount{0};
 
 // Active flight mode. Written by the iBUS bridge when CH6 changes; read by
 // the flight loop to gate controller engagement. Atomic so the flight task
@@ -1876,9 +2440,32 @@ std::atomic<bool> gLandRequested{false};
 // transitions, exposes guards for future mission/RTH code. Does NOT yet take
 // authority over the control loop — see flight_state_machine.h for phasing.
 flight_state::FlightStateMachine gFlightSm;
+// Atomic snapshot of the FSM, published by updateFlightStateMachine() (sensorTask,
+// the sole gFlightSm owner) every tick. Cross-task readers — the motor-spin
+// gates, the webserver getState callback, and the [FSM] status log in loop() —
+// read these instead of touching gFlightSm directly, closing the data race. (F5)
+std::atomic<flight_state::State> gFlightStatePublished{flight_state::State::IDLE};
+std::atomic<uint32_t> gFlightStateEnteredMs{0};
+std::atomic<uint32_t> gFlightTransitionCount{0};
 #if ENABLE_DYNAMIC_NOTCH
 DynamicNotchFilter gDynamicNotch;
 uint32_t gLastDynamicNotchLogMs = 0;
+// Runtime notch reconfigure: the dashboard writes a pending config under
+// gFlightMux and sets the dirty flag; the flight task (sole owner of the notch
+// biquads) applies it at the top of the next notch step. Avoids reconfiguring
+// the filter from another task mid-process().
+DynamicNotchConfig gNotchPendingCfg;
+DynamicNotchConfig gNotchCfg;          // mirror of the currently-applied config
+std::atomic<bool> gNotchCfgDirty{false};
+#endif
+// Bounded gyro-capture + FFT for the dashboard's vibration/notch analysis.
+// Flight task only appends samples; the FFT runs in loop(). Always compiled so
+// raw-gyro spectra are available even with the dynamic notch disabled.
+NotchAnalyzer gNotchAnalyzer;
+#if ENABLE_PID_WEBSERVER || ENABLE_USB_CONFIG
+// PID-web diagnostic recorder. Kept out of normal flight builds so the large
+// fixed capture buffer does not consume flight-image RAM.
+DiagCapture gDiagCapture;
 #endif
 #if FCU_ENABLE_RPM_FILTER
 RpmNotchFilter gRpmNotch;
@@ -1900,6 +2487,13 @@ portMUX_TYPE gFailsafeMux = portMUX_INITIALIZER_UNLOCKED;
 // matches FCU_MIX_PITCH_FRONT_BIAS (compile-time); setup() overrides from NVS
 // when a saved value is present.
 std::atomic<float> gMixPitchFrontBias{MIX_PITCH_FRONT_BIAS_DEFAULT};
+
+// Magnetometer heading trim (deg): a constant offset ADDED to the computed
+// compass heading (after MAG_DECLINATION_DEG) so the small residual left by a
+// good hard-iron calibration reads ~0. Tuned live via /api/settings, restored
+// at boot by loadMagTrimDeg(), and consumed in computeMagHeadingDeg(). Single
+// 32-bit atomic — safe to read from the IMU/flight path without a mux.
+std::atomic<float> gMagTrimDeg{0.0f};
 
 inline float clampMixPitchFrontBias(float v) {
   if (v < MIX_PITCH_FRONT_BIAS_MIN) return MIX_PITCH_FRONT_BIAS_MIN;
@@ -2173,6 +2767,16 @@ SensorSnapshot readSensorSnapshot() {
   snap.gpsLonE7 = gState.gps.lonE7;
   snap.gpsAltDm = gState.gps.altDm;
   snap.gpsLastSentenceMs = gState.gps.lastSentenceMs;
+  snap.gpsGroundSpeedValid = gState.gps.groundSpeedValid;
+  snap.gpsCourseValid = gState.gps.courseValid;
+  snap.gpsVelocityValid = gState.gps.velocityValid;
+  snap.gpsGroundSpeedKmh10 = gState.gps.groundSpeedKmh10;
+  snap.gpsCourseCentiDeg = gState.gps.courseCentiDeg;
+  snap.gpsGroundSpeedMs = gState.gps.groundSpeedMs;
+  snap.gpsCourseDeg = gState.gps.courseDeg;
+  snap.gpsVelNorthMs = gState.gps.velNorthMs;
+  snap.gpsVelEastMs = gState.gps.velEastMs;
+  snap.gpsLastRmcMs = gState.gps.lastRmcMs;
   snap.tof = gState.tof;
   snap.baro = gState.baro;
   snap.battery = gState.battery;
@@ -2279,6 +2883,11 @@ void initNrfStatusLeds() {
 }
 
 void updateNrfStatusLeds() {
+#if ENABLE_BLE_CONFIG
+  if (fcu_ble_config::ledOverrideActive()) {
+    return;
+  }
+#endif
   // Don't fight the nav LED state machine — if the user mapped the nav LED
   // onto the historical CTRL-radio pin (the default since iBUS replaced the
   // CTRL nRF), skip writing it here. The blinker owns that pin.
@@ -2312,6 +2921,14 @@ void updateNrfStatusLeds() {
 // the operator that motors are under autonomous descent control.
 volatile bool gSafeLandingActive = false;
 
+// Airborne heuristic — LOGGING/TELEMETRY ONLY, never a control input.
+// Latched true after >=500 ms continuously at >=20% commanded throttle while
+// armed; cleared only on disarm (a throttle chop does NOT clear it — chopping
+// throttle is not landing). TODO(hardware): validate against real flights
+// (ToF/EKF ground truth) before ANY control decision is allowed to consume
+// this flag.
+volatile bool gAirborneLikely = false;
+
 #ifndef NAV_LED_READY_MIN_SATS
 // Minimum satellite count to consider the GPS "ready to arm." 6 is the
 // commercial-drone convention for a meaningful HDOP.
@@ -2321,7 +2938,7 @@ volatile bool gSafeLandingActive = false;
 LedBlinker::Pattern computeNavLedPattern() {
   // Failsafe / safe-landing has highest priority.
   if (gSafeLandingActive ||
-      (!ALL_FAILSAFES_DISABLED && gState.control.failsafeActive)) {
+      (!failsafesBypassed() && gState.control.failsafeActive)) {
     return LedBlinker::Pattern::FAST;
   }
   // Armed = motors authorized by packetAllowsFlightThrottle(). Snapshot the
@@ -2338,7 +2955,7 @@ LedBlinker::Pattern computeNavLedPattern() {
   const bool safeBootComplete =
       control_protocol::flagIsSet(pktSnap.flags, control_protocol::kFlagSafeBootComplete);
   const bool armed = flightMode && flightSwitchOn && safeBootComplete &&
-                     (ALL_FAILSAFES_DISABLED || !failsafeSnap);
+                     (failsafesBypassed() || !failsafeSnap);
   if (armed) {
     return LedBlinker::Pattern::SOLID;
   }
@@ -2361,7 +2978,7 @@ LedBlinker::Pattern computeNavLedPattern() {
   const bool linkOk = gState.ctrlRadioReady;
   const bool gpsOk  = gpsHasFix && gpsSats >= NAV_LED_READY_MIN_SATS;
   const bool readyToArm = sensorsOk && linkOk && gpsOk && safeBootComplete &&
-                          (ALL_FAILSAFES_DISABLED || !failsafeSnap);
+                          (failsafesBypassed() || !failsafeSnap);
   if (readyToArm) {
     return LedBlinker::Pattern::SLOW;
   }
@@ -2660,11 +3277,15 @@ const char* gyroDlpfName(icm20x_gyro_cutoff_t cutoff) {
   }
 }
 
-bool computeMagHeadingDeg(const ImuSample& sample, float rollDeg, float pitchDeg, float& headingDeg) {
-  if (!sample.magValid || sample.magFieldUt < MAG_FIELD_MIN_UT || sample.magFieldUt > MAG_FIELD_MAX_UT) {
+// Tilt-compensated compass heading from a body-frame mag vector (µT). Shared by
+// the onboard and external sources. `valid` is the caller's field/source gate;
+// declination + the live heading trim are folded in. Returns false if the
+// projection is degenerate (vertical field) or the result is non-finite.
+bool computeMagHeadingFromVec(float mx_uT, float my_uT, float mz_uT, float fieldUt,
+                              bool valid, float rollDeg, float pitchDeg, float& headingDeg) {
+  if (!valid || !isfinite(fieldUt) || fieldUt < 1e-3f) {
     return false;
   }
-
   static constexpr float DEG_TO_RAD_F = 0.017453292519943295f;
   static constexpr float RAD_TO_DEG_F = 57.295779513082320876f;
   const float rollRad = rollDeg * DEG_TO_RAD_F;
@@ -2675,16 +3296,59 @@ bool computeMagHeadingDeg(const ImuSample& sample, float rollDeg, float pitchDeg
   const float sp = sinf(pitchRad);
 
   // Tilt-compensated compass projection. Assumes body X is forward and body Y
-  // is right after the MAG_BODY_* mapping above. If the heading is mirrored,
-  // flip FCU_MAG_BODY_Y_SIGN first rather than changing this math.
-  const float xh = sample.mx_uT * cp + sample.mz_uT * sp;
-  const float yh = sample.mx_uT * sr * sp + sample.my_uT * cr - sample.mz_uT * sr * cp;
+  // is right after the per-sensor body mapping. If the heading is mirrored,
+  // flip the sensor's *_Y_SIGN first rather than changing this math.
+  const float xh = mx_uT * cp + mz_uT * sp;
+  const float yh = mx_uT * sr * sp + my_uT * cr - mz_uT * sr * cp;
   if (fabsf(xh) < 0.001f && fabsf(yh) < 0.001f) {
     return false;
   }
 
-  headingDeg = wrapDeg360(atan2f(yh, xh) * RAD_TO_DEG_F + MAG_DECLINATION_DEG);
+  headingDeg = wrapDeg360(atan2f(yh, xh) * RAD_TO_DEG_F + MAG_DECLINATION_DEG +
+                          gMagTrimDeg.load(std::memory_order_relaxed));
   return isfinite(headingDeg);
+}
+
+bool computeMagHeadingDeg(const ImuSample& sample, float rollDeg, float pitchDeg, float& headingDeg) {
+  // Preserve the field-range gate for the ACTIVE flight sample (sample.magValid
+  // already encodes the active source's gate; the range check is belt-and-braces).
+  if (!sample.magValid || sample.magFieldUt < MAG_FIELD_MIN_UT || sample.magFieldUt > MAG_FIELD_MAX_UT) {
+    return false;
+  }
+  return computeMagHeadingFromVec(sample.mx_uT, sample.my_uT, sample.mz_uT, sample.magFieldUt,
+                                  true, rollDeg, pitchDeg, headingDeg);
+}
+
+// Pick which magnetometer feeds the heading/fusion path this tick and overwrite
+// the sample's mag vector accordingly. On entry out.* holds the ONBOARD result.
+// External wins when it is enabled + connected + healthy and (preferred OR the
+// onboard source is unusable). Publishes gActiveMagSource for telemetry. When
+// neither source is usable, out.magValid is forced false (⇒ pure gyro yaw).
+void selectActiveMagSource(ImuSample& out) {
+  const bool onboardEnabled = gMagOnboardEnabled.load(std::memory_order_relaxed);
+  const bool onboardUsable = out.magValid && onboardEnabled;
+  uint8_t src = MAG_SOURCE_NONE;
+#if FCU_ENABLE_EXTERNAL_MAG
+  const bool extUsable = gMagExtEnabled.load(std::memory_order_relaxed) &&
+                         gExtMag.connected.load(std::memory_order_relaxed) &&
+                         gExtMag.healthy.load(std::memory_order_relaxed);
+  const bool preferExt = gMagPreferExternal.load(std::memory_order_relaxed);
+  if (extUsable && (preferExt || !onboardUsable)) {
+    out.mx_uT = gExtMag.mx.load(std::memory_order_relaxed);
+    out.my_uT = gExtMag.my.load(std::memory_order_relaxed);
+    out.mz_uT = gExtMag.mz.load(std::memory_order_relaxed);
+    out.magFieldUt = gExtMag.field.load(std::memory_order_relaxed);
+    out.magValid = true;   // healthy ⇒ field already in range
+    src = MAG_SOURCE_EXTERNAL;
+  } else
+#endif
+  if (onboardUsable) {
+    src = MAG_SOURCE_ONBOARD;   // keep the onboard out.* as-is
+  } else {
+    out.magValid = false;       // neither source usable this tick
+    src = MAG_SOURCE_NONE;
+  }
+  gActiveMagSource.store(src, std::memory_order_relaxed);
 }
 
 // [IMU MODULE] — declared in include/imu_module.h
@@ -2754,6 +3418,9 @@ bool readImuSample(ImuSample& out) {
   out.magFieldUt = sqrtf(out.mx_uT * out.mx_uT + out.my_uT * out.my_uT + out.mz_uT * out.mz_uT);
   out.magValid = isfinite(out.magFieldUt) && out.magFieldUt >= MAG_FIELD_MIN_UT &&
                  out.magFieldUt <= MAG_FIELD_MAX_UT;
+  // Choose onboard vs external (preferred, when healthy) and overwrite out.* with
+  // the active source's body-frame vector before the heading/fusion path runs.
+  selectActiveMagSource(out);
   return true;
 }
 
@@ -2798,23 +3465,42 @@ bool calibrateGyroBias(uint16_t samples) {
   return true;
 }
 
-void resetPidOutputs();
+void resetPidOutputs(const char* reason = "unspecified");
+bool anyMotorOutputActive(const std::array<uint16_t, 4>& raw);
 
-#if ENABLE_PID_WEBSERVER
+// REGRESSION FIX (armed-idle audit): these bench gates used
+// appliedThrottlePercent == 0 as a proxy for "motors are quiet". Armed idle
+// broke that — props spin at MOTOR_OUTPUT_MIN_ACTIVE_RAW while applied
+// throttle reads 0 (and the observer FSM still reports IDLE). Every gate that
+// must not run beside spinning props now ALSO requires the actual commanded
+// motor outputs to be zero.
+
+#if ENABLE_PID_WEBSERVER || ENABLE_USB_CONFIG
 bool requestGyroCalibration() {
   uint8_t throttle = 0;
   bool failsafe = false;
   bool motorSpinBusy = false;
+  bool motorsActive = false;
+#if ENABLE_USB_CONFIG
+  bool configMotorBusy = false;
+#endif
   portENTER_CRITICAL(&gControlMux);
   throttle = gState.control.appliedThrottlePercent;
   failsafe = gState.control.failsafeActive;
   portEXIT_CRITICAL(&gControlMux);
   portENTER_CRITICAL(&gFlightMux);
   motorSpinBusy = (gMotorSpin.requestedMotor != 0U) || (gMotorSpin.activeMotor != 0U);
+  motorsActive = anyMotorOutputActive(gState.motorRaw);
+#if ENABLE_USB_CONFIG
+  configMotorBusy = gConfigMotorTest.sessionArmed || gConfigMotorTest.active;
+#endif
   portEXIT_CRITICAL(&gFlightMux);
 
-  if (throttle != 0U || failsafe || motorSpinBusy ||
-      gFlightSm.state() != flight_state::State::IDLE) {
+  if (throttle != 0U || failsafe || motorSpinBusy || motorsActive ||
+#if ENABLE_USB_CONFIG
+      configMotorBusy ||
+#endif
+      gFlightStatePublished.load(std::memory_order_relaxed) != flight_state::State::IDLE) {
     return false;
   }
 
@@ -2826,10 +3512,170 @@ bool requestGyroCalibration() {
   }
   portEXIT_CRITICAL(&gFlightMux);
   if (accepted) {
-    Serial.println("[IMU] gyro calibration requested from PID webserver; keep FCU still");
+    fcu_log::logf(fcu_log::Level::Info, "[IMU] gyro calibration requested from PID webserver; keep FCU still\n");
   }
   return accepted;
 }
+
+// "Calibrate Level & Save" entry point. Same bench-idle gate as the gyro cal:
+// disarmed, throttle zero, no motor output, no other calibration in flight.
+// The actual sampling + NVS save happens in serviceLevelCalibration() on the
+// flight task (sole owner of the attitude estimate).
+bool requestLevelCalibration() {
+  uint8_t throttle = 0;
+  bool failsafe = false;
+  bool motorSpinBusy = false;
+  bool motorsActive = false;
+#if ENABLE_USB_CONFIG
+  bool configMotorBusy = false;
+#endif
+  portENTER_CRITICAL(&gControlMux);
+  throttle = gState.control.appliedThrottlePercent;
+  failsafe = gState.control.failsafeActive;
+  portEXIT_CRITICAL(&gControlMux);
+  portENTER_CRITICAL(&gFlightMux);
+  motorSpinBusy = (gMotorSpin.requestedMotor != 0U) || (gMotorSpin.activeMotor != 0U);
+  motorsActive = anyMotorOutputActive(gState.motorRaw);
+#if ENABLE_USB_CONFIG
+  configMotorBusy = gConfigMotorTest.sessionArmed || gConfigMotorTest.active;
+#endif
+  portEXIT_CRITICAL(&gFlightMux);
+
+  if (throttle != 0U || failsafe || motorSpinBusy || motorsActive ||
+#if ENABLE_USB_CONFIG
+      configMotorBusy ||
+#endif
+      gFlightStatePublished.load(std::memory_order_relaxed) != flight_state::State::IDLE) {
+    return false;
+  }
+
+  bool accepted = false;
+  portENTER_CRITICAL(&gFlightMux);
+  if (!gLevelCal.active && !gGyroCal.active && !gGyroCal.requested) {
+    gLevelCal.requested = true;
+    accepted = true;
+  }
+  portEXIT_CRITICAL(&gFlightMux);
+  if (accepted) {
+    fcu_log::logf(fcu_log::Level::Info,
+                  "[LEVELCAL] requested from dashboard; place frame level + hold still\n");
+  }
+  return accepted;
+}
+
+#if ENABLE_USB_CONFIG
+bool configuratorMotorTestSafe(uint32_t nowMs, bool requireMotorsIdle) {
+  uint8_t throttle = 0;
+  bool failsafe = false;
+  portENTER_CRITICAL(&gControlMux);
+  throttle = gState.control.appliedThrottlePercent;
+  failsafe = gState.control.failsafeActive;
+  portEXIT_CRITICAL(&gControlMux);
+
+  bool motorsActive = false;
+  bool oneShotBusy = false;
+  bool calibrationBusy = false;
+  portENTER_CRITICAL(&gFlightMux);
+  motorsActive = anyMotorOutputActive(gState.motorRaw);
+  oneShotBusy = (gMotorSpin.requestedMotor != 0U) || (gMotorSpin.activeMotor != 0U);
+  calibrationBusy = gGyroCal.active || gGyroCal.requested ||
+                    gLevelCal.active || gLevelCal.requested;
+  portEXIT_CRITICAL(&gFlightMux);
+
+  return gState.escReady &&
+         !escStartupSettleActive(nowMs) &&
+         throttle == 0U &&
+         !failsafe &&
+         !oneShotBusy &&
+         !calibrationBusy &&
+         gFlightStatePublished.load(std::memory_order_relaxed) == flight_state::State::IDLE &&
+         (!requireMotorsIdle || !motorsActive);
+}
+
+bool configuratorMotorTestArm() {
+  const uint32_t nowMs = millis();
+  if (!configuratorMotorTestSafe(nowMs, true)) {
+    return false;
+  }
+
+  portENTER_CRITICAL(&gFlightMux);
+  gConfigMotorTest.sessionArmed = true;
+  gConfigMotorTest.active = false;
+  gConfigMotorTest.motorMask = 0;
+  gConfigMotorTest.raw = 0;
+  gConfigMotorTest.startedMs = nowMs;
+  gConfigMotorTest.lastCommandMs = nowMs;
+  gConfigMotorTest.outputDeadlineMs = nowMs;
+  gConfigMotorTest.sessionDeadlineMs = nowMs + CONFIG_MOTOR_TEST_SESSION_TIMEOUT_MS;
+  portEXIT_CRITICAL(&gFlightMux);
+
+  forceMotorStop("config_motor_test_arm");
+  fcu_log::logf(fcu_log::Level::Warn,
+                "[MOTOR_TEST] USB deadman session armed max_raw=%u session_timeout=%lums\n",
+                static_cast<unsigned>(CONFIG_MOTOR_TEST_MAX_RAW),
+                static_cast<unsigned long>(CONFIG_MOTOR_TEST_SESSION_TIMEOUT_MS));
+  return true;
+}
+
+bool configuratorMotorTestSet(uint8_t motorMask, uint16_t raw, uint16_t timeoutMs) {
+  const uint32_t nowMs = millis();
+  if ((motorMask & 0x0FU) == 0U || (motorMask & 0xF0U) != 0U ||
+      raw > CONFIG_MOTOR_TEST_MAX_RAW || timeoutMs == 0U ||
+      timeoutMs > CONFIG_MOTOR_TEST_MAX_TIMEOUT_MS) {
+    return false;
+  }
+  if (!configuratorMotorTestSafe(nowMs, false)) {
+    return false;
+  }
+
+  bool accepted = false;
+  bool justStarted = false;
+  portENTER_CRITICAL(&gFlightMux);
+  if (gConfigMotorTest.sessionArmed) {
+    justStarted = !gConfigMotorTest.active;
+    gConfigMotorTest.active = true;
+    gConfigMotorTest.motorMask = static_cast<uint8_t>(motorMask & 0x0FU);
+    gConfigMotorTest.raw = raw;
+    if (justStarted) {
+      gConfigMotorTest.startedMs = nowMs;
+    }
+    gConfigMotorTest.lastCommandMs = nowMs;
+    gConfigMotorTest.outputDeadlineMs = nowMs + timeoutMs;
+    gConfigMotorTest.sessionDeadlineMs = nowMs + CONFIG_MOTOR_TEST_SESSION_TIMEOUT_MS;
+    accepted = true;
+  }
+  portEXIT_CRITICAL(&gFlightMux);
+
+  if (accepted && justStarted) {
+    fcu_log::logf(fcu_log::Level::Warn,
+                  "[MOTOR_TEST] USB deadman output start mask=0x%X raw=%u timeout=%ums\n",
+                  static_cast<unsigned>(motorMask & 0x0FU),
+                  static_cast<unsigned>(raw),
+                  static_cast<unsigned>(timeoutMs));
+  }
+  return accepted;
+}
+
+bool configuratorMotorTestStop() {
+  bool wasActive = false;
+  portENTER_CRITICAL(&gFlightMux);
+  wasActive = gConfigMotorTest.sessionArmed || gConfigMotorTest.active;
+  gConfigMotorTest.sessionArmed = false;
+  gConfigMotorTest.active = false;
+  gConfigMotorTest.motorMask = 0;
+  gConfigMotorTest.raw = 0;
+  if (wasActive) {
+    gConfigMotorTest.completedCount++;
+  }
+  portEXIT_CRITICAL(&gFlightMux);
+
+  if (wasActive) {
+    forceMotorStop("config_motor_test_stop");
+    fcu_log::logf(fcu_log::Level::Info, "[MOTOR_TEST] USB deadman session stopped\n");
+  }
+  return true;
+}
+#endif
 
 bool requestMotorSpin(uint8_t oneBasedMotor) {
   if (oneBasedMotor < 1U || oneBasedMotor > 4U || escStartupSettleActive(millis())) {
@@ -2843,7 +3689,22 @@ bool requestMotorSpin(uint8_t oneBasedMotor) {
   failsafe = gState.control.failsafeActive;
   portEXIT_CRITICAL(&gControlMux);
 
-  if (throttle != 0U || failsafe || gFlightSm.state() != flight_state::State::IDLE) {
+  bool motorsActive = false;
+#if ENABLE_USB_CONFIG
+  bool configuratorBusy = false;
+#endif
+  portENTER_CRITICAL(&gFlightMux);
+  motorsActive = anyMotorOutputActive(gState.motorRaw);
+#if ENABLE_USB_CONFIG
+  configuratorBusy = gConfigMotorTest.sessionArmed || gConfigMotorTest.active;
+#endif
+  portEXIT_CRITICAL(&gFlightMux);
+
+  if (throttle != 0U || failsafe || motorsActive ||
+#if ENABLE_USB_CONFIG
+      configuratorBusy ||
+#endif
+      gFlightStatePublished.load(std::memory_order_relaxed) != flight_state::State::IDLE) {
     return false;
   }
 
@@ -2857,7 +3718,7 @@ bool requestMotorSpin(uint8_t oneBasedMotor) {
   portEXIT_CRITICAL(&gFlightMux);
 
   if (accepted) {
-    Serial.printf("[MOTOR_TEST] requested M%u raw=%u duration=%lums\n",
+    fcu_log::logf(fcu_log::Level::Info, "[MOTOR_TEST] requested M%u raw=%u duration=%lums\n",
                   static_cast<unsigned>(oneBasedMotor),
                   static_cast<unsigned>(PIDWEB_MOTOR_TEST_RAW),
                   static_cast<unsigned long>(PIDWEB_MOTOR_TEST_MS));
@@ -2882,7 +3743,7 @@ void serviceGyroCalibration(const ImuSample& sample, uint32_t nowMs) {
   portENTER_CRITICAL(&gFlightMux);
   if (gGyroCal.requested && !gGyroCal.active) {
     gGyroCal.requested = false;
-    if (throttle == 0U && gFlightSm.state() == flight_state::State::IDLE) {
+    if (throttle == 0U && gFlightStatePublished.load(std::memory_order_relaxed) == flight_state::State::IDLE) {
       gGyroCal.active = true;
       gGyroCal.accepted = 0;
       gGyroCal.target = GYRO_BIAS_CAL_SAMPLES;
@@ -2901,24 +3762,24 @@ void serviceGyroCalibration(const ImuSample& sample, uint32_t nowMs) {
   portEXIT_CRITICAL(&gFlightMux);
 
   if (shouldStart) {
-    Serial.printf("[IMU] gyro calibration started samples=%u\n",
+    fcu_log::logf(fcu_log::Level::Info, "[IMU] gyro calibration started samples=%u\n",
                   static_cast<unsigned>(GYRO_BIAS_CAL_SAMPLES));
   }
 
   if (!isActive) {
     if (aborted) {
-      Serial.println("[IMU] gyro calibration refused; throttle/state not idle");
+      fcu_log::logf(fcu_log::Level::Warn, "[IMU] gyro calibration refused; throttle/state not idle\n");
     }
     return;
   }
 
-  if (throttle != 0U || gFlightSm.state() != flight_state::State::IDLE) {
+  if (throttle != 0U || gFlightStatePublished.load(std::memory_order_relaxed) != flight_state::State::IDLE) {
     portENTER_CRITICAL(&gFlightMux);
     gGyroCal.active = false;
     gGyroCal.requested = false;
     gGyroCal.lastOk = false;
     portEXIT_CRITICAL(&gFlightMux);
-    Serial.println("[IMU] gyro calibration aborted; FCU no longer idle");
+    fcu_log::logf(fcu_log::Level::Warn, "[IMU] gyro calibration aborted; FCU no longer idle\n");
     return;
   }
 
@@ -2945,20 +3806,240 @@ void serviceGyroCalibration(const ImuSample& sample, uint32_t nowMs) {
       gGyroCal.active = false;
       gGyroCal.lastOk = true;
       gGyroCal.completedCount++;
-      resetPidOutputs();
+      resetPidOutputs("gyro_cal_complete");
       completed = true;
     }
   }
   portEXIT_CRITICAL(&gFlightMux);
 
   if (completed) {
-    Serial.printf("[IMU] gyro calibration complete samples=%u bias=[%.3f,%.3f,%.3f] dps\n",
+    fcu_log::logf(fcu_log::Level::Info, "[IMU] gyro calibration complete samples=%u bias=[%.3f,%.3f,%.3f] dps\n",
                   static_cast<unsigned>(completedSamples),
                   static_cast<double>(completedBias.gx_dps),
                   static_cast<double>(completedBias.gy_dps),
                   static_cast<double>(completedBias.gz_dps));
   }
 }
+
+// Service the persistent level calibration. Runs every flight tick from
+// updateControlLoop AFTER updateAttitudeFromImu (so gState.attitude is fresh).
+// While active it averages the estimated roll/pitch while verifying the frame
+// is stationary (gyro under threshold, |accel| in the gravity window), then
+// stores the mounting offset to NVS (with read-back verify) and clears the PID
+// integrators. The standard deviation of the captured samples is reported as a
+// quality metric. No-op (early return) when neither requested nor active, so
+// the per-tick cost in normal flight is a single mux-guarded bool read.
+void serviceLevelCalibration(const ImuSample& sample, uint32_t nowMs) {
+  bool req = false, act = false;
+  portENTER_CRITICAL(&gFlightMux);
+  req = gLevelCal.requested;
+  act = gLevelCal.active;
+  portEXIT_CRITICAL(&gFlightMux);
+  if (!req && !act) return;
+
+  uint8_t throttle = 0;
+  portENTER_CRITICAL(&gControlMux);
+  throttle = gState.control.appliedThrottlePercent;
+  portEXIT_CRITICAL(&gControlMux);
+  const bool idle =
+      (throttle == 0U) &&
+      (gFlightStatePublished.load(std::memory_order_relaxed) == flight_state::State::IDLE);
+
+  // ---- Start transition ----
+  bool started = false, refused = false;
+  portENTER_CRITICAL(&gFlightMux);
+  if (gLevelCal.requested && !gLevelCal.active) {
+    gLevelCal.requested = false;
+    if (idle && !anyMotorOutputActive(gState.motorRaw)) {
+      gLevelCal.active = true;
+      gLevelCal.accepted = 0;
+      gLevelCal.rejected = 0;
+      gLevelCal.target = LEVEL_CAL_SAMPLES;
+      gLevelCal.sumRoll = gLevelCal.sumPitch = 0.0;
+      gLevelCal.sumRoll2 = gLevelCal.sumPitch2 = 0.0;
+      gLevelCal.startedMs = nowMs;
+      gLevelCal.lastError = LEVELCAL_ERR_NONE;
+      started = true;
+    } else {
+      gLevelCal.lastOk = false;
+      gLevelCal.lastError = LEVELCAL_ERR_NOT_IDLE;
+      refused = true;
+    }
+  }
+  act = gLevelCal.active;
+  portEXIT_CRITICAL(&gFlightMux);
+  if (started) {
+    fcu_log::logf(fcu_log::Level::Info, "[LEVELCAL] capture started (target=%u samples)\n",
+                  static_cast<unsigned>(LEVEL_CAL_SAMPLES));
+  }
+  if (refused) {
+    fcu_log::logf(fcu_log::Level::Warn, "[LEVELCAL] refused; FCU not bench-idle\n");
+    return;
+  }
+  if (!act) return;
+
+  // ---- Abort if no longer idle mid-capture ----
+  if (!idle) {
+    portENTER_CRITICAL(&gFlightMux);
+    gLevelCal.active = false;
+    gLevelCal.lastOk = false;
+    gLevelCal.lastError = LEVELCAL_ERR_NOT_IDLE;
+    portEXIT_CRITICAL(&gFlightMux);
+    fcu_log::logf(fcu_log::Level::Warn, "[LEVELCAL] aborted; FCU no longer idle\n");
+    return;
+  }
+
+  // ---- Stationarity gate from this sample ----
+  const bool gyroStill =
+      isfinite(sample.gx_dps) && isfinite(sample.gy_dps) && isfinite(sample.gz_dps) &&
+      fabsf(sample.gx_dps) < LEVEL_CAL_GYRO_STATIONARY_DPS &&
+      fabsf(sample.gy_dps) < LEVEL_CAL_GYRO_STATIONARY_DPS &&
+      fabsf(sample.gz_dps) < LEVEL_CAL_GYRO_STATIONARY_DPS;
+  const float accelMag = sqrtf(sample.ax_g * sample.ax_g + sample.ay_g * sample.ay_g +
+                               sample.az_g * sample.az_g);
+  const bool accelOk = isfinite(accelMag) && accelMag >= LEVEL_CAL_ACCEL_MIN_G &&
+                       accelMag <= LEVEL_CAL_ACCEL_MAX_G;
+
+  float rollNow = 0.0f, pitchNow = 0.0f;
+  portENTER_CRITICAL(&gFlightMux);
+  rollNow = gState.attitude.rollDeg;
+  pitchNow = gState.attitude.pitchDeg;
+  portEXIT_CRITICAL(&gFlightMux);
+
+  bool completed = false, aborted = false;
+  uint8_t abortErr = LEVELCAL_ERR_NONE;
+  float offR = 0.0f, offP = 0.0f, stdR = 0.0f, stdP = 0.0f;
+  uint16_t nUsed = 0;
+
+  portENTER_CRITICAL(&gFlightMux);
+  if (gLevelCal.active) {
+    if (!accelOk || !gyroStill) {
+      if (++gLevelCal.rejected > LEVEL_CAL_MAX_REJECTS) {
+        gLevelCal.active = false;
+        gLevelCal.lastOk = false;
+        gLevelCal.lastError = abortErr = (!accelOk) ? LEVELCAL_ERR_ACCEL : LEVELCAL_ERR_MOTION;
+        aborted = true;
+      }
+    } else if (isfinite(rollNow) && isfinite(pitchNow)) {
+      gLevelCal.sumRoll += rollNow;
+      gLevelCal.sumPitch += pitchNow;
+      gLevelCal.sumRoll2 += static_cast<double>(rollNow) * rollNow;
+      gLevelCal.sumPitch2 += static_cast<double>(pitchNow) * pitchNow;
+      gLevelCal.accepted++;
+      if (gLevelCal.accepted >= gLevelCal.target) {
+        const double nn = static_cast<double>(gLevelCal.accepted);
+        const double mr = gLevelCal.sumRoll / nn;
+        const double mp = gLevelCal.sumPitch / nn;
+        const double vr = gLevelCal.sumRoll2 / nn - mr * mr;
+        const double vp = gLevelCal.sumPitch2 / nn - mp * mp;
+        offR = static_cast<float>(mr);
+        offP = static_cast<float>(mp);
+        stdR = static_cast<float>(sqrt(vr > 0.0 ? vr : 0.0));
+        stdP = static_cast<float>(sqrt(vp > 0.0 ? vp : 0.0));
+        nUsed = gLevelCal.accepted;
+        if (fabsf(offR) > LEVEL_CAL_MAX_OFFSET_DEG || fabsf(offP) > LEVEL_CAL_MAX_OFFSET_DEG) {
+          gLevelCal.active = false;
+          gLevelCal.lastOk = false;
+          gLevelCal.lastError = abortErr = LEVELCAL_ERR_RANGE;
+          aborted = true;
+        } else {
+          gLevelCal.active = false;
+          gLevelCal.resultRollOffsetDeg = offR;
+          gLevelCal.resultPitchOffsetDeg = offP;
+          gLevelCal.qualityRollStdDeg = stdR;
+          gLevelCal.qualityPitchStdDeg = stdP;
+          gLevelCal.lastSampleCount = nUsed;
+          completed = true;
+        }
+      }
+    }
+  }
+  portEXIT_CRITICAL(&gFlightMux);
+
+  if (aborted) {
+    fcu_log::logf(fcu_log::Level::Warn, "[LEVELCAL] aborted err=%u (1=motion 2=accel 3=range)\n",
+                  static_cast<unsigned>(abortErr));
+    return;
+  }
+  if (!completed) return;
+
+  // ---- Apply to the live correction (preserve existing manual trim) ----
+  gLevelCorr.rollOffsetDeg.store(offR, std::memory_order_relaxed);
+  gLevelCorr.pitchOffsetDeg.store(offP, std::memory_order_relaxed);
+  gLevelCorr.loaded.store(true, std::memory_order_relaxed);
+
+  // ---- Persist + read-back verify ----
+  bool nvsOk = false;
+  if (gPidNvs.ready()) {
+    fcu_nvs::FcuPidNvs::LevelCalibration lc;
+    lc.roll_offset_deg = offR;
+    lc.pitch_offset_deg = offP;
+    lc.roll_trim_deg = gLevelCorr.rollTrimDeg.load(std::memory_order_relaxed);
+    lc.pitch_trim_deg = gLevelCorr.pitchTrimDeg.load(std::memory_order_relaxed);
+    lc.valid = true;
+    if (gPidNvs.saveLevelCalibration(lc, LEVEL_CAL_MAX_OFFSET_DEG, LEVEL_TRIM_MAX_DEG)) {
+      const auto rb = gPidNvs.loadLevelCalibration(LEVEL_CAL_MAX_OFFSET_DEG, LEVEL_TRIM_MAX_DEG);
+      nvsOk = rb.valid && fabsf(rb.roll_offset_deg - offR) < 0.01f &&
+              fabsf(rb.pitch_offset_deg - offP) < 0.01f;
+    }
+  }
+  portENTER_CRITICAL(&gFlightMux);
+  gLevelCal.lastOk = nvsOk;
+  gLevelCal.completedCount++;
+  gLevelCal.lastError = nvsOk ? LEVELCAL_ERR_NONE : LEVELCAL_ERR_NVS;
+  portEXIT_CRITICAL(&gFlightMux);
+
+  // Old integrator windup was learned against the previous (wrong) level
+  // reference — clear it so the freshly-leveled frame starts clean.
+  resetPidOutputs("level_cal_complete");
+  fcu_log::logf(fcu_log::Level::Info,
+                "[LEVELCAL] complete roll_off=%.3f pitch_off=%.3f std=[%.3f,%.3f] n=%u nvs=%s\n",
+                static_cast<double>(offR), static_cast<double>(offP),
+                static_cast<double>(stdR), static_cast<double>(stdP),
+                static_cast<unsigned>(nUsed), nvsOk ? "OK" : "FAIL");
+}
+
+#if FCU_MAG_FILTER
+// Magnetometer DISPLAY filter (single-writer: flight task, via updateAttitudeFromImu).
+// Smooths the compass for the dashboard/telemetry ONLY — it does NOT gate flight
+// control (the rate loops never use heading; yaw fusion, if enabled, gets the
+// smoothed value, which is strictly cleaner). Wrap-safe EMA on heading, EMA +
+// innovation spike-gate on field, N-sample debounce on the trusted flag. State is
+// function-local static; seeded on the first call after boot.
+void applyMagDisplayFilter(float& headingDeg, float& fieldUt, bool& trusted, float dt) {
+  static bool s_init = false;
+  static float s_hdg = 0.0f, s_field = 0.0f;
+  static bool s_trusted = false;
+  static uint8_t s_debounce = 0, s_spikeRun = 0;
+  const float a = (dt > 0.0f) ? (dt / (FCU_MAG_FILTER_TAU_S + dt)) : 1.0f;
+  if (!s_init) {
+    s_field = fieldUt; s_hdg = headingDeg; s_trusted = trusted; s_init = true;
+  } else {
+    // Field: EMA, but hold through impulse spikes — bounded so a genuine level
+    // shift is accepted after FCU_MAG_SPIKE_MAX_REJECT samples rather than forever.
+    if (fabsf(fieldUt - s_field) > FCU_MAG_SPIKE_REJECT_UT &&
+        s_spikeRun < FCU_MAG_SPIKE_MAX_REJECT) {
+      s_spikeRun++;
+    } else {
+      s_spikeRun = 0;
+      s_field += a * (fieldUt - s_field);
+    }
+    // Heading: wrap-safe EMA, only from samples that are trusted AND not a spike.
+    if (trusted && s_spikeRun == 0) {
+      s_hdg = wrapDeg360(s_hdg + a * shortestAngleErrorDeg(headingDeg, s_hdg));
+    }
+    // Trusted: require N consecutive same-state samples before flipping (anti-flicker).
+    if (trusted != s_trusted) {
+      if (++s_debounce >= FCU_MAG_VALID_DEBOUNCE) { s_trusted = trusted; s_debounce = 0; }
+    } else {
+      s_debounce = 0;
+    }
+  }
+  headingDeg = s_hdg;
+  fieldUt = s_field;
+  trusted = s_trusted;
+}
+#endif
 
 // [IMU MODULE] — declared in include/imu_module.h
 void updateAttitudeFromImu(const ImuSample& sample, AttitudeSample& attitude, float dtSeconds) {
@@ -3005,13 +4086,73 @@ void updateAttitudeFromImu(const ImuSample& sample, AttitudeSample& attitude, fl
 
   float yawIntegrated = wrapDeg180(attitude.yawDeg + sample.gz_dps * dtSeconds);
   float magHeadingDeg = 0.0f;
-  attitude.magTrusted = computeMagHeadingDeg(sample, attitude.rollDeg, attitude.pitchDeg, magHeadingDeg);
-  attitude.magHeadingDeg = attitude.magTrusted ? magHeadingDeg : attitude.magHeadingDeg;
-  attitude.magFieldUt = sample.magFieldUt;
-  if (MAG_YAW_FUSION_ENABLED && attitude.magTrusted) {
+  bool magTrusted = computeMagHeadingDeg(sample, attitude.rollDeg, attitude.pitchDeg, magHeadingDeg);
+  float magFieldUt = sample.magFieldUt;
+#if FCU_MAG_FILTER
+  applyMagDisplayFilter(magHeadingDeg, magFieldUt, magTrusted, dtSeconds);
+#endif
+
+#if FCU_ENABLE_EXTERNAL_MAG
+  // External-mag heading (published every tick with fresh tilt, for the dashboard
+  // even when it is not the active source) + heading-jump innovation gate. A jump
+  // beyond EXTMAG_HEADING_JUMP_DEG between accepted samples is treated as
+  // interference; while external is the ACTIVE source it suppresses the correction
+  // this tick (keeping gyro yaw). Bounded reject run so a genuine fast yaw is
+  // accepted after EXTMAG_HEADING_JUMP_MAX_REJECT consecutive rejects.
+  if (gExtMag.connected.load(std::memory_order_relaxed)) {
+    float extHdg = gExtMag.headingDeg.load(std::memory_order_relaxed);
+    const bool extHdgOk = computeMagHeadingFromVec(
+        gExtMag.mx.load(std::memory_order_relaxed), gExtMag.my.load(std::memory_order_relaxed),
+        gExtMag.mz.load(std::memory_order_relaxed), gExtMag.field.load(std::memory_order_relaxed),
+        true, attitude.rollDeg, attitude.pitchDeg, extHdg);
+    static bool s_haveExtHdg = false;
+    static float s_prevExtHdg = 0.0f;
+    static uint8_t s_extJumpRun = 0;
+    bool jump = false;
+    if (extHdgOk) {
+      if (s_haveExtHdg) {
+        const float d = fabsf(shortestAngleErrorDeg(extHdg, s_prevExtHdg));
+        if (d > EXTMAG_HEADING_JUMP_DEG && s_extJumpRun < EXTMAG_HEADING_JUMP_MAX_REJECT) {
+          jump = true;
+          s_extJumpRun++;
+        } else {
+          s_extJumpRun = 0;
+          s_prevExtHdg = extHdg;
+        }
+      } else {
+        s_haveExtHdg = true;
+        s_prevExtHdg = extHdg;
+      }
+      gExtMag.headingDeg.store(extHdg, std::memory_order_relaxed);
+    }
+    gExtMag.headingRejected.store(jump, std::memory_order_relaxed);
+    if (jump && gActiveMagSource.load(std::memory_order_relaxed) == MAG_SOURCE_EXTERNAL) {
+      magTrusted = false;   // suppress this tick's correction; yaw stays gyro
+    }
+  } else {
+    gExtMag.headingRejected.store(false, std::memory_order_relaxed);
+  }
+#endif
+
+  attitude.magTrusted = magTrusted;
+  attitude.magHeadingDeg = magTrusted ? magHeadingDeg : attitude.magHeadingDeg;
+  attitude.magFieldUt = magFieldUt;
+
+  // ---- Slow, low-gain yaw drift correction --------------------------------
+  // Yaw stays gyro-integrated (the rate PID closes on gz directly); the mag only
+  // nudges the integrated angle toward the compass heading, slowly (MAG_YAW_TAU_S)
+  // and scaled by the runtime gain. corrGain == 0 ⇒ pure gyro (SHADOW). The
+  // onboard source ALSO honours the legacy MAG_YAW_FUSION_ENABLED compile gate
+  // (distrusted on this airframe); the external source is gated by gain only.
+  const uint8_t activeSrc = gActiveMagSource.load(std::memory_order_relaxed);
+  const bool sourceAllowsFusion =
+      (activeSrc == MAG_SOURCE_EXTERNAL) ||
+      (activeSrc == MAG_SOURCE_ONBOARD && MAG_YAW_FUSION_ENABLED);
+  const float corrGain = constrain(gMagYawCorrGain.load(std::memory_order_relaxed), 0.0f, 1.0f);
+  if (attitude.magTrusted && sourceAllowsFusion && corrGain > 0.0f) {
     const float magAlpha = MAG_YAW_TAU_S / (MAG_YAW_TAU_S + dtSeconds);
     yawIntegrated = wrapDeg180(yawIntegrated +
-                               (1.0f - magAlpha) *
+                               corrGain * (1.0f - magAlpha) *
                                    shortestAngleErrorDeg(magHeadingDeg, yawIntegrated));
   }
   attitude.yawDeg = yawIntegrated;
@@ -3337,6 +4478,256 @@ void logBmpRawDiagnostics(uint8_t addr, const char* context) {
                 static_cast<unsigned long>(rawTemp));
 }
 
+// =============================================================================
+// [EXTMAG MODULE] — external MMC5603 magnetometer driver (declared in
+// include/external_mag.h). Raw register I/O over the shared Wire bus, reusing
+// bmpReadReg8()/i2cProbe(). The functions are defined unconditionally (so the
+// unconditional header declarations link when the feature is compiled out); the
+// bodies are gated by FCU_ENABLE_EXTERNAL_MAG.
+// =============================================================================
+#if FCU_ENABLE_EXTERNAL_MAG
+// Single-byte register write (no generic write helper exists in this file).
+static bool extMagWriteReg8(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(MMC5603_I2C_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  return Wire.endTransmission(true) == 0U;
+}
+
+// Read one continuous-mode sample: 9 bytes from XOUT0, assembled into 20-bit
+// unsigned counts, then converted to signed µT. Returns false on I2C error.
+static bool extMagReadRaw(float& mx_uT, float& my_uT, float& mz_uT) {
+  Wire.beginTransmission(MMC5603_I2C_ADDR);
+  Wire.write(MMC5603_REG_XOUT0);
+  if (Wire.endTransmission(false) != 0U) {
+    return false;
+  }
+  const size_t got = Wire.requestFrom(static_cast<uint8_t>(MMC5603_I2C_ADDR),
+                                      static_cast<size_t>(9), true);
+  if (got != 9U || Wire.available() < 9) {
+    return false;
+  }
+  uint8_t b[9];
+  for (int i = 0; i < 9; ++i) b[i] = static_cast<uint8_t>(Wire.read());
+  const uint32_t xr = (static_cast<uint32_t>(b[0]) << 12) |
+                      (static_cast<uint32_t>(b[1]) << 4) | (static_cast<uint32_t>(b[6]) >> 4);
+  const uint32_t yr = (static_cast<uint32_t>(b[2]) << 12) |
+                      (static_cast<uint32_t>(b[3]) << 4) | (static_cast<uint32_t>(b[7]) >> 4);
+  const uint32_t zr = (static_cast<uint32_t>(b[4]) << 12) |
+                      (static_cast<uint32_t>(b[5]) << 4) | (static_cast<uint32_t>(b[8]) >> 4);
+  mx_uT = (static_cast<int32_t>(xr) - MMC5603_ZERO_OFFSET) * MMC5603_UT_PER_LSB;
+  my_uT = (static_cast<int32_t>(yr) - MMC5603_ZERO_OFFSET) * MMC5603_UT_PER_LSB;
+  mz_uT = (static_cast<int32_t>(zr) - MMC5603_ZERO_OFFSET) * MMC5603_UT_PER_LSB;
+  return true;
+}
+
+// Copy a calibration record into the live atomics the poll path reads. Called at
+// boot (before tasks spawn) and after a successful capture. Defaults are identity
+// so applying with no cal is a no-op.
+void applyExtMagCalToLive(const fcu_nvs::FcuPidNvs::ExtMagCalibration& m) {
+  gExtCal.hard_x.store(m.hard_x, std::memory_order_relaxed);
+  gExtCal.hard_y.store(m.hard_y, std::memory_order_relaxed);
+  gExtCal.hard_z.store(m.hard_z, std::memory_order_relaxed);
+  gExtCal.scale_x.store(m.scale_x, std::memory_order_relaxed);
+  gExtCal.scale_y.store(m.scale_y, std::memory_order_relaxed);
+  gExtCal.scale_z.store(m.scale_z, std::memory_order_relaxed);
+  for (int i = 0; i < 9; ++i) gExtCal.soft[i].store(m.soft[i], std::memory_order_relaxed);
+  gExtCal.valid.store(m.valid, std::memory_order_relaxed);
+}
+
+// Decide which sensor a calibration capture should target: the active source,
+// else external if it is connected, else onboard.
+bool magCaptureTargetIsExternal() {
+  const uint8_t src = gActiveMagSource.load(std::memory_order_relaxed);
+  if (src == MAG_SOURCE_EXTERNAL) return true;
+  if (src == MAG_SOURCE_ONBOARD) return false;
+  return gExtMag.connected.load(std::memory_order_relaxed);
+}
+#endif  // FCU_ENABLE_EXTERNAL_MAG
+
+bool initExternalMag(uint8_t& addrOut, uint8_t& chipIdOut) {
+#if FCU_ENABLE_EXTERNAL_MAG
+  addrOut = MMC5603_I2C_ADDR;
+  chipIdOut = 0;
+  if (!gState.i2cReady) return false;
+  if (!i2cProbe(MMC5603_I2C_ADDR)) return false;
+  uint8_t id = 0;
+  if (!bmpReadReg8(MMC5603_I2C_ADDR, MMC5603_REG_PRODUCT, id)) return false;
+  chipIdOut = id;
+  if (id != MMC5603_PRODUCT_ID) return false;
+  // Software reset, then a SET/RESET degauss pair to null residual offset.
+  extMagWriteReg8(MMC5603_REG_CTRL1, MMC5603_CTRL1_SW_RESET);
+  delay(20);
+  extMagWriteReg8(MMC5603_REG_CTRL0, MMC5603_CTRL0_SET);
+  delay(1);
+  extMagWriteReg8(MMC5603_REG_CTRL0, MMC5603_CTRL0_RESET);
+  delay(1);
+  // Continuous mode at EXTMAG_ODR_HZ with automatic set/reset.
+  extMagWriteReg8(MMC5603_REG_ODR, EXTMAG_ODR_HZ);
+  extMagWriteReg8(MMC5603_REG_CTRL0, MMC5603_CTRL0_CMM_FREQ_EN | MMC5603_CTRL0_AUTO_SR_EN);
+  const bool ok = extMagWriteReg8(MMC5603_REG_CTRL2, MMC5603_CTRL2_CMM_EN);
+  return ok;
+#else
+  addrOut = 0;
+  chipIdOut = 0;
+  return false;
+#endif
+}
+
+void pollExternalMag(uint32_t nowMs) {
+#if FCU_ENABLE_EXTERNAL_MAG
+  if (!gExtMag.ready.load(std::memory_order_relaxed)) {
+    gExtMag.connected.store(false, std::memory_order_relaxed);
+    gExtMag.healthy.store(false, std::memory_order_relaxed);
+    gExtMag.rejectReason.store(EXTMAG_REJECT_NOT_PRESENT, std::memory_order_relaxed);
+    return;
+  }
+  float rx = 0.0f, ry = 0.0f, rz = 0.0f;
+  if (!extMagReadRaw(rx, ry, rz)) {
+    gExtMag.failCount.fetch_add(1, std::memory_order_relaxed);
+    const uint32_t last = gExtMag.lastUpdateMs.load(std::memory_order_relaxed);
+    if (last == 0U || (nowMs - last) > EXTMAG_STALE_MS) {
+      gExtMag.connected.store(false, std::memory_order_relaxed);
+      gExtMag.healthy.store(false, std::memory_order_relaxed);
+      gExtMag.rejectReason.store(EXTMAG_REJECT_STALE, std::memory_order_relaxed);
+    } else {
+      gExtMag.rejectReason.store(EXTMAG_REJECT_READ_FAIL, std::memory_order_relaxed);
+    }
+    return;
+  }
+  // Remap the sensor axes into FCU body frame (own map; chip can be mounted
+  // in any orientation). selectImuAxis picks one of x/y/z; sign flips it.
+  const float bx = EXTMAG_BODY_X_SIGN * selectImuAxis(EXTMAG_BODY_X_AXIS, rx, ry, rz);
+  const float by = EXTMAG_BODY_Y_SIGN * selectImuAxis(EXTMAG_BODY_Y_AXIS, rx, ry, rz);
+  const float bz = EXTMAG_BODY_Z_SIGN * selectImuAxis(EXTMAG_BODY_Z_AXIS, rx, ry, rz);
+  // Feed RAW body samples to the calibrator while a capture is active (captured
+  // offsets must be in the same body frame the corrected reads produce).
+  if (gExtMagCalActive.load(std::memory_order_relaxed)) {
+    gExtMagCal.addSample(bx, by, bz, nowMs);
+  }
+  // Apply hard-iron + diagonal scale, then the 3x3 soft-iron matrix (identity
+  // default ⇒ no-op until an ellipsoid fit fills it).
+  const float hx = (bx - gExtCal.hard_x.load(std::memory_order_relaxed)) *
+                   gExtCal.scale_x.load(std::memory_order_relaxed);
+  const float hy = (by - gExtCal.hard_y.load(std::memory_order_relaxed)) *
+                   gExtCal.scale_y.load(std::memory_order_relaxed);
+  const float hz = (bz - gExtCal.hard_z.load(std::memory_order_relaxed)) *
+                   gExtCal.scale_z.load(std::memory_order_relaxed);
+  const float cx = gExtCal.soft[0].load(std::memory_order_relaxed) * hx +
+                   gExtCal.soft[1].load(std::memory_order_relaxed) * hy +
+                   gExtCal.soft[2].load(std::memory_order_relaxed) * hz;
+  const float cy = gExtCal.soft[3].load(std::memory_order_relaxed) * hx +
+                   gExtCal.soft[4].load(std::memory_order_relaxed) * hy +
+                   gExtCal.soft[5].load(std::memory_order_relaxed) * hz;
+  const float cz = gExtCal.soft[6].load(std::memory_order_relaxed) * hx +
+                   gExtCal.soft[7].load(std::memory_order_relaxed) * hy +
+                   gExtCal.soft[8].load(std::memory_order_relaxed) * hz;
+  const float field = sqrtf(cx * cx + cy * cy + cz * cz);
+  gExtMag.mx.store(cx, std::memory_order_relaxed);
+  gExtMag.my.store(cy, std::memory_order_relaxed);
+  gExtMag.mz.store(cz, std::memory_order_relaxed);
+  gExtMag.field.store(field, std::memory_order_relaxed);
+  gExtMag.lastUpdateMs.store(nowMs, std::memory_order_relaxed);
+  gExtMag.readCount.fetch_add(1, std::memory_order_relaxed);
+  gExtMag.connected.store(true, std::memory_order_relaxed);
+  // Field-magnitude health gate (the heading-jump gate is flight-task side).
+  uint8_t reason = EXTMAG_REJECT_NONE;
+  bool healthy = true;
+  if (!isfinite(field) || field < EXTMAG_FIELD_MIN_UT) {
+    healthy = false;
+    reason = EXTMAG_REJECT_FIELD_LOW;
+  } else if (field > EXTMAG_FIELD_MAX_UT) {
+    healthy = false;
+    reason = EXTMAG_REJECT_FIELD_HIGH;
+  }
+  gExtMag.healthy.store(healthy, std::memory_order_relaxed);
+  gExtMag.rejectReason.store(reason, std::memory_order_relaxed);
+#else
+  (void)nowMs;
+#endif
+}
+
+// Shared mag-capture start/finish — routed to the active source (external uses
+// gExtMagCal + the ExtMagCalibration NVS slot; onboard uses gMagCal + gCal).
+bool magCaptureStart(uint32_t nowMs) {
+#if FCU_ENABLE_EXTERNAL_MAG
+  if (magCaptureTargetIsExternal()) {
+    gExtMagCal.configure({});
+    gExtMagCal.start(nowMs);
+    gExtMagCalActive.store(true, std::memory_order_relaxed);
+    fcu_log::logf(fcu_log::Level::Info,
+                  "[CAL][MAG] EXTERNAL capture STARTED — rotate the airframe through all axes\n");
+    return true;
+  }
+#endif
+  gMagCal.configure({});
+  gMagCal.start(nowMs);
+  gMagCalActive.store(true, std::memory_order_relaxed);
+  fcu_log::logf(fcu_log::Level::Info,
+                "[CAL][MAG] ONBOARD capture STARTED — rotate the airframe through all axes\n");
+  return true;
+}
+
+bool magCaptureFinish() {
+#if FCU_ENABLE_EXTERNAL_MAG
+  if (gExtMagCalActive.load(std::memory_order_relaxed)) {
+    gExtMagCalActive.store(false, std::memory_order_relaxed);
+    if (!gExtMagCal.finish()) {
+      fcu_log::logf(fcu_log::Level::Warn,
+                    "[CAL][MAG] EXTERNAL capture ABORTED samples=%u (need rotation through all axes)\n",
+                    static_cast<unsigned>(gExtMagCal.result().samples));
+      return false;
+    }
+    const auto& r = gExtMagCal.result();
+    fcu_nvs::FcuPidNvs::ExtMagCalibration m;  // soft[] stays identity (diagonal cal)
+    m.hard_x = r.hard_iron_uT.x; m.hard_y = r.hard_iron_uT.y; m.hard_z = r.hard_iron_uT.z;
+    m.scale_x = r.scale.x; m.scale_y = r.scale.y; m.scale_z = r.scale.z;
+    m.valid = true;
+    applyExtMagCalToLive(m);
+    const bool saved = gPidNvs.ready() && gPidNvs.saveExtMagCalibration(m);
+    fcu_log::logf(saved ? fcu_log::Level::Info : fcu_log::Level::Error,
+                  "[CAL][MAG] EXTERNAL COMPLETE samples=%u hard=%+.2f/%+.2f/%+.2f uT "
+                  "scale=%.3f/%.3f/%.3f saved=%u\n",
+                  static_cast<unsigned>(r.samples),
+                  static_cast<double>(r.hard_iron_uT.x), static_cast<double>(r.hard_iron_uT.y),
+                  static_cast<double>(r.hard_iron_uT.z), static_cast<double>(r.scale.x),
+                  static_cast<double>(r.scale.y), static_cast<double>(r.scale.z),
+                  static_cast<unsigned>(saved));
+    return saved;
+  }
+#endif
+  if (!gMagCalActive.load(std::memory_order_relaxed)) return false;
+  gMagCalActive.store(false, std::memory_order_relaxed);
+  if (!gMagCal.finish()) {
+    fcu_log::logf(fcu_log::Level::Warn,
+                  "[CAL][MAG] ONBOARD capture ABORTED samples=%u (need rotation through all axes)\n",
+                  static_cast<unsigned>(gMagCal.result().samples));
+    return false;
+  }
+  const auto& r = gMagCal.result();
+  gCal.mag_hard_x.store(r.hard_iron_uT.x, std::memory_order_relaxed);
+  gCal.mag_hard_y.store(r.hard_iron_uT.y, std::memory_order_relaxed);
+  gCal.mag_hard_z.store(r.hard_iron_uT.z, std::memory_order_relaxed);
+  gCal.mag_scale_x.store(r.scale.x, std::memory_order_relaxed);
+  gCal.mag_scale_y.store(r.scale.y, std::memory_order_relaxed);
+  gCal.mag_scale_z.store(r.scale.z, std::memory_order_relaxed);
+  gCal.mag_valid.store(true, std::memory_order_relaxed);
+  fcu_nvs::FcuPidNvs::MagCalibration m;
+  m.hard_x = r.hard_iron_uT.x; m.hard_y = r.hard_iron_uT.y; m.hard_z = r.hard_iron_uT.z;
+  m.scale_x = r.scale.x; m.scale_y = r.scale.y; m.scale_z = r.scale.z;
+  m.valid = true;
+  const bool saved = gPidNvs.ready() && gPidNvs.saveMagCalibration(m);
+  fcu_log::logf(saved ? fcu_log::Level::Info : fcu_log::Level::Error,
+                "[CAL][MAG] ONBOARD COMPLETE samples=%u hard=%+.2f/%+.2f/%+.2f uT "
+                "scale=%.3f/%.3f/%.3f saved=%u\n",
+                static_cast<unsigned>(r.samples),
+                static_cast<double>(r.hard_iron_uT.x), static_cast<double>(r.hard_iron_uT.y),
+                static_cast<double>(r.hard_iron_uT.z), static_cast<double>(r.scale.x),
+                static_cast<double>(r.scale.y), static_cast<double>(r.scale.z),
+                static_cast<unsigned>(saved));
+  return saved;
+}
+
 // [BARO MODULE] — declared in include/baro_module.h
 bool initBmp(uint8_t& chipId, uint8_t& addrOut) {
   chipId = 0;
@@ -3498,7 +4889,11 @@ void pollBmp(uint32_t nowMs) {
 #if ENABLE_EXPERIMENTAL_EKF
   // ---- EKF baro update (shadow) ---------------------------------------------
   if (gEkfReady.load(std::memory_order_relaxed)) {
-    (void)gEkf.updateBarometer(baroAltUp, nowMs);
+    EkfMeasurement m;
+    m.type = EkfMeasurement::Type::Baro;
+    m.nowMs = nowMs;
+    m.baroAltM = baroAltUp;
+    postEkfMeasurement(m);   // applied by flightTask, the single gEkf owner (F4)
   }
 #endif
 }
@@ -3618,7 +5013,11 @@ void pollTof(uint32_t nowMs) {
   // ---- EKF TOF update (shadow) -----------------------------------------------
   // Forward the FILTERED reading; raw distance can swing 30 mm tick-to-tick.
   if (gEkfReady.load(std::memory_order_relaxed) && gTofFilter.ready()) {
-    (void)gEkf.updateTOF(gTofFilter.filteredMm(), nowMs);
+    EkfMeasurement m;
+    m.type = EkfMeasurement::Type::Tof;
+    m.nowMs = nowMs;
+    m.tofRangeMm = static_cast<uint16_t>(gTofFilter.filteredMm());
+    postEkfMeasurement(m);   // applied by flightTask, the single gEkf owner (F4)
   }
 #endif
 #endif  // FCU_ENABLE_TOF
@@ -3639,26 +5038,165 @@ bool initGpsUart() {
 }
 #endif
 
+#if FCU_ESC_TELEM
+// ---- [ESC TELEMETRY] KISS TLM-wire glue -------------------------------------
+// EscUartTelemetry owns scheduling + parsing and runs ONLY on the sensor task.
+// Validated frames are mirrored into gEscTelemStore under gSensorMux so
+// cross-task consumers (the CRSF battery frame on the crsf task) read
+// coherent values. The DShot request bit itself is an atomic one-shot inside
+// the motor driver, consumed by the flight task's next throttle frame.
+EscUartTelemetry gEscUartTelem;
+struct EscTelemStore {
+  EscUartTelemetry::Frame frame[4];
+  uint32_t lastUpdateMs[4] = {0, 0, 0, 0};
+};
+EscTelemStore gEscTelemStore;  // guarded by gSensorMux
+
+bool escTelemRequestMotor(uint8_t motor) {
+  switch (motor) {
+    case 0: return gState.motor0Ready && gMotor0.requestUartTelemetry();
+    case 1: return gState.motor1Ready && gMotor1.requestUartTelemetry();
+    case 2: return gState.motor2Ready && gMotor2.requestUartTelemetry();
+    case 3: return gState.motor3Ready && gMotor3.requestUartTelemetry();
+    default: return false;
+  }
+}
+
+// Sum the FRESH per-motor currents/consumption for the CRSF battery frame.
+// Returns false (zeros) when no motor reported within maxAgeMs.
+bool escTelemPackCurrents(uint32_t nowMs, uint32_t maxAgeMs,
+                          float& outAmps, uint32_t& outMah) {
+  uint32_t sumCa = 0;
+  uint32_t sumMah = 0;
+  bool any = false;
+  portENTER_CRITICAL(&gSensorMux);
+  for (uint8_t i = 0; i < 4; ++i) {
+    if (gEscTelemStore.lastUpdateMs[i] != 0U &&
+        (nowMs - gEscTelemStore.lastUpdateMs[i]) <= maxAgeMs) {
+      sumCa += gEscTelemStore.frame[i].currentCa;
+      sumMah += gEscTelemStore.frame[i].consumptionMah;
+      any = true;
+    }
+  }
+  portEXIT_CRITICAL(&gSensorMux);
+  outAmps = static_cast<float>(sumCa) * 0.01f;
+  outMah = sumMah;
+  return any;
+}
+
+// Sensor-task tick: run the request/receive cycle and emit a 1 Hz status line.
+void pollEscUartTelemetry(uint32_t nowMs) {
+  bool motorsActive = false;
+  portENTER_CRITICAL(&gFlightMux);
+  motorsActive = anyMotorOutputActive(gState.motorRaw);
+  portEXIT_CRITICAL(&gFlightMux);
+
+  uint8_t motor = 0;
+  EscUartTelemetry::Frame f;
+  if (gEscUartTelem.poll(nowMs, motorsActive, &motor, &f) && motor < 4U) {
+    portENTER_CRITICAL(&gSensorMux);
+    gEscTelemStore.frame[motor] = f;
+    gEscTelemStore.lastUpdateMs[motor] = nowMs;
+    portEXIT_CRITICAL(&gSensorMux);
+  }
+
+  static uint32_t s_nextLogMs = 0;
+  if (static_cast<int32_t>(nowMs - s_nextLogMs) >= 0) {
+    s_nextLogMs = nowMs + 1000U;
+    {
+      EscTelemStore snap;
+      portENTER_CRITICAL(&gSensorMux);
+      snap = gEscTelemStore;
+      portEXIT_CRITICAL(&gSensorMux);
+      const EscUartTelemetry::Stats& st = gEscUartTelem.stats();
+      // Voltage from the most recently updated motor (they share one pack).
+      uint8_t newest = 0;
+      for (uint8_t i = 1; i < 4; ++i) {
+        if (snap.lastUpdateMs[i] > snap.lastUpdateMs[newest]) newest = i;
+      }
+      fcu_log::logf(fcu_log::Level::Info,
+          "[ESC_TLM] V=%.2f rpm=[%lu,%lu,%lu,%lu] T=[%d,%d,%d,%d]C "
+          "A=[%.1f,%.1f,%.1f,%.1f] ok=%lu crc=%lu to=%lu ref=%lu\n",
+          static_cast<double>(snap.frame[newest].voltageCv) * 0.01,
+          static_cast<unsigned long>(snap.frame[0].erpm / ESC_TELEM_POLE_PAIRS),
+          static_cast<unsigned long>(snap.frame[1].erpm / ESC_TELEM_POLE_PAIRS),
+          static_cast<unsigned long>(snap.frame[2].erpm / ESC_TELEM_POLE_PAIRS),
+          static_cast<unsigned long>(snap.frame[3].erpm / ESC_TELEM_POLE_PAIRS),
+          static_cast<int>(snap.frame[0].tempC), static_cast<int>(snap.frame[1].tempC),
+          static_cast<int>(snap.frame[2].tempC), static_cast<int>(snap.frame[3].tempC),
+          static_cast<double>(snap.frame[0].currentCa) * 0.01,
+          static_cast<double>(snap.frame[1].currentCa) * 0.01,
+          static_cast<double>(snap.frame[2].currentCa) * 0.01,
+          static_cast<double>(snap.frame[3].currentCa) * 0.01,
+          static_cast<unsigned long>(st.framesOk),
+          static_cast<unsigned long>(st.crcErrors),
+          static_cast<unsigned long>(st.timeouts),
+          static_cast<unsigned long>(st.requestRefused));
+    }
+  }
+}
+#endif  // FCU_ESC_TELEM
+
 bool initPiUart() {
+#if FCU_ESC_TELEM
+  // UART2 is repurposed for ESC KISS telemetry: RX-only on PIN_ESC_TELEM, no
+  // TX pin routed. Returning false keeps gState.pi.uartReady=false, which
+  // makes every Pi path (pollPiAutonomy's drain, emitPiTelemetry) inert —
+  // nothing else touches this UART.
+  gPiSerial.setRxBufferSize(256);
+  gPiSerial.begin(ESC_TELEM_BAUD, SERIAL_8N1, PIN_ESC_TELEM, /*txPin=*/-1);
+  gEscUartTelem.begin(gPiSerial, escTelemRequestMotor, /*motorCount=*/4);
+  Serial.printf("[ESC_TLM] UART2 rx=%d baud=%lu pole_pairs=%u (KISS TLM wire; Pi autonomy UART unavailable)\n",
+                PIN_ESC_TELEM, static_cast<unsigned long>(ESC_TELEM_BAUD),
+                static_cast<unsigned>(ESC_TELEM_POLE_PAIRS));
+  return false;
+#else
   gPiSerial.begin(PI_UART_BAUD, SERIAL_8N1, PIN_PI_RX, PIN_PI_TX);
   Serial.printf("[PI] UART placeholder ready baud=%lu rx=%d tx=%d\n",
                 static_cast<unsigned long>(PI_UART_BAUD), PIN_PI_RX, PIN_PI_TX);
   return true;
+#endif
 }
 
-int32_t parseNmeaCoordE7(const char* value, const char* hemisphere) {
+// Parse an NMEA ddmm.mmmm / dddmm.mmmm coordinate + hemisphere token into
+// degrees * 1e7. Strict: rejects empty/garbage values, an unknown or swapped
+// hemisphere token, out-of-range minutes, and out-of-range results — returning
+// false and leaving outE7 untouched. Replaces the old atof()-based version that
+// silently produced 0 for garbage and treated any non-S/W token as positive.
+// (F3)
+bool parseNmeaCoordE7(const char* value, const char* hemisphere,
+                      bool isLongitude, int32_t& outE7) {
   if (!value || !hemisphere || value[0] == '\0' || hemisphere[0] == '\0') {
-    return 0;
+    return false;
   }
-
-  const double raw = atof(value);
+  const char h = hemisphere[0];
+  // Latitude must carry N/S, longitude must carry E/W — reject a swapped or
+  // unknown hemisphere token instead of defaulting to a positive value.
+  if (isLongitude) {
+    if (h != 'E' && h != 'W') return false;
+  } else {
+    if (h != 'N' && h != 'S') return false;
+  }
+  char* end = nullptr;
+  const double raw = strtod(value, &end);
+  if (end == value || *end != '\0' || !isfinite(raw) || raw < 0.0) {
+    return false;
+  }
   const int degrees = static_cast<int>(raw / 100.0);
   const double minutes = raw - static_cast<double>(degrees * 100);
+  if (minutes < 0.0 || minutes >= 60.0) {
+    return false;
+  }
   double decimalDegrees = static_cast<double>(degrees) + (minutes / 60.0);
-  if (hemisphere[0] == 'S' || hemisphere[0] == 'W') {
+  if (h == 'S' || h == 'W') {
     decimalDegrees = -decimalDegrees;
   }
-  return static_cast<int32_t>(decimalDegrees * 10000000.0);
+  const double limit = isLongitude ? 180.0 : 90.0;
+  if (!(decimalDegrees >= -limit && decimalDegrees <= limit)) {
+    return false;
+  }
+  outE7 = static_cast<int32_t>(decimalDegrees * 10000000.0);
+  return true;
 }
 
 size_t splitNmeaFields(char* line, char** fields, size_t maxFields) {
@@ -3681,9 +5219,84 @@ size_t splitNmeaFields(char* line, char** fields, size_t maxFields) {
   return count;
 }
 
-// [GPS MODULE] — declared in include/gps_module.h
-void parseGpsLine(const char* line, uint32_t nowMs) {
-  if (!line || (strncmp(line, "$GPGGA", 6) != 0 && strncmp(line, "$GNGGA", 6) != 0)) {
+// Verify the NMEA "*HH" XOR checksum (computed over every char between '$' and
+// '*'). Returns false for a missing '$', a missing '*HH' delimiter, non-hex
+// digits, or a mismatch. Sentences that fail are dropped before any field is
+// trusted, so UART noise / spoofed lines can't reach the fix/home/origin
+// logic. (F3)
+bool nmeaChecksumValid(const char* line) {
+  if (!line || line[0] != '$') {
+    return false;
+  }
+  auto hexVal = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    return -1;
+  };
+  uint8_t sum = 0;
+  const char* p = line + 1;
+  for (; *p != '\0' && *p != '*'; ++p) {
+    sum ^= static_cast<uint8_t>(*p);
+  }
+  if (*p != '*') {
+    return false;  // no checksum delimiter
+  }
+  const int hi = hexVal(p[1]);
+  const int lo = (p[1] != '\0') ? hexVal(p[2]) : -1;
+  if (hi < 0 || lo < 0) {
+    return false;
+  }
+  return static_cast<uint8_t>((hi << 4) | lo) == sum;
+}
+
+void logGpsChecksumMismatch(uint32_t nowMs) {
+  static uint32_t sChecksumErrs = 0;
+  static uint32_t sLastLogMs = 0;
+  ++sChecksumErrs;
+  if (nowMs - sLastLogMs >= 2000U) {
+    sLastLogMs = nowMs;
+    Serial.printf("[GPS] dropped %lu sentence(s) on NMEA checksum mismatch\n",
+                  static_cast<unsigned long>(sChecksumErrs));
+  }
+}
+
+bool parseNmeaDoubleStrict(const char* field, double& out) {
+  if (!field || field[0] == '\0') {
+    return false;
+  }
+  char* endp = nullptr;
+  const double raw = strtod(field, &endp);
+  if (endp == field || *endp != '\0' || !isfinite(raw)) {
+    return false;
+  }
+  out = raw;
+  return true;
+}
+
+uint16_t courseCentiDegFromDeg(double courseDeg) {
+  while (courseDeg < 0.0) courseDeg += 360.0;
+  while (courseDeg >= 360.0) courseDeg -= 360.0;
+  const long cdeg = lround(courseDeg * 100.0);
+  return static_cast<uint16_t>(constrain(static_cast<int>(cdeg), 0, 36000));
+}
+
+// Set FCU_GPS_ALLOW_UNDEBOUNCED_ORIGIN=1 ONLY for indoor / GPS-marginal bench
+// sessions where RTH home / EKF origin should seed from the very first fix
+// instead of waiting for the gGpsOriginCal debouncer (sats>=6, 10 s stable).
+// OFF for flight: one noisy fix must never anchor home / origin. (F3)
+#ifndef FCU_GPS_ALLOW_UNDEBOUNCED_ORIGIN
+#define FCU_GPS_ALLOW_UNDEBOUNCED_ORIGIN 0
+#endif
+
+static void parseGpsGgaLine(const char* line, uint32_t nowMs) {
+  if (!line) {
+    return;
+  }
+
+  // Drop sentences that fail the NMEA checksum BEFORE trusting any field. (F3)
+  if (!nmeaChecksumValid(line)) {
+    logGpsChecksumMismatch(nowMs);
     return;
   }
 
@@ -3698,22 +5311,69 @@ void parseGpsLine(const char* line, uint32_t nowMs) {
     return;
   }
 
-  const uint8_t fixQuality = static_cast<uint8_t>(constrain(atoi(fields[6]), 0, 255));
-  const bool hasFix = fixQuality > 0;
-  const uint8_t satellites = static_cast<uint8_t>(constrain(atoi(fields[7]), 0, 99));
-  const int32_t latE7 = parseNmeaCoordE7(fields[2], fields[3]);
-  const int32_t lonE7 = parseNmeaCoordE7(fields[4], fields[5]);
-  const int16_t altDm =
-      static_cast<int16_t>(constrain(static_cast<int>(atof(fields[9]) * 10.0), -32768, 32767));
+  // Strict numeric parsing: a malformed or empty field must not silently decode
+  // to 0 and then masquerade as a valid reading. GGA field layout:
+  //   [2]=lat [3]=N/S [4]=lon [5]=E/W [6]=fixQuality [7]=numSats [8]=HDOP
+  //   [9]=altMSL(m). (F3)
+  char* endp = nullptr;
+  const long fixQ = strtol(fields[6], &endp, 10);
+  const bool fixQOk = (endp != fields[6] && *endp == '\0' && fixQ >= 0 && fixQ <= 8);
+  endp = nullptr;
+  const long satsRaw = strtol(fields[7], &endp, 10);
+  const bool satsOk = (endp != fields[7] && *endp == '\0' && satsRaw >= 0 && satsRaw <= 99);
+  endp = nullptr;
+  const double hdopRaw = strtod(fields[8], &endp);
+  const bool hdopOk = (endp != fields[8] && *endp == '\0' && isfinite(hdopRaw) && hdopRaw > 0.0);
+  endp = nullptr;
+  const double altRaw = strtod(fields[9], &endp);
+  const bool altOk = (endp != fields[9] && *endp == '\0' && isfinite(altRaw) &&
+                      altRaw > -1000.0 && altRaw < 10000.0);
+
+  int32_t latE7 = 0;
+  int32_t lonE7 = 0;
+  const bool latOk = parseNmeaCoordE7(fields[2], fields[3], /*isLongitude=*/false, latE7);
+  const bool lonOk = parseNmeaCoordE7(fields[4], fields[5], /*isLongitude=*/true, lonE7);
+  const bool coordsOk = latOk && lonOk && !(latE7 == 0 && lonE7 == 0);
+
+  const uint8_t fixQuality = fixQOk ? static_cast<uint8_t>(fixQ) : 0;
+  const uint8_t satellites = satsOk ? static_cast<uint8_t>(satsRaw) : 0;
+  const int16_t altDm = altOk
+      ? static_cast<int16_t>(constrain(static_cast<int>(altRaw * 10.0), -32768, 32767))
+      : 0;
+
+  // A usable fix requires a real quality byte (>0), both coordinates parsed and
+  // in range (and not the 0,0 null island), enough satellites, and a sane HDOP.
+  // Anything short of that reports NO fix rather than a bogus position. (F3)
+  constexpr uint8_t kGpsMinSatsForFix = 5;
+  constexpr double kGpsMaxHdopForFix = 5.0;
+  const bool hasFix = fixQOk && fixQuality > 0 && coordsOk &&
+                      satsOk && satellites >= kGpsMinSatsForFix &&
+                      hdopOk && hdopRaw <= kGpsMaxHdopForFix;
+
+  bool gpsVelocityFresh = false;
+  float gpsVelNorthMs = 0.0f;
+  float gpsVelEastMs = 0.0f;
 
   portENTER_CRITICAL(&gSensorMux);
   gState.gps.fixQuality = fixQuality;
   gState.gps.hasFix = hasFix;
   gState.gps.satellites = satellites;
-  gState.gps.latE7 = latE7;
-  gState.gps.lonE7 = lonE7;
-  gState.gps.altDm = altDm;
+  // Only overwrite position/altitude with freshly-validated values; a single
+  // malformed sentence must not zero out the last-known good fix. (F3)
+  if (coordsOk) {
+    gState.gps.latE7 = latE7;
+    gState.gps.lonE7 = lonE7;
+  }
+  if (altOk) {
+    gState.gps.altDm = altDm;
+  }
   gState.gps.lastSentenceMs = nowMs;
+  const uint32_t rmcAgeMs = (gState.gps.lastRmcMs == 0U || nowMs < gState.gps.lastRmcMs)
+      ? 0xFFFFFFFFU
+      : (nowMs - gState.gps.lastRmcMs);
+  gpsVelocityFresh = gState.gps.velocityValid && rmcAgeMs <= GPS_RMC_VELOCITY_STALE_MS;
+  gpsVelNorthMs = gState.gps.velNorthMs;
+  gpsVelEastMs = gState.gps.velEastMs;
   portEXIT_CRITICAL(&gSensorMux);
 
   // [LED] Nav status — 4 blinks on the FIRST valid fix as visual proof that
@@ -3721,7 +5381,7 @@ void parseGpsLine(const char* line, uint32_t nowMs) {
   if (hasFix && !gNavFirstFixSeen.load(std::memory_order_relaxed)) {
     gNavFirstFixSeen.store(true, std::memory_order_relaxed);
     gNavLed.startBurst(nowMs);
-    Serial.printf("[LED] nav-OK 4-blink burst (first GPS fix: lat=%.7f lon=%.7f sats=%u)\n",
+    fcu_log::logf(fcu_log::Level::Info, "[LED] nav-OK 4-blink burst (first GPS fix: lat=%.7f lon=%.7f sats=%u)\n",
                   static_cast<double>(latE7) * 1e-7,
                   static_cast<double>(lonE7) * 1e-7,
                   static_cast<unsigned>(satellites));
@@ -3730,11 +5390,13 @@ void parseGpsLine(const char* line, uint32_t nowMs) {
   // [CALIBRATION] feed the GPS origin debouncer. It waits for sats >= 6 and
   // position stability for 10 seconds before locking the home / EKF origin
   // from the average of N stable fixes — much better than the first fix.
+  // Only feed the origin debouncer real, in-range coordinates; a (0,0) sample
+  // with a nonzero fix quality would otherwise poison the averaged origin. (F3)
   const bool originJustLocked =
-      gGpsOriginCal.tick(latE7, lonE7, altDm, fixQuality, satellites, nowMs);
+      coordsOk && gGpsOriginCal.tick(latE7, lonE7, altDm, fixQuality, satellites, nowMs);
   if (originJustLocked) {
     const auto& o = gGpsOriginCal.result();
-    Serial.printf("[CAL][GPS] origin LOCKED lat=%.7f lon=%.7f alt=%.1fm "
+    fcu_log::logf(fcu_log::Level::Info, "[CAL][GPS] origin LOCKED lat=%.7f lon=%.7f alt=%.1fm "
                   "(samples=%u, %.1fs stable, fix=%u sats=%u)\n",
                   static_cast<double>(o.lat_e7) * 1e-7,
                   static_cast<double>(o.lon_e7) * 1e-7,
@@ -3749,7 +5411,7 @@ void parseGpsLine(const char* line, uint32_t nowMs) {
     gCal.gps_origin_valid.store(true, std::memory_order_relaxed);
     // Second 4-blink burst as visual proof the position estimate is anchored.
     gNavLed.startBurst(nowMs);
-    Serial.println("[LED] nav-OK 4-blink burst (origin LOCKED)");
+    fcu_log::logf(fcu_log::Level::Info, "[LED] nav-OK 4-blink burst (origin LOCKED)\n");
   }
 
 #if FCU_ENABLE_RTH
@@ -3760,48 +5422,162 @@ void parseGpsLine(const char* line, uint32_t nowMs) {
     if (gGpsOriginCal.ready()) {
       const auto& o = gGpsOriginCal.result();
       if (gRth.captureHomeIfNeeded(o.lat_e7, o.lon_e7, true)) {
-        Serial.printf("[RTH] home captured from CAL origin (E7=%ld/%ld)\n",
+        fcu_log::logf(fcu_log::Level::Info, "[RTH] home captured from CAL origin (E7=%ld/%ld)\n",
                       static_cast<long>(o.lat_e7), static_cast<long>(o.lon_e7));
       }
-    } else if (gRth.captureHomeIfNeeded(latE7, lonE7, hasFix)) {
-      Serial.printf("[RTH] home captured (UNDEBOUNCED first-fix) lat=%.7f lon=%.7f\n",
+    }
+#if FCU_GPS_ALLOW_UNDEBOUNCED_ORIGIN
+    else if (coordsOk && gRth.captureHomeIfNeeded(latE7, lonE7, hasFix)) {
+      fcu_log::logf(fcu_log::Level::Warn, "[RTH] home captured (UNDEBOUNCED first-fix) lat=%.7f lon=%.7f\n",
                     static_cast<double>(latE7) * 1e-7,
                     static_cast<double>(lonE7) * 1e-7);
     }
+#endif
   }
 #endif
 
 #if ENABLE_EXPERIMENTAL_EKF
-  // ---- EKF GPS update (shadow) ----------------------------------------------
-  // Set origin from the DEBOUNCED average, fall back to first-fix if the
-  // debouncer hasn't locked yet (so the EKF still has SOMETHING to anchor
-  // against during the 10-second stability window).
+  // ---- EKF GPS integration (shadow) -----------------------------------------
+  // sensorTask only POSTS; flightTask owns gEkf and decides origin-set vs update
+  // from gEkf.originValid(). Offer the current fix as an update every sentence
+  // (the EKF applies it only once an origin exists); and, as an origin
+  // candidate, the DEBOUNCED average when ready — or the raw fix only if
+  // explicitly allowed. flightTask applies the first origin candidate and
+  // ignores the rest. (F4 / F3)
   if (gEkfReady.load(std::memory_order_relaxed) && hasFix) {
     const float latRad = static_cast<float>(latE7) * 1e-7f * (gnc::kPi / 180.0f);
     const float lonRad = static_cast<float>(lonE7) * 1e-7f * (gnc::kPi / 180.0f);
     const float altMsl = static_cast<float>(altDm) * 0.1f;
-    if (!gEkf.originValid()) {
-      if (gGpsOriginCal.ready()) {
-        const auto& o = gGpsOriginCal.result();
-        const float oLatRad = static_cast<float>(o.lat_e7) * 1e-7f * (gnc::kPi / 180.0f);
-        const float oLonRad = static_cast<float>(o.lon_e7) * 1e-7f * (gnc::kPi / 180.0f);
-        const float oAltM   = static_cast<float>(o.alt_dm) * 0.1f;
-        gEkf.setOrigin(oLatRad, oLonRad, oAltM);
-        Serial.println("[EKF] origin set from CAL debounce");
-      } else {
-        gEkf.setOrigin(latRad, lonRad, altMsl);
-        Serial.printf("[EKF] origin set UNDEBOUNCED lat=%.7f lon=%.7f alt=%.1fm\n",
-                      static_cast<double>(latRad) * (180.0 / gnc::kPi),
-                      static_cast<double>(lonRad) * (180.0 / gnc::kPi),
-                      static_cast<double>(altMsl));
-      }
-    } else {
-      (void)gEkf.updateGPS(latRad, lonRad, altMsl,
-                           math3::Vector3{},  // no velocity yet (GPRMC TODO)
-                           /*hasVelocity*/ false, nowMs);
+
+    EkfMeasurement up;
+    up.type = EkfMeasurement::Type::GpsUpdate;
+    up.nowMs = nowMs;
+    up.gps.latRad = latRad;
+    up.gps.lonRad = lonRad;
+    up.gps.altMsl = altMsl;
+    up.gps.velN = gpsVelNorthMs;
+    up.gps.velE = gpsVelEastMs;
+    up.gps.velD = 0.0f;
+    up.gps.hasVelocity = gpsVelocityFresh;
+    postEkfMeasurement(up);
+
+    if (gGpsOriginCal.ready()) {
+      const auto& o = gGpsOriginCal.result();
+      EkfMeasurement og;
+      og.type = EkfMeasurement::Type::GpsOrigin;
+      og.nowMs = nowMs;
+      og.gps.latRad = static_cast<float>(o.lat_e7) * 1e-7f * (gnc::kPi / 180.0f);
+      og.gps.lonRad = static_cast<float>(o.lon_e7) * 1e-7f * (gnc::kPi / 180.0f);
+      og.gps.altMsl = static_cast<float>(o.alt_dm) * 0.1f;
+      og.gps.velN = 0.0f;
+      og.gps.velE = 0.0f;
+      og.gps.velD = 0.0f;
+      og.gps.hasVelocity = false;
+      postEkfMeasurement(og);
     }
+#if FCU_GPS_ALLOW_UNDEBOUNCED_ORIGIN
+    else {
+      EkfMeasurement og;
+      og.type = EkfMeasurement::Type::GpsOrigin;
+      og.nowMs = nowMs;
+      og.gps.latRad = latRad;
+      og.gps.lonRad = lonRad;
+      og.gps.altMsl = altMsl;
+      og.gps.velN = 0.0f;
+      og.gps.velE = 0.0f;
+      og.gps.velD = 0.0f;
+      og.gps.hasVelocity = false;
+      postEkfMeasurement(og);
+    }
+#endif
   }
 #endif
+}
+
+// [GPS MODULE] — declared in include/gps_module.h
+static void parseGpsRmcLine(const char* line, uint32_t nowMs) {
+  if (!line) {
+    return;
+  }
+
+  if (!nmeaChecksumValid(line)) {
+    logGpsChecksumMismatch(nowMs);
+    return;
+  }
+
+  char lineCopy[sizeof(gState.gps.line)];
+  strncpy(lineCopy, line, sizeof(lineCopy) - 1);
+  lineCopy[sizeof(lineCopy) - 1] = '\0';
+
+  char* fields[16] = {};
+  const size_t fieldCount = splitNmeaFields(lineCopy, fields, sizeof(fields) / sizeof(fields[0]));
+  if (fieldCount < 9) {
+    return;
+  }
+
+  // RMC layout:
+  //   [2]=status A/V [3]=lat [4]=N/S [5]=lon [6]=E/W [7]=speed knots
+  //   [8]=course over ground degrees true.
+  const bool statusActive = fields[2] && fields[2][0] == 'A';
+  int32_t latE7 = 0;
+  int32_t lonE7 = 0;
+  const bool latOk = parseNmeaCoordE7(fields[3], fields[4], /*isLongitude=*/false, latE7);
+  const bool lonOk = parseNmeaCoordE7(fields[5], fields[6], /*isLongitude=*/true, lonE7);
+  const bool coordsOk = latOk && lonOk && !(latE7 == 0 && lonE7 == 0);
+
+  double speedKnots = 0.0;
+  const bool speedOk = statusActive && parseNmeaDoubleStrict(fields[7], speedKnots) &&
+                       speedKnots >= 0.0 && speedKnots < 500.0;
+  double courseDeg = 0.0;
+  bool courseOk = statusActive && parseNmeaDoubleStrict(fields[8], courseDeg) &&
+                  courseDeg >= 0.0 && courseDeg <= 360.0;
+  if (courseOk && courseDeg >= 360.0) {
+    courseDeg = 0.0;
+  }
+
+  constexpr double kKnotsToMs = 0.514444444;
+  constexpr double kKnotsToKmh = 1.852;
+  const float speedMs = speedOk ? static_cast<float>(speedKnots * kKnotsToMs) : 0.0f;
+  const bool stopped = speedOk && speedMs < 0.05f;
+  const bool velocityOk = speedOk && (courseOk || stopped);
+  const float courseForVectorDeg = courseOk ? static_cast<float>(courseDeg) : 0.0f;
+  const float courseRad = courseForVectorDeg * (gnc::kPi / 180.0f);
+  const float velNorth = velocityOk ? speedMs * cosf(courseRad) : 0.0f;
+  const float velEast = velocityOk ? speedMs * sinf(courseRad) : 0.0f;
+  const uint16_t kmh10 = speedOk
+      ? static_cast<uint16_t>(constrain(static_cast<int>(lround(speedKnots * kKnotsToKmh * 10.0)),
+                                        0, 65535))
+      : 0U;
+  const uint16_t courseCdeg = courseOk ? courseCentiDegFromDeg(courseDeg) : 0U;
+
+  portENTER_CRITICAL(&gSensorMux);
+  if (statusActive && coordsOk) {
+    gState.gps.latE7 = latE7;
+    gState.gps.lonE7 = lonE7;
+  }
+  gState.gps.groundSpeedValid = speedOk;
+  gState.gps.courseValid = courseOk;
+  gState.gps.velocityValid = velocityOk;
+  gState.gps.groundSpeedKmh10 = kmh10;
+  gState.gps.courseCentiDeg = courseCdeg;
+  gState.gps.groundSpeedMs = speedMs;
+  gState.gps.courseDeg = courseForVectorDeg;
+  gState.gps.velNorthMs = velNorth;
+  gState.gps.velEastMs = velEast;
+  gState.gps.lastRmcMs = nowMs;
+  portEXIT_CRITICAL(&gSensorMux);
+}
+
+// [GPS MODULE] — declared in include/gps_module.h
+void parseGpsLine(const char* line, uint32_t nowMs) {
+  if (!line) {
+    return;
+  }
+  if (strncmp(line, "$GPGGA", 6) == 0 || strncmp(line, "$GNGGA", 6) == 0) {
+    parseGpsGgaLine(line, nowMs);
+  } else if (strncmp(line, "$GPRMC", 6) == 0 || strncmp(line, "$GNRMC", 6) == 0) {
+    parseGpsRmcLine(line, nowMs);
+  }
 }
 
 // [GPS MODULE] — declared in include/gps_module.h
@@ -4167,13 +5943,13 @@ void scheduleRadioRetry(const char* name, uint16_t& attempts, bool& givenUp,
   attempts++;
   if (attempts >= RADIO_INIT_MAX_ATTEMPTS) {
     givenUp = true;
-    Serial.printf("[RADIO][%s] giving up after %u attempts\n",
+    fcu_log::logf(fcu_log::Level::Error, "[RADIO][%s] giving up after %u attempts\n",
                   name, static_cast<unsigned>(attempts));
     return;
   }
   const uint32_t backoff = radioBackoffMs(attempts);
   nextAttemptMs = nowMs + backoff;
-  Serial.printf("[RADIO][%s] attempt %u failed; next retry in %lu ms\n",
+  fcu_log::logf(fcu_log::Level::Warn, "[RADIO][%s] attempt %u failed; next retry in %lu ms\n",
                 name, static_cast<unsigned>(attempts),
                 static_cast<unsigned long>(backoff));
 }
@@ -4188,7 +5964,7 @@ void serviceRadioInit(uint32_t nowMs) {
     gState.ctrlInitDiagnosticDone = true;
     gState.ctrlRadioReady = initControlRadio(gState.ctrlRaw0, gState.ctrlRaw1, runDiag);
     if (gState.ctrlRadioReady) {
-      Serial.printf("[RADIO][CTRL] ready after %u attempt(s)\n",
+      fcu_log::logf(fcu_log::Level::Info, "[RADIO][CTRL] ready after %u attempt(s)\n",
                     static_cast<unsigned>(gState.ctrlInitAttempts + 1U));
     } else {
       scheduleRadioRetry("CTRL", gState.ctrlInitAttempts, gState.ctrlInitGivenUp,
@@ -4216,7 +5992,7 @@ void serviceRadioInit(uint32_t nowMs) {
     gState.telemInitDiagnosticDone = true;
     gState.telemRadioReady = initTelemetryRadio(gState.telemRaw0, gState.telemRaw1, runDiag);
     if (gState.telemRadioReady) {
-      Serial.printf("[RADIO][TELM] ready after %u attempt(s)\n",
+      fcu_log::logf(fcu_log::Level::Info, "[RADIO][TELM] ready after %u attempt(s)\n",
                     static_cast<unsigned>(gState.telemInitAttempts + 1U));
     } else {
       scheduleRadioRetry("TELM", gState.telemInitAttempts, gState.telemInitGivenUp,
@@ -4243,7 +6019,10 @@ bool packetAllowsFlightThrottle(const control_protocol::ControlPacket& packet) {
 #if FCU_ENABLE_RPM_FILTER
   rpmOk = rpmFilterSafeToArm();
 #endif
-  return flightMode && flightSwitchOn && safeBootComplete && !gState.control.failsafeActive && rpmOk;
+  // Block arming while ESC passthrough owns the motor pins (no-op when the
+  // feature is compiled out).
+  return flightMode && flightSwitchOn && safeBootComplete && !gState.control.failsafeActive && rpmOk &&
+         !esc_passthrough::isActive();
 }
 
 uint16_t throttleToMotorRaw(uint8_t throttlePercent) {
@@ -4318,7 +6097,8 @@ bool rpmFilterSafeToArm() {
 }
 
 void updateRpmFilterFromEsc(float sampleRateHz, uint32_t nowUs, uint32_t nowMs) {
-  gRpmNotch.update(sampleRateHz, readRpmTelemetrySamples(), nowUs);
+  const auto rpmSamples = readRpmTelemetrySamples();
+  gRpmNotch.update(sampleRateHz, rpmSamples, nowUs);
 
   if (RPM_FILTER_DEBUG_ENABLED && (nowMs - gLastRpmFilterLogMs) >= 1000U) {
     gLastRpmFilterLogMs = nowMs;
@@ -4326,7 +6106,8 @@ void updateRpmFilterFromEsc(float sampleRateHz, uint32_t nowUs, uint32_t nowMs) 
     const RpmMotorState& m1 = gRpmNotch.motorState(1);
     const RpmMotorState& m2 = gRpmNotch.motorState(2);
     const RpmMotorState& m3 = gRpmNotch.motorState(3);
-    Serial.printf("[RPM_FILTER] active=%u arm_ok=%u hz=[%.1f,%.1f,%.1f,%.1f] err=[%.1f,%.1f,%.1f,%.1f]\n",
+    fcu_log::logf(fcu_log::Level::Info,
+                  "[RPM_FILTER] active=%u arm_ok=%u hz=[%.1f,%.1f,%.1f,%.1f] err=[%.1f,%.1f,%.1f,%.1f]\n",
                   static_cast<unsigned>(gRpmNotch.active()),
                   static_cast<unsigned>(gRpmNotch.safeToArm()),
                   static_cast<double>(m0.motorHz),
@@ -4337,6 +6118,40 @@ void updateRpmFilterFromEsc(float sampleRateHz, uint32_t nowUs, uint32_t nowMs) 
                   static_cast<double>(m1.errorPercent),
                   static_cast<double>(m2.errorPercent),
                   static_cast<double>(m3.errorPercent));
+    const esc::MotorTelemetry t0 = gMotor0.telemetry();
+    const esc::MotorTelemetry t1 = gMotor1.telemetry();
+    const esc::MotorTelemetry t2 = gMotor2.telemetry();
+    const esc::MotorTelemetry t3 = gMotor3.telemetry();
+    const uint32_t age0 = t0.lastUpdateMs != 0U ? nowMs - t0.lastUpdateMs : 999999U;
+    const uint32_t age1 = t1.lastUpdateMs != 0U ? nowMs - t1.lastUpdateMs : 999999U;
+    const uint32_t age2 = t2.lastUpdateMs != 0U ? nowMs - t2.lastUpdateMs : 999999U;
+    const uint32_t age3 = t3.lastUpdateMs != 0U ? nowMs - t3.lastUpdateMs : 999999U;
+    fcu_log::logf(fcu_log::Level::Info,
+                  "[BDSHOT] valid=%u%u%u%u erpm=[%lu,%lu,%lu,%lu] rpm=[%lu,%lu,%lu,%lu] good=[%lu,%lu,%lu,%lu] bad=[%lu,%lu,%lu,%lu] age_ms=[%lu,%lu,%lu,%lu]\n",
+                  static_cast<unsigned>(t0.valid),
+                  static_cast<unsigned>(t1.valid),
+                  static_cast<unsigned>(t2.valid),
+                  static_cast<unsigned>(t3.valid),
+                  static_cast<unsigned long>(t0.erpm),
+                  static_cast<unsigned long>(t1.erpm),
+                  static_cast<unsigned long>(t2.erpm),
+                  static_cast<unsigned long>(t3.erpm),
+                  static_cast<unsigned long>(t0.motorRpm),
+                  static_cast<unsigned long>(t1.motorRpm),
+                  static_cast<unsigned long>(t2.motorRpm),
+                  static_cast<unsigned long>(t3.motorRpm),
+                  static_cast<unsigned long>(t0.goodFrameCount),
+                  static_cast<unsigned long>(t1.goodFrameCount),
+                  static_cast<unsigned long>(t2.goodFrameCount),
+                  static_cast<unsigned long>(t3.goodFrameCount),
+                  static_cast<unsigned long>(t0.badFrameCount),
+                  static_cast<unsigned long>(t1.badFrameCount),
+                  static_cast<unsigned long>(t2.badFrameCount),
+                  static_cast<unsigned long>(t3.badFrameCount),
+                  static_cast<unsigned long>(age0),
+                  static_cast<unsigned long>(age1),
+                  static_cast<unsigned long>(age2),
+                  static_cast<unsigned long>(age3));
   }
 }
 #endif
@@ -4405,12 +6220,10 @@ bool sendTelemetryPayloadNoWait(const void* payload, uint8_t len) {
   static uint32_t lastWarnMs = 0;
   if (elapsedUs > TELEMETRY_SPI_WARN_US && (millis() - lastWarnMs) > 1000U) {
     lastWarnMs = millis();
-    if (serialHasRoom(96)) {
-      Serial.printf("[RADIO][TELM] slow nonblocking send %luus ok=%u\n",
+    {
+      fcu_log::logf(fcu_log::Level::Warn, "[RADIO][TELM] slow nonblocking send %luus ok=%u\n",
                     static_cast<unsigned long>(elapsedUs),
                     static_cast<unsigned>(ok));
-    } else {
-      noteSerialBackpressure(false);
     }
   }
   return ok;
@@ -4433,7 +6246,19 @@ uint16_t clampMotorRaw(float value) {
   return static_cast<uint16_t>(max(rounded, static_cast<int>(MOTOR_OUTPUT_MIN_ACTIVE_RAW)));
 }
 
-void resetPidOutputs() {
+// PID reset policy (active-flight-path safety fix, 2026-06): resets happen
+// ONLY at transitions — disarm/forceMotorStop, failsafe entry (soft release),
+// failsafe clear, arming edge, gyro-cal completion, webserver gain apply.
+// They must NEVER run as part of normal armed control (the old code reset the
+// PIDs on every zero-throttle tick, wiping trim mid-flight on a throttle chop).
+// Rate-PID state is deliberately NOT reset on flight-mode transitions (e.g.
+// ATK engage/disengage): the inner loop keeps flying through the transition
+// and a reset there would inject a motor transient mid-air. Outer-loop state
+// (gAltCtrl) is what gets reset on mode boundaries instead.
+//
+// Callers hold gFlightMux (or are the flight task pre-scheduler) — no Serial,
+// no mutex acquisition in here. `reason` must be a static string literal.
+void resetPidOutputs(const char* reason) {
   gState.pid.roll.reset();
   gState.pid.pitch.reset();
   gState.pid.yaw.reset();
@@ -4444,9 +6269,56 @@ void resetPidOutputs() {
   gState.pid.pitchRateSetpointDps = 0.0f;
   gState.pid.yawRateSetpointDps = 0.0f;
   gState.pid.active = false;
+  // Saturation/idle flags are only refreshed by mixer-reaching ticks; clear
+  // them here so (a) a disarm/failsafe gap can never leave a stale
+  // mixerSatPrevTick gating the integrator on the first tick after re-arm,
+  // and (b) telemetry/logs never show last-flight saturation while stopped.
+  // (Armed-idle audit fix.)
+  gState.pid.mixerMinSat = false;
+  gState.pid.mixerMaxSat = false;
+  gState.pid.mixerCorrScaled = false;
+  gState.pid.rollPidSat = false;
+  gState.pid.pitchPidSat = false;
+  gState.pid.yawPidSat = false;
+  gState.pid.mixerSatPrevTick = false;
+  gState.pid.integratorFrozen = false;
+  gState.pid.armedIdleActive = false;
+  // Bookkeeping only on a reason *change* or first call — forceMotorStop()
+  // runs every tick while disarmed (idempotent), and bumping the counter at
+  // 500 Hz would make it meaningless.
+  if (gState.pid.lastResetReason != reason) {
+    gState.pid.lastResetReason = reason;
+    gState.pid.lastResetMs = millis();
+    gState.pid.resetCount++;
+  }
 }
 
-#if ENABLE_PID_WEBSERVER
+// Pack the per-tick saturation/idle flags into the telemetry byte
+// (TelemetryAuxPacket.mixerSatFlags). Plain bool reads: single writer is the
+// flight task; byte-sized fields cannot tear, and telemetry tolerates one
+// tick of staleness (same convention as gState.loopRate.lastHz).
+uint8_t mixerSatFlagsByte() {
+  uint8_t f = 0;
+  if (gState.pid.mixerMinSat) f |= control_protocol::kTelemetrySatMotorMin;
+  if (gState.pid.mixerMaxSat) f |= control_protocol::kTelemetrySatMotorMax;
+  if (gState.pid.mixerCorrScaled) f |= control_protocol::kTelemetrySatCorrScaled;
+  if (gState.pid.rollPidSat) f |= control_protocol::kTelemetrySatRollPid;
+  if (gState.pid.pitchPidSat) f |= control_protocol::kTelemetrySatPitchPid;
+  if (gState.pid.yawPidSat) f |= control_protocol::kTelemetrySatYawPid;
+  if (gState.pid.armedIdleActive) f |= control_protocol::kTelemetrySatArmedIdle;
+  return f;
+}
+
+#if ENABLE_PID_WEBSERVER || ENABLE_USB_CONFIG
+enum class PendingSystemAction : uint8_t {
+  None = 0,
+  Reboot,
+  Bootloader,
+};
+
+PendingSystemAction gPendingSystemAction = PendingSystemAction::None;
+uint32_t gPendingSystemActionDueMs = 0;
+
 bool pidWebWriteSafe() {
   uint8_t throttle = 0;
   bool failsafe = false;
@@ -4456,13 +6328,138 @@ bool pidWebWriteSafe() {
   portEXIT_CRITICAL(&gControlMux);
 
   bool motorSpinBusy = false;
+  bool motorsActive = false;
+#if ENABLE_USB_CONFIG
+  bool configMotorBusy = false;
+#endif
   portENTER_CRITICAL(&gFlightMux);
   motorSpinBusy = (gMotorSpin.requestedMotor != 0U) || (gMotorSpin.activeMotor != 0U);
+#if ENABLE_USB_CONFIG
+  configMotorBusy = gConfigMotorTest.sessionArmed || gConfigMotorTest.active;
+#endif
+  // Armed idle spins the props with appliedThrottlePercent == 0 — the throttle
+  // check alone no longer proves the motors are quiet. (Armed-idle audit fix.)
+  motorsActive = anyMotorOutputActive(gState.motorRaw);
   portEXIT_CRITICAL(&gFlightMux);
 
-  return throttle == 0U && !failsafe &&
-         gFlightSm.state() == flight_state::State::IDLE &&
-         !motorSpinBusy;
+  bool safe = throttle == 0U && !failsafe && !motorsActive &&
+              gFlightStatePublished.load(std::memory_order_relaxed) == flight_state::State::IDLE &&
+              !motorSpinBusy;
+#if ENABLE_USB_CONFIG
+  safe = safe && !configMotorBusy;
+#endif
+  return safe;
+}
+
+bool queueSystemAction(PendingSystemAction action, const char* reason) {
+  if (!pidWebWriteSafe() || action == PendingSystemAction::None) {
+    return false;
+  }
+  forceMotorStop(reason != nullptr ? reason : "config_system_action");
+  gPendingSystemAction = action;
+  gPendingSystemActionDueMs = millis() + 180U;
+  fcu_log::logf(fcu_log::Level::Warn, "[CONFIG] queued system action=%u\n",
+                static_cast<unsigned>(action));
+  return true;
+}
+
+bool requestSystemReboot() {
+  return queueSystemAction(PendingSystemAction::Reboot, "config_reboot");
+}
+
+bool requestSystemBootloader() {
+  return queueSystemAction(PendingSystemAction::Bootloader, "config_bootloader");
+}
+
+void serviceSystemAction(uint32_t nowMs) {
+  if (gPendingSystemAction == PendingSystemAction::None ||
+      static_cast<int32_t>(nowMs - gPendingSystemActionDueMs) < 0) {
+    return;
+  }
+  const PendingSystemAction action = gPendingSystemAction;
+  gPendingSystemAction = PendingSystemAction::None;
+  forceMotorStop(action == PendingSystemAction::Bootloader ? "config_bootloader" : "config_reboot");
+  fcu_log::drain(nowMs);
+  Serial.flush();
+  delay(40);
+  if (action == PendingSystemAction::Bootloader) {
+    REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
+  }
+  ESP.restart();
+}
+
+bool requestSensorRescan() {
+  if (!pidWebWriteSafe()) {
+    gSensorRescanRejectCount.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  bool expected = false;
+  if (!gSensorRescanRequested.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+    return false;
+  }
+  gSensorRescanAcceptCount.fetch_add(1, std::memory_order_relaxed);
+  fcu_log::logf(fcu_log::Level::Warn, "[SENSOR] disarmed rescan queued from configurator\n");
+  return true;
+}
+
+void serviceSensorRescan(uint32_t nowMs) {
+  if (!gSensorRescanRequested.exchange(false, std::memory_order_acq_rel)) {
+    return;
+  }
+  if (!pidWebWriteSafe()) {
+    gSensorRescanRejectCount.fetch_add(1, std::memory_order_relaxed);
+    fcu_log::logf(fcu_log::Level::Warn, "[SENSOR] rescan refused; FCU no longer bench-idle\n");
+    return;
+  }
+  if (!gState.i2cReady) {
+    fcu_log::logf(fcu_log::Level::Warn, "[SENSOR] rescan skipped; I2C not ready\n");
+    return;
+  }
+
+  uint8_t bmpChip = 0;
+  uint8_t bmpAddr = 0;
+  const bool bmpOk = initBmp(bmpChip, bmpAddr);
+  portENTER_CRITICAL(&gSensorMux);
+  gState.bmpReady = bmpOk;
+  gState.bmpChipId = bmpChip;
+  gState.bmpAddr = bmpAddr;
+  portEXIT_CRITICAL(&gSensorMux);
+
+#if FCU_ENABLE_TOF
+  const bool tofOk = initTof();
+  portENTER_CRITICAL(&gSensorMux);
+  gState.tof.ready = tofOk;
+  if (!tofOk) {
+    gState.tof.ranging = false;
+    gState.tof.distanceMm = 0;
+    gState.tof.lastReadMs = 0;
+  }
+  portEXIT_CRITICAL(&gSensorMux);
+#else
+  const bool tofOk = false;
+#endif
+
+#if FCU_ENABLE_EXTERNAL_MAG
+  uint8_t extAddr = 0;
+  uint8_t extChip = 0;
+  const bool extMagOk = initExternalMag(extAddr, extChip);
+  gExtMag.ready.store(extMagOk, std::memory_order_relaxed);
+  gExtMag.addr.store(extAddr, std::memory_order_relaxed);
+  gExtMag.chipId.store(extChip, std::memory_order_relaxed);
+  if (!extMagOk) {
+    gExtMag.connected.store(false, std::memory_order_relaxed);
+    gExtMag.healthy.store(false, std::memory_order_relaxed);
+  }
+#else
+  const bool extMagOk = false;
+#endif
+
+  fcu_log::logf(fcu_log::Level::Warn,
+                "[SENSOR] rescan complete bmp=%u tof=%u extmag=%u t=%lums\n",
+                static_cast<unsigned>(bmpOk),
+                static_cast<unsigned>(tofOk),
+                static_cast<unsigned>(extMagOk),
+                static_cast<unsigned long>(nowMs));
 }
 
 void pidWebGetPid(int16_t out[pid_webserver::kFieldCount]) {
@@ -4491,7 +6488,7 @@ bool pidWebApplyPid(const int16_t values[pid_webserver::kFieldCount]) {
 
   portENTER_CRITICAL(&gFlightMux);
   configurePidFromPacket(packet);
-  resetPidOutputs();
+  resetPidOutputs("pidweb_gain_apply");
   portEXIT_CRITICAL(&gFlightMux);
   return true;
 }
@@ -4552,7 +6549,7 @@ void pidWebGetState(pid_webserver::StateSnapshot& s) {
   s.loopHz = gState.loopRate.lastHz;
   portEXIT_CRITICAL(&gFlightMux);
 
-  s.armed = (s.throttlePct > 0U) || (gFlightSm.state() != flight_state::State::IDLE);
+  s.armed = (s.throttlePct > 0U) || (gFlightStatePublished.load(std::memory_order_relaxed) != flight_state::State::IDLE);
 }
 
 void pidWebGetHealth(pid_webserver::HealthSnapshot& h) {
@@ -4593,6 +6590,165 @@ bool pidWebSaveMixBiasToNvs() {
   return ok;
 }
 
+// ---- Magnetometer heading trim (deg) — webserver /api/settings -------------
+void pidWebGetMagTrim(float& out) {
+  out = gMagTrimDeg.load(std::memory_order_relaxed);
+}
+
+bool pidWebSetMagTrim(float deg) {
+  if (!pidWebWriteSafe()) return false;
+  if (!(isfinite(deg) && deg >= -360.0f && deg <= 360.0f)) return false;
+  gMagTrimDeg.store(deg, std::memory_order_relaxed);
+  Serial.printf("[PIDWEB] mag heading trim -> %.1f deg (RAM)\n", static_cast<double>(deg));
+  return true;
+}
+
+bool pidWebSaveMagTrimToNvs() {
+  if (!pidWebWriteSafe() || !gPidNvs.ready()) return false;
+  const float current = gMagTrimDeg.load(std::memory_order_relaxed);
+  const bool ok = gPidNvs.saveMagTrimDeg(current);
+  if (ok) {
+    Serial.printf("[PIDWEB] mag heading trim=%.1f deg persisted to NVS\n",
+                  static_cast<double>(current));
+  }
+  return ok;
+}
+
+bool pidWebSetFailsafeBypass(bool bypass) {
+  if (!pidWebWriteSafe()) return false;
+  gFailsafeBypass.store(bypass, std::memory_order_relaxed);
+  if (bypass) {
+    portENTER_CRITICAL(&gFailsafeMux);
+    gFailsafe.reset();
+    gState.failsafeReason = control_protocol::kFailsafeNone;
+    portEXIT_CRITICAL(&gFailsafeMux);
+    portENTER_CRITICAL(&gControlMux);
+    gState.control.failsafeActive = false;
+    portEXIT_CRITICAL(&gControlMux);
+  }
+  Serial.printf("[PIDWEB] failsafe bypass -> %u (RAM)\n", static_cast<unsigned>(bypass));
+  return true;
+}
+
+bool pidWebSaveFailsafeBypassToNvs() {
+  if (!pidWebWriteSafe() || !gPidNvs.ready()) return false;
+  const bool bypass = gFailsafeBypass.load(std::memory_order_relaxed);
+  const bool ok = gPidNvs.saveFailsafeBypass(bypass);
+  if (ok) {
+    Serial.printf("[PIDWEB] failsafe bypass=%u persisted to NVS\n",
+                  static_cast<unsigned>(bypass));
+  }
+  return ok;
+}
+
+// ===== Persistent level correction + manual trim (dashboard backend) =========
+// Snapshot of the live correction kept so "Restore Previous" can undo the last
+// mutating action (apply / reload / clear / reset) without a save round-trip.
+struct LevelSnapshot { float ro = 0.0f, po = 0.0f, rt = 0.0f, pt = 0.0f; bool has = false; };
+LevelSnapshot gLevelPrev;
+
+void snapshotLevelPrev() {
+  gLevelPrev.ro = gLevelCorr.rollOffsetDeg.load(std::memory_order_relaxed);
+  gLevelPrev.po = gLevelCorr.pitchOffsetDeg.load(std::memory_order_relaxed);
+  gLevelPrev.rt = gLevelCorr.rollTrimDeg.load(std::memory_order_relaxed);
+  gLevelPrev.pt = gLevelCorr.pitchTrimDeg.load(std::memory_order_relaxed);
+  gLevelPrev.has = true;
+}
+
+// "Apply Temporarily": push a manually-entered mounting offset to RAM only (no
+// NVS). Disarmed-gated, clamped to the validation envelope.
+bool pidWebApplyLevelOffset(float rollOff, float pitchOff) {
+  if (!pidWebWriteSafe()) return false;
+  if (!(isfinite(rollOff) && isfinite(pitchOff))) return false;
+  snapshotLevelPrev();
+  gLevelCorr.rollOffsetDeg.store(constrain(rollOff, -LEVEL_CAL_MAX_OFFSET_DEG, LEVEL_CAL_MAX_OFFSET_DEG),
+                                 std::memory_order_relaxed);
+  gLevelCorr.pitchOffsetDeg.store(constrain(pitchOff, -LEVEL_CAL_MAX_OFFSET_DEG, LEVEL_CAL_MAX_OFFSET_DEG),
+                                  std::memory_order_relaxed);
+  return true;
+}
+
+// Manual roll/pitch trim → RAM only (no NVS). Independent of the mounting offset.
+bool pidWebApplyTrim(float rollTrim, float pitchTrim) {
+  if (!pidWebWriteSafe()) return false;
+  if (!(isfinite(rollTrim) && isfinite(pitchTrim))) return false;
+  snapshotLevelPrev();
+  gLevelCorr.rollTrimDeg.store(constrain(rollTrim, -LEVEL_TRIM_MAX_DEG, LEVEL_TRIM_MAX_DEG),
+                               std::memory_order_relaxed);
+  gLevelCorr.pitchTrimDeg.store(constrain(pitchTrim, -LEVEL_TRIM_MAX_DEG, LEVEL_TRIM_MAX_DEG),
+                                std::memory_order_relaxed);
+  return true;
+}
+
+// Persist current live offset + trim to NVS, then read back and verify.
+bool pidWebSaveLevelToNvs() {
+  if (!pidWebWriteSafe() || !gPidNvs.ready()) return false;
+  fcu_nvs::FcuPidNvs::LevelCalibration lc;
+  lc.roll_offset_deg = gLevelCorr.rollOffsetDeg.load(std::memory_order_relaxed);
+  lc.pitch_offset_deg = gLevelCorr.pitchOffsetDeg.load(std::memory_order_relaxed);
+  lc.roll_trim_deg = gLevelCorr.rollTrimDeg.load(std::memory_order_relaxed);
+  lc.pitch_trim_deg = gLevelCorr.pitchTrimDeg.load(std::memory_order_relaxed);
+  lc.valid = true;
+  if (!gPidNvs.saveLevelCalibration(lc, LEVEL_CAL_MAX_OFFSET_DEG, LEVEL_TRIM_MAX_DEG)) return false;
+  const auto rb = gPidNvs.loadLevelCalibration(LEVEL_CAL_MAX_OFFSET_DEG, LEVEL_TRIM_MAX_DEG);
+  const bool ok = rb.valid && fabsf(rb.roll_offset_deg - lc.roll_offset_deg) < 0.01f &&
+                  fabsf(rb.pitch_offset_deg - lc.pitch_offset_deg) < 0.01f &&
+                  fabsf(rb.roll_trim_deg - lc.roll_trim_deg) < 0.01f &&
+                  fabsf(rb.pitch_trim_deg - lc.pitch_trim_deg) < 0.01f;
+  if (ok) gLevelCorr.loaded.store(true, std::memory_order_relaxed);
+  return ok;
+}
+
+// Reload level + trim from NVS and apply (clears windup learned against the old
+// reference). Disarmed-gated.
+bool pidWebReloadLevelFromNvs() {
+  if (!pidWebWriteSafe() || !gPidNvs.ready()) return false;
+  const auto lc = gPidNvs.loadLevelCalibration(LEVEL_CAL_MAX_OFFSET_DEG, LEVEL_TRIM_MAX_DEG);
+  if (!lc.valid) return false;
+  snapshotLevelPrev();
+  gLevelCorr.rollOffsetDeg.store(lc.roll_offset_deg, std::memory_order_relaxed);
+  gLevelCorr.pitchOffsetDeg.store(lc.pitch_offset_deg, std::memory_order_relaxed);
+  gLevelCorr.rollTrimDeg.store(lc.roll_trim_deg, std::memory_order_relaxed);
+  gLevelCorr.pitchTrimDeg.store(lc.pitch_trim_deg, std::memory_order_relaxed);
+  gLevelCorr.loaded.store(true, std::memory_order_relaxed);
+  resetPidOutputs("level_reload");
+  return true;
+}
+
+// Clear the saved record and zero live offset + trim. Disarmed-gated.
+bool pidWebClearLevel() {
+  if (!pidWebWriteSafe()) return false;
+  snapshotLevelPrev();
+  if (gPidNvs.ready()) (void)gPidNvs.clearLevelCalibration();
+  gLevelCorr.rollOffsetDeg.store(0.0f, std::memory_order_relaxed);
+  gLevelCorr.pitchOffsetDeg.store(0.0f, std::memory_order_relaxed);
+  gLevelCorr.rollTrimDeg.store(0.0f, std::memory_order_relaxed);
+  gLevelCorr.pitchTrimDeg.store(0.0f, std::memory_order_relaxed);
+  gLevelCorr.loaded.store(false, std::memory_order_relaxed);
+  resetPidOutputs("level_clear");
+  return true;
+}
+
+// Reset manual trim only (keep the mounting offset). RAM only. Disarmed-gated.
+bool pidWebResetTrim() {
+  if (!pidWebWriteSafe()) return false;
+  snapshotLevelPrev();
+  gLevelCorr.rollTrimDeg.store(0.0f, std::memory_order_relaxed);
+  gLevelCorr.pitchTrimDeg.store(0.0f, std::memory_order_relaxed);
+  return true;
+}
+
+// Restore the correction active before the last mutating action.
+bool pidWebRestoreLevelPrev() {
+  if (!pidWebWriteSafe() || !gLevelPrev.has) return false;
+  gLevelCorr.rollOffsetDeg.store(gLevelPrev.ro, std::memory_order_relaxed);
+  gLevelCorr.pitchOffsetDeg.store(gLevelPrev.po, std::memory_order_relaxed);
+  gLevelCorr.rollTrimDeg.store(gLevelPrev.rt, std::memory_order_relaxed);
+  gLevelCorr.pitchTrimDeg.store(gLevelPrev.pt, std::memory_order_relaxed);
+  resetPidOutputs("level_restore");
+  return true;
+}
+
 // Snapshot the full PID/mixer state for the 1 Hz webserver tune log. All
 // reads under gFlightMux so the P/I/D/output terms and motor commands are
 // mutually consistent — no torn reads even if the flight task runs mid-call.
@@ -4631,6 +6787,709 @@ void pidWebGetTune(pid_webserver::TuneSnapshot& t) {
   t.mixPitchFrontBias = gMixPitchFrontBias.load(std::memory_order_relaxed);
 }
 
+// Helper: age in ms with never-seen / wrap guards.
+static uint32_t ageMsSafe(uint32_t now, uint32_t lastMs) {
+  if (lastMs == 0U || now < lastMs) return 0xFFFFFFFFU;
+  return now - lastMs;
+}
+
+// The full live telemetry frame pushed over the WebSocket. Reads every stage of
+// the signal path under the appropriate mux so the dashboard can show
+// raw-vs-corrected end to end (the unequal-motor diagnosis lives here).
+void pidWebGetDash(pid_webserver::DashTelemetry& d) {
+  const uint32_t now = millis();
+  d.uptimeMs = now;
+  d.freeHeap = ESP.getFreeHeap();
+  d.minFreeHeap = gHealth.minFreeHeap;
+  d.flightOverruns = gHealth.flight.overrunCount;
+  d.flightMaxUs = gHealth.flight.maxDurationUs;
+  d.failsafeReason = readFailsafeReason();
+  d.failsafeBypass = failsafesBypassed();
+  d.failsafeBypassCompiledDefault = ALL_FAILSAFES_DISABLED;
+
+  // ---- Flight-mux: attitude, PID, mixer, IMU, level-cal runtime ----
+  portENTER_CRITICAL(&gFlightMux);
+  d.rawRollDeg = gState.attitude.rollDeg;
+  d.rawPitchDeg = gState.attitude.pitchDeg;
+  d.rawYawDeg = gState.attitude.yawDeg;
+  d.accelTrusted = gState.attitude.accelTrusted;
+  d.corrRollDeg = gState.pid.correctedRollDeg;
+  d.corrPitchDeg = gState.pid.correctedPitchDeg;
+  d.targetRollDeg = gState.pid.angleRollSetpointDeg;
+  d.targetPitchDeg = gState.pid.anglePitchSetpointDeg;
+  d.targetYawRateDps = gState.pid.yawRateSetpointDps;
+  d.rollErrDeg = gState.pid.angleRollSetpointDeg - gState.pid.correctedRollDeg;
+  d.pitchErrDeg = gState.pid.anglePitchSetpointDeg - gState.pid.correctedPitchDeg;
+  d.accelG[0] = gState.imuSample.ax_g;
+  d.accelG[1] = gState.imuSample.ay_g;
+  d.accelG[2] = gState.imuSample.az_g;
+  d.gyroDps[0] = gState.imuSample.gx_dps;
+  d.gyroDps[1] = gState.imuSample.gy_dps;
+  d.gyroDps[2] = gState.imuSample.gz_dps;
+  d.magHeadingDeg = gState.imuSample.magHeadingDeg;
+  d.magFieldUt = gState.imuSample.magFieldUt;
+  d.magValid = gState.imuSample.magValid;
+  d.pidRoll[0] = gState.pid.rollTerms.proportional;
+  d.pidRoll[1] = gState.pid.rollTerms.integral;
+  d.pidRoll[2] = gState.pid.rollTerms.derivative;
+  d.pidRoll[3] = gState.pid.rollTerms.output;
+  d.pidRoll[4] = gState.pid.roll.integralState();
+  d.pidPitch[0] = gState.pid.pitchTerms.proportional;
+  d.pidPitch[1] = gState.pid.pitchTerms.integral;
+  d.pidPitch[2] = gState.pid.pitchTerms.derivative;
+  d.pidPitch[3] = gState.pid.pitchTerms.output;
+  d.pidPitch[4] = gState.pid.pitch.integralState();
+  d.pidYaw[0] = gState.pid.yawTerms.proportional;
+  d.pidYaw[1] = gState.pid.yawTerms.integral;
+  d.pidYaw[2] = gState.pid.yawTerms.derivative;
+  d.pidYaw[3] = gState.pid.yawTerms.output;
+  d.pidYaw[4] = gState.pid.yaw.integralState();
+  d.rateSpDps[0] = gState.pid.rollRateSetpointDps;
+  d.rateSpDps[1] = gState.pid.pitchRateSetpointDps;
+  d.rateSpDps[2] = gState.pid.yawRateSetpointDps;
+  d.satMin = gState.pid.mixerMinSat;
+  d.satMax = gState.pid.mixerMaxSat;
+  d.satScaled = gState.pid.mixerCorrScaled;
+  d.pidSat[0] = gState.pid.rollPidSat;
+  d.pidSat[1] = gState.pid.pitchPidSat;
+  d.pidSat[2] = gState.pid.yawPidSat;
+  d.mixBase = gState.pid.mixBase;
+  d.mixRoll = gState.pid.mixRoll;
+  d.mixPitchFront = gState.pid.mixPitchFront;
+  d.mixPitchRear = gState.pid.mixPitchRear;
+  d.mixYaw = gState.pid.mixYaw;
+  for (int i = 0; i < 4; ++i) {
+    d.mixUnclamped[i] = gState.pid.mixUnclamped[i];
+    d.motorRaw[i] = gState.motorRaw[i];
+  }
+  d.levelOffsetDeg[0] = gState.pid.levelRollOffsetDeg;
+  d.levelOffsetDeg[1] = gState.pid.levelPitchOffsetDeg;
+  d.trimDeg[0] = gState.pid.rollTrimDeg;
+  d.trimDeg[1] = gState.pid.pitchTrimDeg;
+  d.loopHz = gState.loopRate.lastHz;
+  d.imuReady = gState.imuReady;
+  const bool lvlActive = gLevelCal.active;
+  const bool lvlOk = gLevelCal.lastOk;
+  const uint8_t lvlErr = gLevelCal.lastError;
+  d.levelCalAccepted = gLevelCal.active ? gLevelCal.accepted : gLevelCal.lastSampleCount;
+  d.levelCalStdDeg[0] = gLevelCal.qualityRollStdDeg;
+  d.levelCalStdDeg[1] = gLevelCal.qualityPitchStdDeg;
+  portEXIT_CRITICAL(&gFlightMux);
+
+  d.accelMag = sqrtf(d.accelG[0] * d.accelG[0] + d.accelG[1] * d.accelG[1] +
+                     d.accelG[2] * d.accelG[2]);
+  d.accelOffG[0] = gCal.accel_off_x.load(std::memory_order_relaxed);
+  d.accelOffG[1] = gCal.accel_off_y.load(std::memory_order_relaxed);
+  d.accelOffG[2] = gCal.accel_off_z.load(std::memory_order_relaxed);
+  d.accelValid = gCal.accel_valid.load(std::memory_order_relaxed);
+  d.gyroBiasDps[0] = gGyroBias.gx_dps;
+  d.gyroBiasDps[1] = gGyroBias.gy_dps;
+  d.gyroBiasDps[2] = gGyroBias.gz_dps;
+  d.gyroBiasValid = gGyroBias.valid;
+  d.magCalValid = gCal.mag_valid.load(std::memory_order_relaxed);
+  d.mixBias = gMixPitchFrontBias.load(std::memory_order_relaxed);
+  d.levelLoaded = gLevelCorr.loaded.load(std::memory_order_relaxed);
+  d.levelCalState = lvlActive ? 1 : (lvlErr != LEVELCAL_ERR_NONE ? 3 : (lvlOk ? 2 : 0));
+  d.levelCalErr = lvlErr;
+
+  // ---- Control-mux: link + throttle ----
+  uint8_t throttle = 0;
+  portENTER_CRITICAL(&gControlMux);
+  throttle = gState.control.appliedThrottlePercent;
+  d.throttlePct = throttle;
+  d.controlLinkUp = gState.control.linkActive;
+  d.failsafeActive = gState.control.failsafeActive;
+  d.rcLossPercent = gState.control.lossPercent;
+  d.rcPacketsPerSec = gState.control.packetsPerSec;
+  portEXIT_CRITICAL(&gControlMux);
+  d.armed = (throttle > 0U) ||
+            (gFlightStatePublished.load(std::memory_order_relaxed) != flight_state::State::IDLE);
+  d.flightMode = static_cast<uint16_t>(gActiveFlightMode.load(std::memory_order_relaxed));
+
+  // ---- Sensor-mux: baro / tof / gps / battery ----
+  portENTER_CRITICAL(&gSensorMux);
+  d.baroReady = gState.baro.ready;
+  d.baroValid = gState.baro.valid;
+  d.baroPa = gState.baro.pressurePa;
+  d.baroAltM = gState.baro.relativeAltM;
+  d.baroTempC = gState.baro.temperatureC;
+  const uint32_t baroMs = gState.baro.lastUpdateMs;
+  d.tofReady = gState.tof.ready;
+  d.tofRanging = gState.tof.ranging;
+  d.tofMm = gState.tof.distanceMm;
+  const uint32_t tofMs = gState.tof.lastReadMs;
+  d.gpsReady = gState.gps.uartReady;
+  d.gpsFix = gState.gps.hasFix;
+  d.gpsSats = gState.gps.satellites;
+  d.gpsFixQual = gState.gps.fixQuality;
+  d.gpsLatE7 = gState.gps.latE7;
+  d.gpsLonE7 = gState.gps.lonE7;
+  const uint32_t gpsMs = gState.gps.lastSentenceMs;
+  d.gpsGroundSpeedValid = gState.gps.groundSpeedValid;
+  d.gpsCourseValid = gState.gps.courseValid;
+  d.gpsVelocityValid = gState.gps.velocityValid;
+  d.gpsGroundSpeedKmh10 = gState.gps.groundSpeedKmh10;
+  d.gpsCourseCentiDeg = gState.gps.courseCentiDeg;
+  d.gpsGroundSpeedMs = gState.gps.groundSpeedMs;
+  d.gpsCourseDeg = gState.gps.courseDeg;
+  d.gpsVelNorthMs = gState.gps.velNorthMs;
+  d.gpsVelEastMs = gState.gps.velEastMs;
+  const uint32_t gpsRmcMs = gState.gps.lastRmcMs;
+  d.battEnabled = gState.battery.enabled;
+  d.battVolts = gState.battery.volts;
+  d.battPercent = gState.battery.percent;
+  d.battLow = gState.battery.low;
+  portEXIT_CRITICAL(&gSensorMux);
+  d.baroAgeMs = ageMsSafe(now, baroMs);
+  d.tofAgeMs = ageMsSafe(now, tofMs);
+  d.gpsAgeMs = ageMsSafe(now, gpsMs);
+  d.gpsRmcAgeMs = ageMsSafe(now, gpsRmcMs);
+
+  // ---- Compiled-in feature flags ----
+  d.tofCompiled = (FCU_ENABLE_TOF != 0);
+  d.gpsCompiled = (FCU_ENABLE_GPS != 0);
+  d.piCompiled = (FCU_ENABLE_AUTONOMY_UART != 0);
+  d.piLinkAlive = gState.autonomy.linkAlive;
+  d.piHeartbeatAgeMs = gState.autonomy.heartbeatAgeMs;
+
+#if USE_ELRS_CRSF_CONTROL
+  d.crsfCompiled = true;
+  d.rcLinkUp = gCrsf.linkActive(now, CRSF_LINK_TIMEOUT_MS);
+  d.rcFailsafe = gCrsf.failsafeActive();
+  d.rcLq = gCrsf.uplinkLinkQuality();
+  d.rcRssiDbm = gCrsf.uplinkRssiDbm();
+  d.rcFrameRateHz = gCrsf.frameRateHz();
+  d.rcFrameAgeMs = gCrsf.frameAgeMs(now);
+  for (uint8_t i = 0; i < 8; ++i) d.rcChannelsUs[i] = gCrsf.channelMicros(i);
+#else
+  d.crsfCompiled = false;
+#endif
+
+#if ENABLE_EXPERIMENTAL_EKF
+  EkfDiagSnapshot ekfSnap;
+  portENTER_CRITICAL(&gFlightMux);
+  ekfSnap = gEkfDiag;
+  portEXIT_CRITICAL(&gFlightMux);
+  d.ekfReady = ekfSnap.ready;
+  d.ekfMeasDropped = gEkfMeasDropped.load(std::memory_order_relaxed);
+  d.ekfYawDeg = ekfSnap.yawDeg;
+  d.ekfVelNed[0] = ekfSnap.velNed[0];
+  d.ekfVelNed[1] = ekfSnap.velNed[1];
+  d.ekfVelNed[2] = ekfSnap.velNed[2];
+  d.ekfPosNed[0] = ekfSnap.posNed[0];
+  d.ekfPosNed[1] = ekfSnap.posNed[1];
+  d.ekfPosNed[2] = ekfSnap.posNed[2];
+  d.ekfAttValid = ekfSnap.attValid;
+  d.ekfPosValid = ekfSnap.posValid;
+  d.ekfVelValid = ekfSnap.velValid;
+  d.ekfGpsValid = ekfSnap.gpsValid;
+  d.ekfMagValid = ekfSnap.magValid;
+  d.ekfInnovationFault = ekfSnap.innovationFault;
+  d.ekfGpsInnov[0] = ekfSnap.gpsInnov[0];
+  d.ekfGpsInnov[1] = ekfSnap.gpsInnov[1];
+  d.ekfGpsInnov[2] = ekfSnap.gpsInnov[2];
+  d.ekfMagInnovDeg = ekfSnap.magInnovDeg;
+  d.ekfGpsAccept = ekfSnap.gpsAccept;
+  d.ekfGpsReject = ekfSnap.gpsReject;
+  d.ekfMagAccept = ekfSnap.magAccept;
+  d.ekfMagReject = ekfSnap.magReject;
+#endif
+
+#if USE_CAMERA_PAN_TILT
+  d.servoAttached = gCameraGimbal.attached();
+  d.panUs = gCameraGimbal.panMicros();
+  d.tiltUs = gCameraGimbal.tiltMicros();
+  d.panTargetUs = gCameraGimbal.panTargetMicros();
+  d.tiltTargetUs = gCameraGimbal.tiltTargetMicros();
+#endif
+}
+
+// Read-only calibration + level/trim detail for the Attitude & Level tab.
+void pidWebGetCalInfo(pid_webserver::CalInfo& c) {
+  c.levelOffsetDeg[0] = gLevelCorr.rollOffsetDeg.load(std::memory_order_relaxed);
+  c.levelOffsetDeg[1] = gLevelCorr.pitchOffsetDeg.load(std::memory_order_relaxed);
+  c.trimDeg[0] = gLevelCorr.rollTrimDeg.load(std::memory_order_relaxed);
+  c.trimDeg[1] = gLevelCorr.pitchTrimDeg.load(std::memory_order_relaxed);
+  c.levelLoaded = gLevelCorr.loaded.load(std::memory_order_relaxed);
+  bool act, ok; uint8_t err;
+  portENTER_CRITICAL(&gFlightMux);
+  act = gLevelCal.active;
+  ok = gLevelCal.lastOk;
+  err = gLevelCal.lastError;
+  c.levelCalStdDeg[0] = gLevelCal.qualityRollStdDeg;
+  c.levelCalStdDeg[1] = gLevelCal.qualityPitchStdDeg;
+  c.levelCalSamples = gLevelCal.lastSampleCount;
+  portEXIT_CRITICAL(&gFlightMux);
+  c.levelCalState = act ? 1 : (err != LEVELCAL_ERR_NONE ? 3 : (ok ? 2 : 0));
+  c.levelCalErr = err;
+  c.accelOffG[0] = gCal.accel_off_x.load(std::memory_order_relaxed);
+  c.accelOffG[1] = gCal.accel_off_y.load(std::memory_order_relaxed);
+  c.accelOffG[2] = gCal.accel_off_z.load(std::memory_order_relaxed);
+  c.accelValid = gCal.accel_valid.load(std::memory_order_relaxed);
+  c.gyroBiasDps[0] = gGyroBias.gx_dps;
+  c.gyroBiasDps[1] = gGyroBias.gy_dps;
+  c.gyroBiasDps[2] = gGyroBias.gz_dps;
+  c.gyroBiasValid = gGyroBias.valid;
+  c.magCalValid = gCal.mag_valid.load(std::memory_order_relaxed);
+  c.safe = pidWebWriteSafe();
+  c.maxOffsetDeg = LEVEL_CAL_MAX_OFFSET_DEG;
+  c.maxTrimDeg = LEVEL_TRIM_MAX_DEG;
+  c.trimStepDeg = LEVEL_TRIM_STEP_DEG;
+}
+
+// Persist the current (RAM) accel offset to NVS — explicit user action only;
+// the boot stationary cal no longer does this. Disarmed-gated.
+bool pidWebSaveAccelOffset() {
+  if (!pidWebWriteSafe() || !gPidNvs.ready()) return false;
+  fcu_nvs::FcuPidNvs::AccelOffset ao;
+  ao.x = gCal.accel_off_x.load(std::memory_order_relaxed);
+  ao.y = gCal.accel_off_y.load(std::memory_order_relaxed);
+  ao.z = gCal.accel_off_z.load(std::memory_order_relaxed);
+  ao.valid = gCal.accel_valid.load(std::memory_order_relaxed);
+  return ao.valid && gPidNvs.saveAccelOffset(ao);
+}
+
+bool pidWebClearAccelOffset() {
+  if (!pidWebWriteSafe() || !gPidNvs.ready()) return false;
+  const bool ok = gPidNvs.clearAccelOffset();
+  gCal.accel_off_x.store(0.0f, std::memory_order_relaxed);
+  gCal.accel_off_y.store(0.0f, std::memory_order_relaxed);
+  gCal.accel_off_z.store(0.0f, std::memory_order_relaxed);
+  gCal.accel_valid.store(false, std::memory_order_relaxed);
+  resetPidOutputs("accel_offset_clear");
+  return ok;
+}
+
+bool pidWebStartMagCalibration() {
+  if (!pidWebWriteSafe()) return false;
+  return magCaptureStart(millis());  // routed to the active source (ext/onboard)
+}
+
+bool pidWebFinishMagCalibration() {
+  if (!pidWebWriteSafe()) return false;
+  return magCaptureFinish();         // finishes whichever capture is active
+}
+
+#if ENABLE_PID_WEBSERVER || ENABLE_USB_CONFIG
+// ---- Magnetometer source selection + yaw-correction gain (Mag tab) ----------
+void pidWebGetMagConfig(pid_webserver::MagConfigSnapshot& c) {
+  c.extCompiled = (FCU_ENABLE_EXTERNAL_MAG != 0);
+  c.extEnabled = gMagExtEnabled.load(std::memory_order_relaxed);
+  c.onboardEnabled = gMagOnboardEnabled.load(std::memory_order_relaxed);
+  c.preferExternal = gMagPreferExternal.load(std::memory_order_relaxed);
+  c.yawCorrGain = gMagYawCorrGain.load(std::memory_order_relaxed);
+}
+
+bool pidWebSetMagConfig(bool extEnabled, bool onboardEnabled, bool preferExternal,
+                        float yawCorrGain) {
+  if (!pidWebWriteSafe()) return false;
+  if (!isfinite(yawCorrGain)) return false;
+  gMagExtEnabled.store(extEnabled, std::memory_order_relaxed);
+  gMagOnboardEnabled.store(onboardEnabled, std::memory_order_relaxed);
+  gMagPreferExternal.store(preferExternal, std::memory_order_relaxed);
+  gMagYawCorrGain.store(constrain(yawCorrGain, 0.0f, 1.0f), std::memory_order_relaxed);
+  return true;
+}
+
+bool pidWebSaveMagConfigToNvs() {
+  if (!pidWebWriteSafe()) return false;
+  fcu_nvs::FcuPidNvs::MagConfig c;
+  c.extEnabled = gMagExtEnabled.load(std::memory_order_relaxed);
+  c.onboardEnabled = gMagOnboardEnabled.load(std::memory_order_relaxed);
+  c.preferExternal = gMagPreferExternal.load(std::memory_order_relaxed);
+  c.yawCorrGain = gMagYawCorrGain.load(std::memory_order_relaxed);
+  return gPidNvs.ready() && gPidNvs.saveMagConfig(c);
+}
+#endif  // ENABLE_PID_WEBSERVER || ENABLE_USB_CONFIG
+
+// ===== Vibration / FFT / notch (dashboard backend) ==========================
+void pidWebGetNotchInfo(pid_webserver::NotchInfo& n) {
+#if ENABLE_DYNAMIC_NOTCH
+  n.dynamicCompiled = true;
+  n.enabled = !gDynamicNotch.runtimeBypass();
+  n.centerHz = gDynamicNotch.centerHz();
+  n.minHz = gNotchCfg.minFrequencyHz;
+  n.maxHz = gNotchCfg.maxFrequencyHz;
+  n.q = gNotchCfg.q;
+#else
+  n.dynamicCompiled = false;
+#endif
+  n.analysisRunning = gNotchAnalyzer.active();
+  n.analysisDone = gNotchAnalyzer.ready();
+  n.effectiveSampleHz = gNotchAnalyzer.effectiveHz();
+  n.sampleCount = gNotchAnalyzer.progress();
+  for (uint8_t a = 0; a < 3; ++a) {
+    n.peakHz[a] = gNotchAnalyzer.peakHz(a);
+    n.peakMag[a] = gNotchAnalyzer.peakMag(a);
+    n.noiseFloor[a] = gNotchAnalyzer.noiseFloor(a);
+  }
+  n.recommendCenterHz = gNotchAnalyzer.recCenterHz();
+  n.recommendQ = gNotchAnalyzer.recQ();
+  n.confidence = gNotchAnalyzer.recConfidence();
+}
+bool pidWebStartNotch() {
+  if (!pidWebWriteSafe()) return false;  // disarmed/bench only
+  gNotchAnalyzer.start();
+  return true;
+}
+bool pidWebStopNotch() { gNotchAnalyzer.stop(); return true; }
+uint16_t pidWebGetFft(uint8_t axis, uint8_t stage, float* out, uint16_t bins, float& hpb) {
+  return gNotchAnalyzer.getSpectrum(axis, stage, out, bins, hpb);
+}
+bool pidWebSetNotchEnabled(bool en) {
+#if ENABLE_DYNAMIC_NOTCH
+  if (!pidWebWriteSafe()) return false;
+  gDynamicNotch.setRuntimeBypass(!en);
+  return true;
+#else
+  (void)en; return false;
+#endif
+}
+bool pidWebApplyNotchTemp(float centerHz, float q) {
+#if ENABLE_DYNAMIC_NOTCH
+  if (!pidWebWriteSafe()) return false;
+  if (!(isfinite(centerHz) && isfinite(q))) return false;
+  q = constrain(q, 0.5f, 20.0f);
+  const float minHz = constrain(centerHz * 0.6f, 10.0f, 480.0f);
+  const float maxHz = constrain(centerHz * 1.7f, minHz + 5.0f, 500.0f);
+  DynamicNotchConfig cfg = gNotchCfg;
+  cfg.minFrequencyHz = minHz;
+  cfg.maxFrequencyHz = maxHz;
+  cfg.q = q;
+  portENTER_CRITICAL(&gFlightMux);
+  gNotchPendingCfg = cfg;
+  gNotchCfgDirty.store(true, std::memory_order_release);
+  portEXIT_CRITICAL(&gFlightMux);
+  gNotchCfg = cfg;  // mirror (applied on the next flight tick)
+  return true;
+#else
+  (void)centerHz; (void)q; return false;
+#endif
+}
+bool pidWebSaveNotch() {
+#if ENABLE_DYNAMIC_NOTCH
+  if (!pidWebWriteSafe() || !gPidNvs.ready()) return false;
+  fcu_nvs::FcuPidNvs::NotchConfig nc;
+  nc.minHz = gNotchCfg.minFrequencyHz;
+  nc.maxHz = gNotchCfg.maxFrequencyHz;
+  nc.q = gNotchCfg.q;
+  nc.enabled = !gDynamicNotch.runtimeBypass();
+  nc.valid = true;
+  return gPidNvs.saveNotchConfig(nc);
+#else
+  return false;
+#endif
+}
+bool pidWebReloadNotch() {
+#if ENABLE_DYNAMIC_NOTCH
+  if (!pidWebWriteSafe() || !gPidNvs.ready()) return false;
+  const auto nv = gPidNvs.loadNotchConfig();
+  if (!nv.valid) return false;
+  DynamicNotchConfig cfg = gNotchCfg;
+  cfg.minFrequencyHz = nv.minHz;
+  cfg.maxFrequencyHz = nv.maxHz;
+  cfg.q = nv.q;
+  portENTER_CRITICAL(&gFlightMux);
+  gNotchPendingCfg = cfg;
+  gNotchCfgDirty.store(true, std::memory_order_release);
+  portEXIT_CRITICAL(&gFlightMux);
+  gNotchCfg = cfg;
+  gDynamicNotch.setRuntimeBypass(!nv.enabled);
+  return true;
+#else
+  return false;
+#endif
+}
+
+// ===== Pan/tilt servos (dashboard backend) ==================================
+void pidWebGetServo(pid_webserver::ServoState& s) {
+#if USE_CAMERA_PAN_TILT
+  s.attached = gCameraGimbal.attached();
+  s.panUs = gCameraGimbal.panMicros();
+  s.tiltUs = gCameraGimbal.tiltMicros();
+  s.panTargetUs = gCameraGimbal.panTargetMicros();
+  s.tiltTargetUs = gCameraGimbal.tiltTargetMicros();
+  const auto& c = gCameraGimbal.config();
+  s.panMinUs = c.panMinUs;   s.panCenterUs = c.panCenterUs;   s.panMaxUs = c.panMaxUs;
+  s.tiltMinUs = c.tiltMinUs; s.tiltCenterUs = c.tiltCenterUs; s.tiltMaxUs = c.tiltMaxUs;
+  s.panInverted = gServoOverride.panInv.load(std::memory_order_relaxed);
+  s.tiltInverted = gServoOverride.tiltInv.load(std::memory_order_relaxed);
+  s.webOverrideActive = gServoOverride.active.load(std::memory_order_relaxed);
+#else
+  s.attached = false;
+#endif
+}
+#if USE_CAMERA_PAN_TILT
+static uint16_t clampServoUs(int v, uint16_t lo, uint16_t hi) {
+  if (v < static_cast<int>(lo)) v = lo;
+  if (v > static_cast<int>(hi)) v = hi;
+  return static_cast<uint16_t>(v);
+}
+static void servoSetTarget(uint16_t pan, uint16_t tilt) {
+  const auto& c = gCameraGimbal.config();
+  gServoOverride.panUs.store(clampServoUs(pan, c.panMinUs, c.panMaxUs), std::memory_order_relaxed);
+  gServoOverride.tiltUs.store(clampServoUs(tilt, c.tiltMinUs, c.tiltMaxUs), std::memory_order_relaxed);
+  gServoOverride.lastCmdMs.store(millis(), std::memory_order_relaxed);
+  gServoOverride.active.store(true, std::memory_order_relaxed);
+}
+#endif
+bool pidWebSetServoMicros(uint16_t pan, uint16_t tilt) {
+#if USE_CAMERA_PAN_TILT
+  if (!pidWebWriteSafe()) return false;
+  servoSetTarget(pan, tilt);
+  return true;
+#else
+  (void)pan; (void)tilt; return false;
+#endif
+}
+bool pidWebNudgeServo(int16_t dPan, int16_t dTilt) {
+#if USE_CAMERA_PAN_TILT
+  if (!pidWebWriteSafe()) return false;
+  // Accumulate on the current target; inversion flips the commanded direction so
+  // the on-screen "left/right/up/down" always matches the physical movement.
+  const int pan = gCameraGimbal.panTargetMicros() +
+                  (gServoOverride.panInv.load(std::memory_order_relaxed) ? -dPan : dPan);
+  const int tilt = gCameraGimbal.tiltTargetMicros() +
+                   (gServoOverride.tiltInv.load(std::memory_order_relaxed) ? -dTilt : dTilt);
+  servoSetTarget(static_cast<uint16_t>(pan < 0 ? 0 : pan),
+                 static_cast<uint16_t>(tilt < 0 ? 0 : tilt));
+  return true;
+#else
+  (void)dPan; (void)dTilt; return false;
+#endif
+}
+bool pidWebCenterServo(bool pan, bool tilt) {
+#if USE_CAMERA_PAN_TILT
+  if (!pidWebWriteSafe()) return false;
+  const auto& c = gCameraGimbal.config();
+  servoSetTarget(pan ? c.panCenterUs : gCameraGimbal.panTargetMicros(),
+                 tilt ? c.tiltCenterUs : gCameraGimbal.tiltTargetMicros());
+  return true;
+#else
+  (void)pan; (void)tilt; return false;
+#endif
+}
+bool pidWebStopServo() {
+#if USE_CAMERA_PAN_TILT
+  if (!pidWebWriteSafe()) return false;
+  servoSetTarget(gCameraGimbal.panMicros(), gCameraGimbal.tiltMicros());  // freeze at applied
+  return true;
+#else
+  return false;
+#endif
+}
+bool pidWebReleaseServo() {
+#if USE_CAMERA_PAN_TILT
+  gServoOverride.active.store(false, std::memory_order_relaxed);  // hand back to RC
+  return true;
+#else
+  return false;
+#endif
+}
+bool pidWebSaveServoConfig(uint16_t panMin, uint16_t panCenter, uint16_t panMax,
+                           uint16_t tiltMin, uint16_t tiltCenter, uint16_t tiltMax,
+                           bool panInv, bool tiltInv) {
+#if USE_CAMERA_PAN_TILT
+  if (!pidWebWriteSafe() || !gPidNvs.ready()) return false;
+  fcu_nvs::FcuPidNvs::ServoConfig sc;
+  sc.panMin = panMin; sc.panCenter = panCenter; sc.panMax = panMax;
+  sc.tiltMin = tiltMin; sc.tiltCenter = tiltCenter; sc.tiltMax = tiltMax;
+  sc.panInv = panInv; sc.tiltInv = tiltInv; sc.valid = true;
+  if (!gPidNvs.saveServoConfig(sc)) return false;
+  gCameraGimbal.applyLimits(panMin, panCenter, panMax, tiltMin, tiltCenter, tiltMax);
+  gServoOverride.panInv.store(panInv, std::memory_order_relaxed);
+  gServoOverride.tiltInv.store(tiltInv, std::memory_order_relaxed);
+  return true;
+#else
+  (void)panMin;(void)panCenter;(void)panMax;(void)tiltMin;(void)tiltCenter;(void)tiltMax;
+  (void)panInv;(void)tiltInv; return false;
+#endif
+}
+
+static uint32_t diagAgeMs(uint32_t nowMs, uint32_t lastMs) {
+  if (lastMs == 0U || nowMs < lastMs) return 0xFFFFFFFFU;
+  return nowMs - lastMs;
+}
+
+void pidWebGetCaptureStatus(pid_webserver::CaptureStatus& c) {
+  const DiagCapture::Status s = gDiagCapture.status();
+  c.active = s.active;
+  c.waitingForArm = s.waitingForArm;
+  c.hasData = s.hasData;
+  c.overflow = s.overflow;
+  c.samples = s.samples;
+  c.capacity = s.capacity;
+  c.effectiveHz = s.effectiveHz;
+  c.droppedSamples = s.droppedSamples;
+}
+
+bool pidWebStartCapture() {
+  if (!pidWebWriteSafe()) return false;
+  gDiagCapture.start(false);
+  return true;
+}
+
+bool pidWebArmTriggeredCapture() {
+  if (!pidWebWriteSafe()) return false;
+  gDiagCapture.start(true);
+  return true;
+}
+
+bool pidWebStopCapture() {
+  gDiagCapture.stop();
+  return true;
+}
+
+bool pidWebClearCapture() {
+  if (!pidWebWriteSafe()) return false;
+  gDiagCapture.clear();
+  return true;
+}
+
+uint32_t pidWebCaptureCsvChunk(uint32_t cursor, char* buf, uint32_t maxLen,
+                               uint32_t& nextCursor) {
+  return gDiagCapture.csvChunk(cursor, buf, maxLen, nextCursor);
+}
+
+void recordPidWebDiagCaptureTick(uint32_t nowMs) {
+  bool motorActive = false;
+  bool pidAllowFlight = false;
+  portENTER_CRITICAL(&gFlightMux);
+  motorActive = anyMotorOutputActive(gState.motorRaw) || gState.pid.armedIdleActive;
+  pidAllowFlight = gState.pid.prevAllowFlight;
+  portEXIT_CRITICAL(&gFlightMux);
+  const bool fsmIdle =
+      gFlightStatePublished.load(std::memory_order_relaxed) == flight_state::State::IDLE;
+  const bool armed = pidAllowFlight || motorActive || !fsmIdle;
+  if (!gDiagCapture.wantsTick(armed)) return;
+
+  DiagCapture::Row r;
+  r.tUs = micros();
+  r.flightMode = gActiveFlightMode.load(std::memory_order_relaxed);
+  r.failsafeReason = readFailsafeReason();
+  if (armed) r.flags |= DiagCapture::kFlagArmed;
+
+  portENTER_CRITICAL(&gControlMux);
+  const control_protocol::ControlPacket packet = gState.control.lastPacket;
+  r.throttleRxPct = packet.throttlePercent;
+  r.throttleAppliedPct = gState.control.appliedThrottlePercent;
+  r.rcLossPct = gState.control.lossPercent;
+  if (gState.control.linkActive) r.flags |= DiagCapture::kFlagRcLink;
+  if (gState.control.failsafeActive) r.flags |= DiagCapture::kFlagFailsafe;
+  r.rcFrameAgeMs = diagAgeMs(nowMs, gState.control.lastPacketMs);
+  portEXIT_CRITICAL(&gControlMux);
+
+  portENTER_CRITICAL(&gFlightMux);
+  r.loopDtUs = gState.pid.lastDtUs;
+  r.loopHz = gState.loopRate.lastHz;
+  if (gState.imuReady) r.flags |= DiagCapture::kFlagImuReady;
+  if (gState.imuSampleValid) r.flags |= DiagCapture::kFlagImuValid;
+  if (gState.attitude.accelTrusted) r.flags |= DiagCapture::kFlagAccelTrusted;
+  if (gState.pid.integratorFrozen) r.flags |= DiagCapture::kFlagIntegratorFrozen;
+  if (gState.pid.mixerMinSat) r.flags |= DiagCapture::kFlagMixerMinSat;
+  if (gState.pid.mixerMaxSat) r.flags |= DiagCapture::kFlagMixerMaxSat;
+  if (gState.pid.mixerCorrScaled) r.flags |= DiagCapture::kFlagMixerScaled;
+  r.imuFailGrace = gState.pid.imuFailGraceTicks;
+
+  r.accelBodyG[0] = gState.imuSample.ax_g;
+  r.accelBodyG[1] = gState.imuSample.ay_g;
+  r.accelBodyG[2] = gState.imuSample.az_g;
+  r.gyroPreFilterDps[0] = gState.pid.gyroPreFilterDps[0];
+  r.gyroPreFilterDps[1] = gState.pid.gyroPreFilterDps[1];
+  r.gyroPreFilterDps[2] = gState.pid.gyroPreFilterDps[2];
+  r.gyroPidDps[0] = gState.pid.gyroPidDps[0];
+  r.gyroPidDps[1] = gState.pid.gyroPidDps[1];
+  r.gyroPidDps[2] = gState.pid.gyroPidDps[2];
+  r.rawEulerDeg[0] = gState.attitude.rollDeg;
+  r.rawEulerDeg[1] = gState.attitude.pitchDeg;
+  r.rawEulerDeg[2] = gState.attitude.yawDeg;
+  r.correctedAttDeg[0] = gState.pid.correctedRollDeg;
+  r.correctedAttDeg[1] = gState.pid.correctedPitchDeg;
+  r.savedLevelDeg[0] = gState.pid.levelRollOffsetDeg;
+  r.savedLevelDeg[1] = gState.pid.levelPitchOffsetDeg;
+  r.manualTrimDeg[0] = gState.pid.rollTrimDeg;
+  r.manualTrimDeg[1] = gState.pid.pitchTrimDeg;
+  r.targetAttDeg[0] = gState.pid.angleRollSetpointDeg;
+  r.targetAttDeg[1] = gState.pid.anglePitchSetpointDeg;
+  r.rateSpDps[0] = gState.pid.rollRateSetpointDps;
+  r.rateSpDps[1] = gState.pid.pitchRateSetpointDps;
+  r.rateSpDps[2] = gState.pid.yawRateSetpointDps;
+  r.pidErr[0] = gState.pid.rollTerms.error;
+  r.pidErr[1] = gState.pid.pitchTerms.error;
+  r.pidErr[2] = gState.pid.yawTerms.error;
+  r.pidP[0] = gState.pid.rollTerms.proportional;
+  r.pidP[1] = gState.pid.pitchTerms.proportional;
+  r.pidP[2] = gState.pid.yawTerms.proportional;
+  r.pidI[0] = gState.pid.rollTerms.integral;
+  r.pidI[1] = gState.pid.pitchTerms.integral;
+  r.pidI[2] = gState.pid.yawTerms.integral;
+  r.pidD[0] = gState.pid.rollTerms.derivative;
+  r.pidD[1] = gState.pid.pitchTerms.derivative;
+  r.pidD[2] = gState.pid.yawTerms.derivative;
+  r.pidOut[0] = gState.pid.rollTerms.output;
+  r.pidOut[1] = gState.pid.pitchTerms.output;
+  r.pidOut[2] = gState.pid.yawTerms.output;
+  r.integratorState[0] = gState.pid.roll.integralState();
+  r.integratorState[1] = gState.pid.pitch.integralState();
+  r.integratorState[2] = gState.pid.yaw.integralState();
+  r.mixBase = gState.pid.mixBase;
+  r.mixRoll = gState.pid.mixRoll;
+  r.mixPitchFront = gState.pid.mixPitchFront;
+  r.mixPitchRear = gState.pid.mixPitchRear;
+  r.mixYaw = gState.pid.mixYaw;
+  for (uint8_t i = 0; i < 4; ++i) {
+    r.mixUnclamped[i] = gState.pid.mixUnclamped[i];
+    r.motorCmd[i] = gState.motorRaw[i];
+    r.motorAccepted[i] = gState.motorAcceptedRaw[i];
+  }
+  r.motorWriteOkMask = gState.motorWriteOkMask;
+  const bool levelActive = gLevelCal.active;
+  const bool levelOk = gLevelCal.lastOk;
+  const uint8_t levelErr = gLevelCal.lastError;
+  r.levelCalSamples = levelActive ? gLevelCal.accepted : gLevelCal.lastSampleCount;
+  portEXIT_CRITICAL(&gFlightMux);
+
+  r.accelOffsetG[0] = gCal.accel_off_x.load(std::memory_order_relaxed);
+  r.accelOffsetG[1] = gCal.accel_off_y.load(std::memory_order_relaxed);
+  r.accelOffsetG[2] = gCal.accel_off_z.load(std::memory_order_relaxed);
+  r.accelRawG[0] = r.accelBodyG[0] + r.accelOffsetG[0];
+  r.accelRawG[1] = r.accelBodyG[1] + r.accelOffsetG[1];
+  r.accelRawG[2] = r.accelBodyG[2] + r.accelOffsetG[2];
+  r.accelMagG = sqrtf(r.accelBodyG[0] * r.accelBodyG[0] +
+                      r.accelBodyG[1] * r.accelBodyG[1] +
+                      r.accelBodyG[2] * r.accelBodyG[2]);
+  r.gyroBiasDps[0] = gGyroBias.gx_dps;
+  r.gyroBiasDps[1] = gGyroBias.gy_dps;
+  r.gyroBiasDps[2] = gGyroBias.gz_dps;
+  r.gyroRawDps[0] = r.gyroPreFilterDps[0] + r.gyroBiasDps[0];
+  r.gyroRawDps[1] = r.gyroPreFilterDps[1] + r.gyroBiasDps[1];
+  r.gyroRawDps[2] = r.gyroPreFilterDps[2] + r.gyroBiasDps[2];
+  if (gLevelCorr.loaded.load(std::memory_order_relaxed)) r.flags |= DiagCapture::kFlagLevelLoaded;
+  r.levelCalState = levelActive ? 1 : (levelErr != LEVELCAL_ERR_NONE ? 3 : (levelOk ? 2 : 0));
+  r.levelCalError = levelErr;
+
+#if USE_ELRS_CRSF_CONTROL
+  r.rcLq = gCrsf.uplinkLinkQuality();
+  r.rcRssiDbm = gCrsf.uplinkRssiDbm();
+  r.rcFrameRateHz = gCrsf.frameRateHz();
+  r.rcFrameAgeMs = gCrsf.frameAgeMs(nowMs);
+  for (uint8_t i = 0; i < 8; ++i) r.rcChannelsUs[i] = gCrsf.channelMicros(i);
+#endif
+
+  const SensorSnapshot sensorSnap = readSensorSnapshot();
+  r.baroAgeMs = diagAgeMs(nowMs, sensorSnap.baro.lastUpdateMs);
+  r.tofAgeMs = diagAgeMs(nowMs, sensorSnap.tof.lastReadMs);
+  r.tofMm = sensorSnap.tof.distanceMm;
+  r.gpsAgeMs = diagAgeMs(nowMs, sensorSnap.gpsLastSentenceMs);
+  r.gpsSats = sensorSnap.gpsSatellites;
+  r.gpsFixQuality = sensorSnap.gpsFixQuality;
+  r.piHeartbeatAgeMs = gState.autonomy.heartbeatAgeMs;
+  r.battVolts = sensorSnap.battery.volts;
+  r.battPct = sensorSnap.battery.percent;
+
+  gDiagCapture.tick(r, armed);
+}
+
 void publishPidWebSafety() {
   uint8_t throttle = 0;
   portENTER_CRITICAL(&gControlMux);
@@ -4640,14 +7499,18 @@ void publishPidWebSafety() {
   portENTER_CRITICAL(&gFlightMux);
   benchActionBusy = gGyroCal.active || gGyroCal.requested ||
                     (gMotorSpin.requestedMotor != 0U) ||
-                    (gMotorSpin.activeMotor != 0U);
+                    (gMotorSpin.activeMotor != 0U)
+#if ENABLE_USB_CONFIG
+                    || gConfigMotorTest.sessionArmed || gConfigMotorTest.active
+#endif
+                    ;
   portEXIT_CRITICAL(&gFlightMux);
   pid_webserver::publishSafety(throttle == 0U,
-                               (gFlightSm.state() != flight_state::State::IDLE) ||
+                               (gFlightStatePublished.load(std::memory_order_relaxed) != flight_state::State::IDLE) ||
                                benchActionBusy);
 }
 
-void initPidWebserver() {
+pid_webserver::Callbacks buildConfiguratorCallbacks() {
   pid_webserver::Callbacks cbs;
   cbs.getPid = pidWebGetPid;
   cbs.applyPid = pidWebApplyPid;
@@ -4659,19 +7522,83 @@ void initPidWebserver() {
   cbs.getMixPitchFrontBias = pidWebGetMixBias;
   cbs.setMixPitchFrontBias = pidWebSetMixBias;
   cbs.saveMixPitchFrontBiasToNvs = pidWebSaveMixBiasToNvs;
+  cbs.getMagTrimDeg = pidWebGetMagTrim;
+  cbs.setMagTrimDeg = pidWebSetMagTrim;
+  cbs.saveMagTrimDegToNvs = pidWebSaveMagTrimToNvs;
+  cbs.setFailsafeBypass = pidWebSetFailsafeBypass;
+  cbs.saveFailsafeBypassToNvs = pidWebSaveFailsafeBypassToNvs;
   cbs.getState = pidWebGetState;
   cbs.getHealth = pidWebGetHealth;
   cbs.getTune = pidWebGetTune;
+  // Live dashboard + persistent level/trim calibration.
+  cbs.getDashTelemetry = pidWebGetDash;
+  cbs.getCalInfo = pidWebGetCalInfo;
+  cbs.calibrateLevel = requestLevelCalibration;
+  cbs.applyLevelOffset = pidWebApplyLevelOffset;
+  cbs.applyTrim = pidWebApplyTrim;
+  cbs.saveLevelToNvs = pidWebSaveLevelToNvs;
+  cbs.reloadLevelFromNvs = pidWebReloadLevelFromNvs;
+  cbs.clearLevel = pidWebClearLevel;
+  cbs.resetTrim = pidWebResetTrim;
+  cbs.restoreLevelPrev = pidWebRestoreLevelPrev;
+  cbs.saveAccelOffset = pidWebSaveAccelOffset;
+  cbs.clearAccelOffset = pidWebClearAccelOffset;
+  cbs.startMagCalibration = pidWebStartMagCalibration;
+  cbs.finishMagCalibration = pidWebFinishMagCalibration;
+  // Vibration / FFT / notch.
+  cbs.getNotchInfo = pidWebGetNotchInfo;
+  cbs.startNotchAnalysis = pidWebStartNotch;
+  cbs.stopNotchAnalysis = pidWebStopNotch;
+  cbs.getFftSpectrum = pidWebGetFft;
+  cbs.applyNotchTemp = pidWebApplyNotchTemp;
+  cbs.saveNotchToNvs = pidWebSaveNotch;
+  cbs.reloadNotchFromNvs = pidWebReloadNotch;
+  cbs.setNotchEnabled = pidWebSetNotchEnabled;
+  // Pan/tilt servos.
+  cbs.getServo = pidWebGetServo;
+  cbs.setServoMicros = pidWebSetServoMicros;
+  cbs.nudgeServo = pidWebNudgeServo;
+  cbs.centerServo = pidWebCenterServo;
+  cbs.stopServo = pidWebStopServo;
+  cbs.saveServoConfig = pidWebSaveServoConfig;
+  cbs.releaseServoOverride = pidWebReleaseServo;
+  // Diagnostic capture.
+  cbs.getCaptureStatus = pidWebGetCaptureStatus;
+  cbs.startCapture = pidWebStartCapture;
+  cbs.armTriggeredCapture = pidWebArmTriggeredCapture;
+  cbs.stopCapture = pidWebStopCapture;
+  cbs.clearCapture = pidWebClearCapture;
+  cbs.captureCsvChunk = pidWebCaptureCsvChunk;
+  return cbs;
+}
+
+#if ENABLE_PID_WEBSERVER
+void initPidWebserver() {
+  pid_webserver::Callbacks cbs = buildConfiguratorCallbacks();
   pid_webserver::registerCallbacks(cbs);
+  // Shared-secret token required on every mutating HTTP request. Sourced from
+  // the gitignored pidweb_secrets.h, never from committed config.
+  pid_webserver::setAuthToken(FCU_PID_AUTH_TOKEN);
   publishPidWebSafety();
+
+#if FCU_DISABLE_FAILSAFES
+  Serial.println("[PIDWEB] ************************************************************");
+  Serial.println("[PIDWEB] *  BENCH-ONLY IMAGE — FAILSAFES DISABLED — DO NOT FLY.    *");
+  Serial.println("[PIDWEB] ************************************************************");
+#endif
 
   if (FCU_PID_WIFI_SSID[0] == '\0') {
     Serial.println("[PIDWEB] ENABLE_PID_WEBSERVER=1 but FCU_PID_WIFI_SSID is empty; webserver not started");
     return;
   }
+  if (FCU_PID_AUTH_TOKEN[0] == '\0') {
+    Serial.println("[PIDWEB] FCU_PID_AUTH_TOKEN is empty; refusing to start an unauthenticated mutation API");
+    return;
+  }
   (void)pid_webserver::start(FCU_PID_WIFI_SSID, FCU_PID_WIFI_PASS,
                              static_cast<uint32_t>(FCU_PID_WIFI_TIMEOUT_MS));
 }
+#endif
 #endif
 
 bool ensureSingleEscArmed(uint8_t index, esc::EasyEscMotor& motor, bool& readyFlag) {
@@ -4691,15 +7618,13 @@ bool ensureSingleEscArmed(uint8_t index, esc::EasyEscMotor& motor, bool& readyFl
   const uint32_t nowMs = millis();
   if (nowMs - lastRearmLogMs >= 500U) {
     lastRearmLogMs = nowMs;
-    if (serialHasRoom(96)) {
-      Serial.printf("[ESC] rearm motor=%u arm=%u zero=%u armed=%u status=%u\n",
+    {
+      fcu_log::logf(fcu_log::Level::Error, "[ESC] rearm motor=%u arm=%u zero=%u armed=%u status=%u\n",
                     static_cast<unsigned>(index),
                     static_cast<unsigned>(armOk),
                     static_cast<unsigned>(zeroOk),
                     static_cast<unsigned>(motor.isArmed()),
                     static_cast<unsigned>(motor.lastStatus()));
-    } else {
-      noteSerialBackpressure(false);
     }
   }
   return readyFlag;
@@ -4723,14 +7648,24 @@ void applyMotorOutputs(const std::array<uint16_t, 4>& raw) {
   const bool ok2 = armed2 && gMotor2.spinRaw(raw[2]);
   const bool ok3 = armed3 && gMotor3.spinRaw(raw[3]);
   const bool ok = ok0 && ok1 && ok2 && ok3;
+  // Record what each ESC actually accepted (vs the commanded gState.motorRaw set
+  // above); hold the last accepted value on a failed write. (F10)
+  portENTER_CRITICAL(&gFlightMux);
+  if (ok0) gState.motorAcceptedRaw[0] = raw[0];
+  if (ok1) gState.motorAcceptedRaw[1] = raw[1];
+  if (ok2) gState.motorAcceptedRaw[2] = raw[2];
+  if (ok3) gState.motorAcceptedRaw[3] = raw[3];
+  gState.motorWriteOkMask = static_cast<uint8_t>(
+      (ok0 ? 0x1 : 0) | (ok1 ? 0x2 : 0) | (ok2 ? 0x4 : 0) | (ok3 ? 0x8 : 0));
+  portEXIT_CRITICAL(&gFlightMux);
   if (!ok) {
     gState.zeroSendFailCount++;
     static uint32_t lastEscWriteFailLogMs = 0;
     const uint32_t nowMs = millis();
     if (nowMs - lastEscWriteFailLogMs >= 500U) {
       lastEscWriteFailLogMs = nowMs;
-      if (serialHasRoom(256)) {
-        Serial.printf("[ESC] throttle write failed ok=%u/%u/%u/%u armed=%u/%u/%u/%u status=%u/%u/%u/%u raw=%u/%u/%u/%u\n",
+      {
+        fcu_log::logf(fcu_log::Level::Error, "[ESC] throttle write failed ok=%u/%u/%u/%u armed=%u/%u/%u/%u status=%u/%u/%u/%u raw=%u/%u/%u/%u\n",
                       static_cast<unsigned>(ok0),
                       static_cast<unsigned>(ok1),
                       static_cast<unsigned>(ok2),
@@ -4747,23 +7682,27 @@ void applyMotorOutputs(const std::array<uint16_t, 4>& raw) {
                       static_cast<unsigned>(raw[1]),
                       static_cast<unsigned>(raw[2]),
                       static_cast<unsigned>(raw[3]));
-      } else {
-        noteSerialBackpressure(false);
       }
     }
   }
 }
 
 // [MOTOR MODULE] — declared in include/motor_module.h
-void forceMotorStop() {
+// TRANSITION-ONLY (see motor_module.h): disarm, failsafe, touchdown, explicit
+// stop, fatal init. Never the response to "throttle stick is low while armed".
+void forceMotorStop(const char* reason) {
   portENTER_CRITICAL(&gControlMux);
   gState.control.appliedThrottlePercent = 0;
   portEXIT_CRITICAL(&gControlMux);
 
   portENTER_CRITICAL(&gFlightMux);
   gState.motorRaw = {0, 0, 0, 0};
-  resetPidOutputs();
+  resetPidOutputs(reason);
   portEXIT_CRITICAL(&gFlightMux);
+  // Motors stopped => the airborne heuristic must drop (its updater lives in
+  // the armed mixing path and would otherwise latch stale across a disarm).
+  // Logging-only flag; mid-air failsafe stops clearing it is acceptable.
+  gAirborneLikely = false;
 
   const bool attempted = gMotor0.isInitialized() || gMotor1.isInitialized() ||
                          gMotor2.isInitialized() || gMotor3.isInitialized();
@@ -4779,7 +7718,7 @@ void forceMotorStop() {
   }
 }
 
-#if ENABLE_PID_WEBSERVER
+#if ENABLE_PID_WEBSERVER || ENABLE_USB_CONFIG
 bool servicePidWebMotorSpin(uint32_t nowMs) {
   uint8_t motor = 0;
   uint32_t startedMs = 0;
@@ -4807,8 +7746,8 @@ bool servicePidWebMotorSpin(uint32_t nowMs) {
   }
 
   if (completed) {
-    forceMotorStop();
-    Serial.printf("[MOTOR_TEST] complete M%u\n", static_cast<unsigned>(motor));
+    forceMotorStop("motor_test_complete");
+    fcu_log::logf(fcu_log::Level::Info, "[MOTOR_TEST] complete M%u\n", static_cast<unsigned>(motor));
     return true;
   }
 
@@ -4820,13 +7759,13 @@ bool servicePidWebMotorSpin(uint32_t nowMs) {
   portEXIT_CRITICAL(&gControlMux);
 
   if (!gState.escReady || escStartupSettleActive(nowMs) || throttle != 0U ||
-      failsafe || gFlightSm.state() != flight_state::State::IDLE) {
+      failsafe || gFlightStatePublished.load(std::memory_order_relaxed) != flight_state::State::IDLE) {
     portENTER_CRITICAL(&gFlightMux);
     gMotorSpin.activeMotor = 0U;
     gMotorSpin.requestedMotor = 0U;
     portEXIT_CRITICAL(&gFlightMux);
-    forceMotorStop();
-    Serial.printf("[MOTOR_TEST] aborted M%u\n", static_cast<unsigned>(motor));
+    forceMotorStop("motor_test_abort");
+    fcu_log::logf(fcu_log::Level::Info, "[MOTOR_TEST] aborted M%u\n", static_cast<unsigned>(motor));
     return true;
   }
 
@@ -4835,13 +7774,72 @@ bool servicePidWebMotorSpin(uint32_t nowMs) {
   applyMotorOutputs(raw);
 
   if (justStarted) {
-    Serial.printf("[MOTOR_TEST] spinning M%u raw=%u duration=%lums\n",
+    fcu_log::logf(fcu_log::Level::Info, "[MOTOR_TEST] spinning M%u raw=%u duration=%lums\n",
                   static_cast<unsigned>(motor),
                   static_cast<unsigned>(PIDWEB_MOTOR_TEST_RAW),
                   static_cast<unsigned long>(PIDWEB_MOTOR_TEST_MS));
   }
   return true;
 }
+
+#if ENABLE_USB_CONFIG
+bool serviceConfiguratorMotorTest(uint32_t nowMs) {
+  bool sessionArmed = false;
+  bool active = false;
+  uint8_t motorMask = 0;
+  uint16_t rawValue = 0;
+  uint32_t outputDeadline = 0;
+  uint32_t sessionDeadline = 0;
+
+  portENTER_CRITICAL(&gFlightMux);
+  sessionArmed = gConfigMotorTest.sessionArmed;
+  active = gConfigMotorTest.active;
+  motorMask = gConfigMotorTest.motorMask;
+  rawValue = gConfigMotorTest.raw;
+  outputDeadline = gConfigMotorTest.outputDeadlineMs;
+  sessionDeadline = gConfigMotorTest.sessionDeadlineMs;
+  portEXIT_CRITICAL(&gFlightMux);
+
+  if (!sessionArmed) {
+    return false;
+  }
+
+  const bool sessionTimedOut = static_cast<int32_t>(nowMs - sessionDeadline) >= 0;
+  const bool outputTimedOut = active && static_cast<int32_t>(nowMs - outputDeadline) >= 0;
+  const bool unsafe = !configuratorMotorTestSafe(nowMs, false);
+  if (sessionTimedOut || outputTimedOut || unsafe) {
+    portENTER_CRITICAL(&gFlightMux);
+    gConfigMotorTest.sessionArmed = false;
+    gConfigMotorTest.active = false;
+    gConfigMotorTest.motorMask = 0;
+    gConfigMotorTest.raw = 0;
+    gConfigMotorTest.abortCount++;
+    gConfigMotorTest.lastAbortReason = sessionTimedOut ? 1U : (outputTimedOut ? 2U : 3U);
+    portEXIT_CRITICAL(&gFlightMux);
+    forceMotorStop(sessionTimedOut ? "config_motor_test_session_timeout" :
+                   (outputTimedOut ? "config_motor_test_output_timeout" :
+                    "config_motor_test_unsafe"));
+    fcu_log::logf(fcu_log::Level::Warn,
+                  "[MOTOR_TEST] USB deadman stopped reason=%s\n",
+                  sessionTimedOut ? "session_timeout" :
+                  (outputTimedOut ? "output_timeout" : "unsafe"));
+    return true;
+  }
+
+  if (!active) {
+    return true;
+  }
+
+  std::array<uint16_t, 4> raw = {0, 0, 0, 0};
+  for (uint8_t i = 0; i < 4; ++i) {
+    if ((motorMask & (1U << i)) != 0U) {
+      raw[i] = rawValue;
+    }
+  }
+  applyMotorOutputs(raw);
+  return true;
+}
+#endif
 #endif
 
 const char* failsafeReasonText(uint8_t reason) {
@@ -4891,7 +7889,7 @@ void beginFailsafeSoftRelease(uint8_t reason, uint32_t nowMs) {
     gState.softStop.reason = reason;
     startRaw = gState.softStop.startRaw;
   }
-  resetPidOutputs();
+  resetPidOutputs("failsafe_soft_release");
   gState.pid.smoothedThrottlePct = 0.0f;
   gState.pid.smoothedThrottleInit = true;
   portEXIT_CRITICAL(&gFlightMux);
@@ -4901,12 +7899,12 @@ void beginFailsafeSoftRelease(uint8_t reason, uint32_t nowMs) {
   portEXIT_CRITICAL(&gControlMux);
 
   if (!alreadyActive && !anyMotorOutputActive(startRaw)) {
-    forceMotorStop();
+    forceMotorStop("failsafe_motors_idle");
     return;
   }
 
   if (!alreadyActive) {
-    Serial.printf("[CTRL] failsafe soft release start: %s raw=%u/%u/%u/%u ramp=%lums dwell=%lums\n",
+    fcu_log::logf(fcu_log::Level::Warn, "[CTRL] failsafe soft release start: %s raw=%u/%u/%u/%u ramp=%lums dwell=%lums\n",
                   failsafeReasonText(reason),
                   static_cast<unsigned>(startRaw[0]),
                   static_cast<unsigned>(startRaw[1]),
@@ -4932,8 +7930,8 @@ bool serviceFailsafeSoftRelease(uint32_t nowMs) {
     portENTER_CRITICAL(&gFlightMux);
     gState.softStop.active = false;
     portEXIT_CRITICAL(&gFlightMux);
-    forceMotorStop();
-    Serial.printf("[CTRL] failsafe soft release complete: %s\n",
+    forceMotorStop("failsafe_release_complete");
+    fcu_log::logf(fcu_log::Level::Warn, "[CTRL] failsafe soft release complete: %s\n",
                   failsafeReasonText(soft.reason));
     return true;
   }
@@ -4981,14 +7979,14 @@ bool handleFailsafeClearRequest(const control_protocol::ControlPacket& packet, u
   if (packet.throttlePercent != 0) {
     if (nowMs - lastRejectLogMs >= 500U) {
       lastRejectLogMs = nowMs;
-      Serial.println("[CTRL] failsafe clear rejected: throttle is not zero");
+      fcu_log::logf(fcu_log::Level::Warn, "[CTRL] failsafe clear rejected: throttle is not zero\n");
     }
     return false;
   }
   if (!failsafeClearSafeToAccept()) {
     if (nowMs - lastRejectLogMs >= 500U) {
       lastRejectLogMs = nowMs;
-      Serial.println("[CTRL] failsafe clear rejected: soft release still active");
+      fcu_log::logf(fcu_log::Level::Warn, "[CTRL] failsafe clear rejected: soft release still active\n");
     }
     return false;
   }
@@ -5018,10 +8016,10 @@ bool handleFailsafeClearRequest(const control_protocol::ControlPacket& packet, u
   gState.altitude.errorMm = 0;
   gState.pid.smoothedThrottlePct = 0.0f;
   gState.pid.smoothedThrottleInit = true;
-  resetPidOutputs();
+  resetPidOutputs("failsafe_clear");
   portEXIT_CRITICAL(&gFlightMux);
 
-  Serial.printf("[CTRL] failsafe clear accepted%s: %s\n",
+  fcu_log::logf(fcu_log::Level::Warn, "[CTRL] failsafe clear accepted%s: %s\n",
                 hadFailsafe ? "" : " (no active latch)",
                 failsafeReasonText(oldReason));
   return true;
@@ -5071,7 +8069,7 @@ void processControlPacket(const control_protocol::ControlPacket& packet, uint32_
   // Any valid control packet refreshes the link, including non-flight
   // zero-throttle heartbeats from the remote.
   bool failsafeLatched = false;
-  if (!ALL_FAILSAFES_DISABLED) {
+  if (!failsafesBypassed()) {
     portENTER_CRITICAL(&gFailsafeMux);
     failsafeLatched = gFailsafe.active() ||
                       (gState.failsafeReason != control_protocol::kFailsafeNone);
@@ -5190,7 +8188,7 @@ void processControlPacket(const control_protocol::ControlPacket& packet, uint32_
   portEXIT_CRITICAL(&gFlightMux);
 
   if (savePerformed) {
-    Serial.printf("[NVS] saved PID field %u = %d (from remote)\n",
+    fcu_log::logf(fcu_log::Level::Info, "[NVS] saved PID field %u = %d (from remote)\n",
                   static_cast<unsigned>(saveFieldIndex),
                   static_cast<int>(saveFieldValue));
   }
@@ -5202,7 +8200,7 @@ void processControlPacket(const control_protocol::ControlPacket& packet, uint32_
 
   if (control_protocol::flagIsSet(packet.flags, control_protocol::kFlagImuCalibrateRequest)) {
     // TODO: connect this request to the final IMU calibration routine when available.
-    Serial.println("[CTRL] IMU calibration requested");
+    fcu_log::logf(fcu_log::Level::Info, "[CTRL] IMU calibration requested\n");
   }
 }
 
@@ -5423,7 +8421,8 @@ void buildAndDispatchIbusControlPacket(uint32_t nowMs) {
   // default, which matches stickYPercent semantics — no inversion needed.
   packet.stickYPercent = microsToSignedPercent(pitchUs);
   packet.throttlePercent = microsToThrottlePercent(throttleUs);
-  gIbusYawStickPercent = microsToSignedPercent(yawUs);
+  gIbusYawStickPercent.store(static_cast<int8_t>(microsToSignedPercent(yawUs)),
+                             std::memory_order_relaxed);
 
   // Switch states with hysteresis. Persist across calls so a stick wiggle
   // near the threshold doesn't strobe the flag bit.
@@ -5452,15 +8451,15 @@ void buildAndDispatchIbusControlPacket(uint32_t nowMs) {
       gMagCal.start(nowMs);
       gMagCalActive.store(true, std::memory_order_relaxed);
       magCalHoldStartMs = 0;
-      Serial.println("[CAL][MAG] capture STARTED — rotate the airframe through all "
-                     "orientations for ~30s (figure-8, all axes). Flip SwD low to finish.");
+      fcu_log::logf(fcu_log::Level::Info, "[CAL][MAG] capture STARTED — rotate the airframe through all "
+                     "orientations for ~30s (figure-8, all axes). Flip SwD low to finish.\n");
     }
   } else if (!wantMagCalGesture && gMagCalActive.load(std::memory_order_relaxed)) {
     // SwD released → finish the capture and save if valid.
     gMagCalActive.store(false, std::memory_order_relaxed);
     if (gMagCal.finish()) {
       const auto& r = gMagCal.result();
-      Serial.printf("[CAL][MAG] capture COMPLETE samples=%u  hard=%+.2f/%+.2f/%+.2f uT  "
+      fcu_log::logf(fcu_log::Level::Info, "[CAL][MAG] capture COMPLETE samples=%u  hard=%+.2f/%+.2f/%+.2f uT  "
                     "scale=%.3f/%.3f/%.3f  range=%.1f/%.1f/%.1f uT\n",
                     static_cast<unsigned>(r.samples),
                     static_cast<double>(r.hard_iron_uT.x),
@@ -5485,13 +8484,13 @@ void buildAndDispatchIbusControlPacket(uint32_t nowMs) {
         m.scale_x = r.scale.x; m.scale_y = r.scale.y; m.scale_z = r.scale.z;
         m.valid = true;
         if (gPidNvs.saveMagCalibration(m)) {
-          Serial.println("[CAL][MAG] saved to NVS");
+          fcu_log::logf(fcu_log::Level::Info, "[CAL][MAG] saved to NVS\n");
         } else {
-          Serial.println("[CAL][MAG][WARN] NVS save FAILED");
+          fcu_log::logf(fcu_log::Level::Error, "[CAL][MAG][WARN] NVS save FAILED\n");
         }
       }
     } else {
-      Serial.printf("[CAL][MAG] capture ABORTED samples=%u (need rotation through all axes)\n",
+      fcu_log::logf(fcu_log::Level::Warn, "[CAL][MAG] capture ABORTED samples=%u (need rotation through all axes)\n",
                     static_cast<unsigned>(gMagCal.result().samples));
     }
     magCalHoldStartMs = 0;
@@ -5505,7 +8504,7 @@ void buildAndDispatchIbusControlPacket(uint32_t nowMs) {
   // in the flight loop based on the atomic gActiveFlightMode value.
   const flight_modes::FlightMode newMode = flight_modes::decodeModeSwitch(modeUs);
   if (newMode != gIbusBridge.lastMode) {
-    Serial.printf("[MODE] %s -> %s (ch6=%u us)\n",
+    fcu_log::logf(fcu_log::Level::Info, "[MODE] %s -> %s (ch6=%u us)\n",
                   flight_modes::name(gIbusBridge.lastMode),
                   flight_modes::name(newMode),
                   static_cast<unsigned>(modeUs));
@@ -5517,7 +8516,7 @@ void buildAndDispatchIbusControlPacket(uint32_t nowMs) {
   static bool rthSwitchPrev = false;
   if (gIbusBridge.rthSwitchHigh && !rthSwitchPrev) {
     gRthRequested.store(true, std::memory_order_relaxed);
-    Serial.println("[MODE] RTH requested (CH7 rising edge)");
+    fcu_log::logf(fcu_log::Level::Warn, "[MODE] RTH requested (CH7 rising edge)\n");
   } else if (!gIbusBridge.rthSwitchHigh && rthSwitchPrev) {
     // Falling edge → abort RTH if running.
     gRthRequested.store(false, std::memory_order_relaxed);
@@ -5532,7 +8531,7 @@ void buildAndDispatchIbusControlPacket(uint32_t nowMs) {
         gIbusBridge.throttleZeroSinceMs = nowMs;
       } else if ((nowMs - gIbusBridge.throttleZeroSinceMs) >= kIbusSafeBootHoldMs) {
         gIbusBridge.safeBootLatched = true;
-        Serial.println("[IBUS] safe-boot complete (throttle zero held)");
+        fcu_log::logf(fcu_log::Level::Info, "[IBUS] safe-boot complete (throttle zero held)\n");
       }
     } else {
       gIbusBridge.throttleZeroSinceMs = 0;
@@ -5593,7 +8592,7 @@ void buildAndDispatchIbusControlPacket(uint32_t nowMs) {
                   static_cast<int>(packet.stickXPercent),
                   static_cast<int>(packet.stickYPercent),
                   static_cast<unsigned>(packet.throttlePercent),
-                  static_cast<int>(gIbusYawStickPercent),
+                  static_cast<int>(gIbusYawStickPercent.load(std::memory_order_relaxed)),
                   static_cast<unsigned>(gIbusBridge.armSwitchHigh),
                   flight_modes::name(gIbusBridge.lastMode),
                   static_cast<unsigned>(gIbusBridge.rthSwitchHigh),
@@ -5623,7 +8622,7 @@ void ibusControlTask(void* /*arg*/) {
       if (!linkUpLogged) {
         linkUpLogged = true;
         linkLossLogged = false;
-        Serial.printf("[IBUS] link up (first valid frame, count=%lu)\n",
+        fcu_log::logf(fcu_log::Level::Info, "[IBUS] link up (first valid frame, count=%lu)\n",
                       static_cast<unsigned long>(gIbus.frameCount()));
       }
     }
@@ -5636,14 +8635,14 @@ void ibusControlTask(void* /*arg*/) {
     if (gIbus.everReceived() && age > IBUS_LINK_TIMEOUT && !linkLossLogged) {
       linkLossLogged = true;
       linkUpLogged = false;
-      Serial.printf("[IBUS] link lost (no frame for %lums, checksum_err=%lu)\n",
+      fcu_log::logf(fcu_log::Level::Warn, "[IBUS] link lost (no frame for %lums, checksum_err=%lu)\n",
                     static_cast<unsigned long>(age),
                     static_cast<unsigned long>(gIbus.checksumErrors()));
       // Zero the yaw side-channel so a held-yaw stick doesn't keep commanding
       // rotation after the link drops. The packet-driven roll/pitch/throttle
       // path already freezes on the last accepted frame and the existing
       // link-loss rampdown takes over from there.
-      gIbusYawStickPercent = 0;
+      gIbusYawStickPercent.store(0, std::memory_order_relaxed);
     }
 
     feedTaskWatchdog();
@@ -5663,10 +8662,10 @@ void ibusControlTask(void* /*arg*/) {
 // are all untouched. The wire-level parser is CrsfReceiver (crsf_receiver.h).
 //
 // SCOPE (per the migration plan): only the basic flight channels + a minimal
-// CH5 arm are wired. CH6/mode, RTH, failsafe-clear and other state switches are
+// CH5 arm are wired. RTH, failsafe-clear and other state switches are
 // intentionally left to updateFlightModeFromAuxChannels() (TODO) so the final
 // switch layout is decided in one place without touching the per-frame decode.
-// CH7/CH8 drive the camera gimbal (serviceCameraGimbal), not the packet.
+// CH6/CH7 drive the camera gimbal (serviceCameraGimbal), not the packet.
 // ============================================================================
 namespace {
 
@@ -5719,23 +8718,180 @@ bool crsfSwitchIsHigh(uint16_t us, bool previous) {
   return previous;
 }
 
+bool crsfTelemetryDue(uint32_t nowMs, uint32_t lastMs, uint32_t periodMs) {
+  return lastMs == 0U || (nowMs - lastMs) >= periodMs;
+}
+
+bool crsfWriteTelemetryFrame(const uint8_t* frame, size_t len) {
+  if (frame == nullptr || len == 0U || len > crsf_telemetry::kMaxFrameBytes) {
+    return false;
+  }
+  if (gCrsf.txFree() < static_cast<int>(len)) {
+    return false;
+  }
+  return gCrsf.writeFrame(frame, len) == len;
+}
+
+size_t crsfBuildBatteryTelemetry(uint8_t* frame, const SensorSnapshot& sensorSnap) {
+  const BatteryState& bat = sensorSnap.battery;
+  if (!bat.enabled || !isfinite(bat.volts) || bat.volts <= 0.1f) {
+    return 0;
+  }
+  const uint8_t remainingPct = (bat.percent <= 100U) ? bat.percent : 0U;
+  // Pack voltage stays ADC-sourced (the battery-failsafe reference). Current +
+  // consumption come from ESC KISS telemetry when fresh — zeros otherwise
+  // (and always zeros with FCU_ESC_TELEM=0: no current sensor on this FCU).
+  float currentA = 0.0f;
+  uint32_t usedMah = 0;
+#if FCU_ESC_TELEM
+  (void)escTelemPackCurrents(millis(), /*maxAgeMs=*/1500U, currentA, usedMah);
+#endif
+  return crsf_telemetry::buildBattery(frame, bat.volts, currentA, usedMah,
+                                      remainingPct);
+}
+
+size_t crsfBuildAttitudeTelemetry(uint8_t* frame) {
+  AttitudeSample attSnap;
+  bool imuValid;
+  portENTER_CRITICAL(&gFlightMux);
+  attSnap = gState.attitude;
+  imuValid = gState.imuSampleValid;
+  portEXIT_CRITICAL(&gFlightMux);
+  if (!imuValid || !isfinite(attSnap.rollDeg) || !isfinite(attSnap.pitchDeg) ||
+      !isfinite(attSnap.yawDeg)) {
+    return 0;
+  }
+  return crsf_telemetry::buildAttitude(frame, attSnap.rollDeg, attSnap.pitchDeg,
+                                       wrapDeg180(attSnap.yawDeg));
+}
+
+uint16_t crsfHeadingCentiDeg(float yawDeg) {
+  if (!isfinite(yawDeg)) {
+    return 0;
+  }
+  const int heading = constrain(static_cast<int>(lroundf(wrapDeg360(yawDeg) * 100.0f)),
+                                0, 36000);
+  return static_cast<uint16_t>(heading);
+}
+
+size_t crsfBuildGpsTelemetry(uint8_t* frame, uint32_t nowMs,
+                             const SensorSnapshot& sensorSnap) {
+  if (!sensorSnap.gpsHasFix || sensorSnap.gpsSatellites == 0U ||
+      sensorSnap.gpsLastSentenceMs == 0U ||
+      (nowMs - sensorSnap.gpsLastSentenceMs) > CRSF_TLM_GPS_STALE) {
+    return 0;
+  }
+
+  AttitudeSample attSnap;
+  bool imuValid;
+  portENTER_CRITICAL(&gFlightMux);
+  attSnap = gState.attitude;
+  imuValid = gState.imuSampleValid;
+  portEXIT_CRITICAL(&gFlightMux);
+
+  const uint32_t rmcAgeMs = (sensorSnap.gpsLastRmcMs == 0U || nowMs < sensorSnap.gpsLastRmcMs)
+      ? 0xFFFFFFFFU
+      : (nowMs - sensorSnap.gpsLastRmcMs);
+  const bool rmcFresh = rmcAgeMs <= GPS_RMC_VELOCITY_STALE_MS;
+  const uint16_t speedKmh10 =
+      (rmcFresh && sensorSnap.gpsGroundSpeedValid) ? sensorSnap.gpsGroundSpeedKmh10 : 0U;
+  const uint16_t headingCdeg =
+      (rmcFresh && sensorSnap.gpsCourseValid) ? sensorSnap.gpsCourseCentiDeg
+                                              : (imuValid ? crsfHeadingCentiDeg(attSnap.yawDeg) : 0U);
+  const int32_t altMeters = static_cast<int32_t>(sensorSnap.gpsAltDm) / 10;
+  return crsf_telemetry::buildGps(frame, sensorSnap.gpsLatE7, sensorSnap.gpsLonE7,
+                                  speedKmh10, headingCdeg,
+                                  altMeters, sensorSnap.gpsSatellites);
+}
+
+// Flight-mode text ("FM" sensor on EdgeTX): the observer FSM's state name.
+// outSentState reports which state the frame carries so the caller can detect
+// changes and force an immediate resend.
+size_t crsfBuildFlightModeTelemetry(uint8_t* frame, flight_state::State& outSentState) {
+  outSentState = gFlightStatePublished.load(std::memory_order_relaxed);
+  return crsf_telemetry::buildFlightMode(
+      frame, flight_state::FlightStateMachine::name(outSentState));
+}
+
+void serviceCrsfTelemetry(uint32_t nowMs, bool linkUp) {
+  if (!CRSF_FC_TELEMETRY_ENABLED || PIN_CRSF_TX < 0 || !linkUp) {
+    return;
+  }
+
+  static uint32_t lastBatteryMs = 0;
+  static uint32_t lastAttitudeMs = 0;
+  static uint32_t lastGpsMs = 0;
+  static uint32_t lastFlightModeMs = 0;
+  // COUNT = "never sent" sentinel so the first pass always emits the mode.
+  static flight_state::State lastSentFmState = flight_state::State::COUNT;
+  static uint8_t nextSlot = 0;
+  constexpr uint8_t kSlotCount = 4;
+
+  uint8_t frame[crsf_telemetry::kMaxFrameBytes];
+  for (uint8_t attempt = 0; attempt < kSlotCount; ++attempt) {
+    const uint8_t slot = nextSlot;
+    nextSlot = static_cast<uint8_t>((nextSlot + 1U) % kSlotCount);
+
+    size_t len = 0;
+    if (slot == 0U) {
+      if (!crsfTelemetryDue(nowMs, lastBatteryMs, CRSF_TLM_BATTERY_PERIOD)) {
+        continue;
+      }
+      lastBatteryMs = nowMs;
+      len = crsfBuildBatteryTelemetry(frame, readSensorSnapshot());
+    } else if (slot == 1U) {
+      if (!crsfTelemetryDue(nowMs, lastAttitudeMs, CRSF_TLM_ATTITUDE_PERIOD)) {
+        continue;
+      }
+      lastAttitudeMs = nowMs;
+      len = crsfBuildAttitudeTelemetry(frame);
+    } else if (slot == 2U) {
+      if (!crsfTelemetryDue(nowMs, lastGpsMs, CRSF_TLM_GPS_PERIOD)) {
+        continue;
+      }
+      lastGpsMs = nowMs;
+      len = crsfBuildGpsTelemetry(frame, nowMs, readSensorSnapshot());
+    } else {
+      // Period-due OR state-changed (arm/failsafe transitions reach the
+      // handset immediately rather than after up to 500 ms).
+      const flight_state::State liveState =
+          gFlightStatePublished.load(std::memory_order_relaxed);
+      if (!crsfTelemetryDue(nowMs, lastFlightModeMs, CRSF_TLM_FLIGHTMODE_PERIOD) &&
+          liveState == lastSentFmState) {
+        continue;
+      }
+      lastFlightModeMs = nowMs;
+      flight_state::State sentState = liveState;
+      len = crsfBuildFlightModeTelemetry(frame, sentState);
+      if (len > 0U) {
+        lastSentFmState = sentState;
+      }
+    }
+
+    if (len > 0U) {
+      (void)crsfWriteTelemetryFrame(frame, len);
+      return;
+    }
+  }
+}
+
 }  // namespace
 
 // [CRSF BRIDGE] — declared in include/crsf_control.h
 //
 // FUTURE HOOK. Intentionally a no-op today (see migration plan: "do not add
-// final button/state mappings yet"). Wire CH5/CH6 and any later aux switches
+// final button/state mappings yet"). Wire CH5 and any later free aux switches
 // into arm / flight-mode / RTH / failsafe-clear transitions HERE so the policy
 // lives in exactly one place.
 void updateFlightModeFromAuxChannels(uint32_t nowMs) {
   (void)nowMs;
   // TODO(elrs-state-mapping): translate aux switches into flight state. Sketch:
-  //   const uint16_t ch6 = gCrsf.channelMicros(5);            // 3-pos mode switch
-  //   const flight_modes::FlightMode m = flight_modes::decodeModeSwitch(ch6);
+  //   const uint16_t ch8 = gCrsf.channelMicros(7);            // example free 3-pos mode switch
+  //   const flight_modes::FlightMode m = flight_modes::decodeModeSwitch(ch8);
   //   gActiveFlightMode.store(static_cast<uint8_t>(m), std::memory_order_relaxed);
   //   // CH9+ : RTH trigger, failsafe-clear, autonomy-enable, ALT/POS-hold.
-  //   //   (the iBUS layout used CH7=RTH / CH8=clear; on ELRS CH7/CH8 are the
-  //   //    camera gimbal, so map these onto free CH9+ positions instead.)
+  //   //   (the iBUS layout used CH7=RTH / CH8=clear; on ELRS CH6/CH7 are the
+  //   //    camera gimbal, so map these onto free channels instead.)
   //   // Use the CrsfBridgeState latches for hysteresis; log transitions once.
   // Until implemented the craft stays MANUAL and no autonomy controller engages
   // — the safe bring-up default.
@@ -5753,9 +8909,16 @@ bool initCrsfReceiver() {
                 static_cast<unsigned long>(CRSF_UART_BAUD_HZ),
                 static_cast<unsigned long>(CRSF_LINK_TIMEOUT),
                 static_cast<int>(CRSF_DEADBAND_PERCENT));
+  Serial.printf("[CRSF] fc telemetry %s batt=%lums att=%lums gps=%lums gps_stale=%lums fm=%lums\n",
+                (CRSF_FC_TELEMETRY_ENABLED && PIN_CRSF_TX >= 0) ? "enabled" : "disabled",
+                static_cast<unsigned long>(CRSF_TLM_BATTERY_PERIOD),
+                static_cast<unsigned long>(CRSF_TLM_ATTITUDE_PERIOD),
+                static_cast<unsigned long>(CRSF_TLM_GPS_PERIOD),
+                static_cast<unsigned long>(CRSF_TLM_GPS_STALE),
+                static_cast<unsigned long>(CRSF_TLM_FLIGHTMODE_PERIOD));
 #if USE_CAMERA_PAN_TILT
   // Pan/tilt servos reuse the freed nRF24 CONTROL pads (see pin block + the
-  // static_assert that USE_NRF24_CONTROL is off). LEDC PWM is independent of
+  // static_assert that USE_NRF24_CONTROL is off). Servo PWM is independent of
   // the motor DShot/RMT timers.
   CameraPanTilt::Config gc;
   gc.panPin = PIN_PAN_SERVO;
@@ -5764,8 +8927,21 @@ bool initCrsfReceiver() {
   gc.tiltMinUs = TILT_MIN_US; gc.tiltCenterUs = TILT_CENTER_US; gc.tiltMaxUs = TILT_MAX_US;
   gc.slewUsPerSec = CAMERA_SLEW_US_PER_SEC;
   gc.recenterOnFailsafe = (CAMERA_RECENTER_ON_FAILSAFE != 0);
+  // Persistent servo config (limits/center/inversion) overrides the compile
+  // defaults when a valid record exists. Safe if NVS isn't ready (returns invalid).
+  {
+    const auto sv = gPidNvs.loadServoConfig();
+    if (sv.valid) {
+      gc.panMinUs = sv.panMin;   gc.panCenterUs = sv.panCenter;   gc.panMaxUs = sv.panMax;
+      gc.tiltMinUs = sv.tiltMin; gc.tiltCenterUs = sv.tiltCenter; gc.tiltMaxUs = sv.tiltMax;
+      gServoOverride.panInv.store(sv.panInv, std::memory_order_relaxed);
+      gServoOverride.tiltInv.store(sv.tiltInv, std::memory_order_relaxed);
+    }
+  }
   const bool camOk = gCameraGimbal.begin(gc);
-  Serial.printf("[CAM] pan/tilt pan_gpio=%d tilt_gpio=%d center=%u/%u us slew=%u us/s recenter_fs=%u attached=%u\n",
+  Serial.printf("[CAM] pan/tilt backend=LEDC rate pan_ch=%u tilt_ch=%u pan_gpio=%d tilt_gpio=%d center=%u/%u us slew=%u us/s recenter_fs=%u attached=%u\n",
+                static_cast<unsigned>(CAMERA_PAN_CHANNEL),
+                static_cast<unsigned>(CAMERA_TILT_CHANNEL),
                 PIN_PAN_SERVO, PIN_TILT_SERVO,
                 static_cast<unsigned>(PAN_CENTER_US), static_cast<unsigned>(TILT_CENTER_US),
                 static_cast<unsigned>(CAMERA_SLEW_US_PER_SEC),
@@ -5798,7 +8974,9 @@ void buildAndDispatchCrsfControlPacket(uint32_t nowMs) {
   // Pitch: stick up (>centre) => positive pitch (nose up); matches stickY.
   packet.stickYPercent = crsfApplyDeadband(crsfMicrosToSignedPercent(pitchUs));
   packet.throttlePercent = crsfMicrosToThrottlePercent(throttleUs);
-  gCrsfYawStickPercent = crsfApplyDeadband(crsfMicrosToSignedPercent(yawUs));
+  gCrsfYawStickPercent.store(
+      static_cast<int8_t>(crsfApplyDeadband(crsfMicrosToSignedPercent(yawUs))),
+      std::memory_order_relaxed);
 
   // CH5 arm with hysteresis — MINIMAL bring-up mapping (final layout TBD in
   // updateFlightModeFromAuxChannels). Below high threshold: motors held quiet.
@@ -5813,7 +8991,7 @@ void buildAndDispatchCrsfControlPacket(uint32_t nowMs) {
         gCrsfBridge.throttleZeroSinceMs = nowMs;
       } else if ((nowMs - gCrsfBridge.throttleZeroSinceMs) >= kCrsfSafeBootHoldMs) {
         gCrsfBridge.safeBootLatched = true;
-        Serial.println("[CRSF] safe-boot complete (throttle zero held)");
+        fcu_log::logf(fcu_log::Level::Info, "[CRSF] safe-boot complete (throttle zero held)\n");
       }
     } else {
       gCrsfBridge.throttleZeroSinceMs = 0;
@@ -5844,7 +9022,7 @@ void buildAndDispatchCrsfControlPacket(uint32_t nowMs) {
 #if CRSF_DEBUG_LOG
   if ((nowMs - gCrsfBridge.lastDebugLogMs) >= CRSF_DEBUG_LOG_PERIOD_MS) {
     gCrsfBridge.lastDebugLogMs = nowMs;
-    Serial.printf("[CRSF] us1-8=%u/%u/%u/%u/%u/%u/%u/%u roll=%d pitch=%d thr=%u yaw=%d arm=%u "
+    fcu_log::logf(fcu_log::Level::Debug, "[CRSF] us1-8=%u/%u/%u/%u/%u/%u/%u/%u roll=%d pitch=%d thr=%u yaw=%d arm=%u "
                   "lq=%u rssi=%d rate=%uHz crc_err=%lu\n",
                   static_cast<unsigned>(rollUs), static_cast<unsigned>(pitchUs),
                   static_cast<unsigned>(throttleUs), static_cast<unsigned>(yawUs),
@@ -5854,7 +9032,7 @@ void buildAndDispatchCrsfControlPacket(uint32_t nowMs) {
                   static_cast<unsigned>(packet.stickXPercent),
                   static_cast<int>(packet.stickYPercent),
                   static_cast<unsigned>(packet.throttlePercent),
-                  static_cast<int>(gCrsfYawStickPercent),
+                  static_cast<int>(gCrsfYawStickPercent.load(std::memory_order_relaxed)),
                   static_cast<unsigned>(gCrsfBridge.armSwitchHigh),
                   static_cast<unsigned>(gCrsf.uplinkLinkQuality()),
                   static_cast<int>(gCrsf.uplinkRssiDbm()),
@@ -5865,19 +9043,104 @@ void buildAndDispatchCrsfControlPacket(uint32_t nowMs) {
 }
 
 #if USE_CAMERA_PAN_TILT
-// Drive the FPV pan/tilt servos from the CRSF aux channels. Kept separate from
-// the packet build so the servo path is obvious and so the gimbal still gets
-// periodic ticks (for slew + failsafe behaviour) even on ticks with no fresh
-// frame. linkUp=false => tick(hold=true) freezes or recenters per camera config.
+// Decode a 3-position aux switch (CRSF channel `chIndex`, 0-based) into an
+// absolute servo pulse: toward-LOW µs -> minUs, centre -> centerUs, toward-HIGH
+// µs -> maxUs. `invert` swaps the two ends (honours the per-axis invert flag
+// from the dashboard/NVS). Absolute (not rate): a steady switch holds a steady
+// angle, so channel noise can no longer walk the servo.
+static uint16_t camAuxSwitchToUs(uint8_t chIndex, uint16_t minUs,
+                                 uint16_t centerUs, uint16_t maxUs, bool invert) {
+  const uint16_t us = gCrsf.channelMicros(chIndex);
+  const uint16_t lowEnd  = invert ? maxUs : minUs;
+  const uint16_t highEnd = invert ? minUs : maxUs;
+  if (us <= CAMERA_AUX_LOW_US)  return lowEnd;
+  if (us >= CAMERA_AUX_HIGH_US) return highEnd;
+  return centerUs;
+}
+
+// Drive the FPV pan/tilt servos from the CRSF aux channels. Each axis is a
+// 3-position switch: low / centre / high -> min / centre / max pulse (absolute
+// position). The slew limiter in tick() smooths the move between detents.
+// linkUp=false => tick(hold=true) freezes or recenters per camera config.
 void serviceCameraGimbal(uint32_t nowMs, bool linkUp) {
+  // Dashboard override takes precedence while active (disarmed bench framing /
+  // direction checks). A command timeout returns control to the RC sticks.
+  bool ov = gServoOverride.active.load(std::memory_order_relaxed);
+  if (ov && (nowMs - gServoOverride.lastCmdMs.load(std::memory_order_relaxed)) > SERVO_CMD_TIMEOUT_MS) {
+    gServoOverride.active.store(false, std::memory_order_relaxed);
+    ov = false;
+  }
+  if (ov) {
+    gCameraGimbal.setTargetMicros(gServoOverride.panUs.load(std::memory_order_relaxed),
+                                  gServoOverride.tiltUs.load(std::memory_order_relaxed));
+    gCameraGimbal.tick(nowMs, /*hold=*/false);
+    return;
+  }
   if (linkUp) {
-    const float panNorm  = gCrsf.channelNormalized(CAMERA_PAN_CHANNEL  - 1);
-    const float tiltNorm = gCrsf.channelNormalized(CAMERA_TILT_CHANNEL - 1);
-    gCameraGimbal.setTargetNormalized(panNorm, tiltNorm);
+    // Absolute 3-position decode: each aux switch selects min / centre / max
+    // pulse directly, so a steady switch holds a steady angle (no rate drift).
+    const auto& c = gCameraGimbal.config();
+    const uint16_t panUs  = camAuxSwitchToUs(CAMERA_PAN_CHANNEL  - 1,
+                                             c.panMinUs, c.panCenterUs, c.panMaxUs,
+                                             gServoOverride.panInv.load(std::memory_order_relaxed));
+    const uint16_t tiltUs = camAuxSwitchToUs(CAMERA_TILT_CHANNEL - 1,
+                                             c.tiltMinUs, c.tiltCenterUs, c.tiltMaxUs,
+                                             gServoOverride.tiltInv.load(std::memory_order_relaxed));
+    gCameraGimbal.setTargetMicros(panUs, tiltUs);
   }
   gCameraGimbal.tick(nowMs, /*hold=*/!linkUp);
 }
 #endif
+
+#if FCU_ENABLE_RADIO_WIFI_TOGGLE
+// WiFi AUX-switch watcher (2-position switch on FCU_WIFI_TOGGLE_AUX_CHANNEL).
+// Runs on the CRSF task; the ONLY side effects are the atomic intent stores in
+// wifi_mgr (requestEnable / requestDisable) — no WiFi calls happen here.
+// Debounce: the raw hysteresis decision (crsfSwitchIsHigh, same thresholds as
+// the arm switch) must hold a NEW position for FCU_WIFI_TOGGLE_DEBOUNCE_MS
+// before it becomes an intent, so RF glitches can't flap the radio stack.
+// Channel values are only sampled while the link is up — receiver-failsafe
+// channel output must never operate the switch.
+void serviceWifiToggleSwitch(uint32_t nowMs, bool linkUp) {
+  static bool rawHigh = false;          // hysteresis output, updated every tick
+  static bool debouncedHigh = false;    // last position turned into an intent
+  static bool debouncedValid = false;   // becomes true after the first stable read
+  static uint32_t stableSinceMs = 0;
+
+  if (!linkUp) {
+    stableSinceMs = 0;  // stale/failsafe channels: freeze, re-debounce on return
+    return;
+  }
+  const uint16_t us = gCrsf.channelMicros(FCU_WIFI_TOGGLE_AUX_CHANNEL - 1);
+  const bool nowHigh = crsfSwitchIsHigh(us, rawHigh);
+  if (nowHigh != rawHigh) {
+    rawHigh = nowHigh;
+    stableSinceMs = nowMs;  // position changed: restart the stability window
+    return;
+  }
+  if (debouncedValid && rawHigh == debouncedHigh) {
+    return;  // no change pending
+  }
+  if (stableSinceMs == 0U) {
+    stableSinceMs = nowMs;
+    return;
+  }
+  if ((nowMs - stableSinceMs) < FCU_WIFI_TOGGLE_DEBOUNCE_MS) {
+    return;  // still settling
+  }
+  debouncedHigh = rawHigh;
+  debouncedValid = true;
+  fcu_log::logf(fcu_log::Level::Warn, "[WIFI] AUX toggle ch%u -> %s (%uus)\n",
+                static_cast<unsigned>(FCU_WIFI_TOGGLE_AUX_CHANNEL),
+                debouncedHigh ? "ON" : "OFF",
+                static_cast<unsigned>(us));
+  if (debouncedHigh) {
+    wifi_mgr::requestEnable(nowMs);   // honored only while disarmed-safe
+  } else {
+    wifi_mgr::requestDisable();       // also clears the fresh-edge latch
+  }
+}
+#endif  // FCU_ENABLE_RADIO_WIFI_TOGGLE
 
 // [CRSF BRIDGE] — FreeRTOS task: drain CRSF UART, dispatch ControlPackets,
 // service the camera gimbal, log link state. Failsafe-on-link-loss is handled
@@ -5891,36 +9154,56 @@ void crsfControlTask(void* /*arg*/) {
   for (;;) {
     const uint32_t nowMs = millis();
     const bool gotFrame = gCrsf.poll(nowMs);
-    if (gotFrame) {
+
+    // Evaluate link health BEFORE dispatching. ELRS keeps the CRSF stream alive
+    // on lost link but collapses uplink LQ to 0; failsafeActive() reflects that
+    // receiver-reported failsafe. Dispatching on gotFrame alone would refresh
+    // gState.control.lastPacketMs / linkActive=true, so the flight-side
+    // control-timeout would NEVER latch while frames keep arriving — leaving
+    // roll/pitch/throttle running from the receiver's failsafe or stale channel
+    // values. (F1)
+    const bool linkUp = gCrsf.linkActive(nowMs, CRSF_LINK_TIMEOUT) && !gCrsf.failsafeActive();
+
+    if (gotFrame && linkUp) {
       buildAndDispatchCrsfControlPacket(nowMs);
       if (!gCrsfBridge.linkUpLogged) {
         gCrsfBridge.linkUpLogged = true;
         gCrsfBridge.linkLossLogged = false;
-        Serial.printf("[CRSF] link up (rc_frames=%lu rate=%uHz lq=%u)\n",
+        fcu_log::logf(fcu_log::Level::Info, "[CRSF] link up (rc_frames=%lu rate=%uHz lq=%u)\n",
                       static_cast<unsigned long>(gCrsf.rcFrameCount()),
                       static_cast<unsigned>(gCrsf.frameRateHz()),
                       static_cast<unsigned>(gCrsf.uplinkLinkQuality()));
       }
+    } else if (gotFrame && !linkUp) {
+      // Frames still arriving but the receiver reports failsafe (LQ=0). Do NOT
+      // dispatch (that would refresh the link). Force the control link inactive
+      // so applyFailsafeIfNeeded() engages the existing failsafe / rampdown
+      // immediately instead of waiting on a frame-timeout that will never fire
+      // while frames keep coming. (F1)
+      portENTER_CRITICAL(&gControlMux);
+      gState.control.linkActive = false;
+      portEXIT_CRITICAL(&gControlMux);
     }
 
-    // Link health: a fresh RC frame within the timeout AND no receiver-reported
-    // failsafe (ELRS drops uplink LQ to 0 on lost link while keeping the stream).
-    const bool linkUp = gCrsf.linkActive(nowMs, CRSF_LINK_TIMEOUT) && !gCrsf.failsafeActive();
     if (gCrsf.everReceived() && !linkUp && !gCrsfBridge.linkLossLogged) {
       gCrsfBridge.linkLossLogged = true;
       gCrsfBridge.linkUpLogged = false;
-      Serial.printf("[CRSF] link lost (age=%lums crc_err=%lu rx_failsafe=%u) — FailsafeManager will latch\n",
+      fcu_log::logf(fcu_log::Level::Warn, "[CRSF] link lost (age=%lums crc_err=%lu rx_failsafe=%u) — FailsafeManager will latch\n",
                     static_cast<unsigned long>(gCrsf.frameAgeMs(nowMs)),
                     static_cast<unsigned long>(gCrsf.crcErrors()),
                     static_cast<unsigned>(gCrsf.failsafeActive()));
       // Stop a held-yaw stick from commanding rotation after the link drops.
       // Roll/pitch/throttle freeze on the last accepted frame; the existing
       // link-loss rampdown in updateControlLoop takes over from there.
-      gCrsfYawStickPercent = 0;
+      gCrsfYawStickPercent.store(0, std::memory_order_relaxed);
     }
 
 #if USE_CAMERA_PAN_TILT
     serviceCameraGimbal(nowMs, linkUp);
+#endif
+    serviceCrsfTelemetry(nowMs, linkUp);
+#if FCU_ENABLE_RADIO_WIFI_TOGGLE
+    serviceWifiToggleSwitch(nowMs, linkUp);
 #endif
 
     feedTaskWatchdog();
@@ -5935,7 +9218,7 @@ void crsfControlTask(void* /*arg*/) {
 //
 // Authority phase: when mission/RTH code lands, this will also call request*()
 // for discretionary transitions and updateControlLoop will gate behavior on
-// gFlightSm.state(). Today it is purely observational and logs every
+// the published FSM state. Today it is purely observational and logs every
 // transition to Serial — read [FSM] lines to verify the machine is tracking
 // reality.
 void updateFlightStateMachine(uint32_t nowMs) {
@@ -5990,7 +9273,7 @@ void updateFlightStateMachine(uint32_t nowMs) {
   in.controlLinkAlive  = linkActiveSnap;
   in.piHeartbeatAlive  = autSnap.linkAlive;
 
-  in.homeSet           = false;   // TODO: set on arm-with-GPS-fix (mission_manager)
+  in.homeSet           = gRth.homeCaptured();
   in.inGeofence        = true;    // TODO: real check when geofence_manager lands
 
   in.flightSwitchOn    = control_protocol::flagIsSet(pkt.flags, control_protocol::kFlagFlightSwitchOn);
@@ -6001,6 +9284,7 @@ void updateFlightStateMachine(uint32_t nowMs) {
   in.atkArmRequested   = control_protocol::flagIsSet(pkt.flags, control_protocol::kFlagAutoTakeoffArm);
   in.autonomyEnabled   = autSnap.enabled;
   in.imuCalibrateRequest = control_protocol::flagIsSet(pkt.flags, control_protocol::kFlagImuCalibrateRequest);
+  in.rthRequested      = gRthRequested.load(std::memory_order_relaxed);
 
   // Mission / RTH fields stay default (false) until those subsystems exist.
   // The guards in the state machine will refuse the corresponding transitions.
@@ -6013,11 +9297,19 @@ void updateFlightStateMachine(uint32_t nowMs) {
   in.tiltUnsafeDeg     = TILT_UNSAFE_DEG;
 
   gFlightSm.update(in);
+
+  // Publish an atomic snapshot for cross-task readers (motor-spin gates,
+  // webserver getState, [FSM] status log). gFlightSm itself stays owned by this
+  // task; everyone else reads these atomics. (F5)
+  gFlightStatePublished.store(gFlightSm.state(), std::memory_order_relaxed);
+  gFlightStateEnteredMs.store(nowMs - gFlightSm.timeInStateMs(nowMs),
+                              std::memory_order_relaxed);
+  gFlightTransitionCount.store(gFlightSm.transitionCount(), std::memory_order_relaxed);
 }
 
 // [FLIGHT CONTROL] — declared in include/flight_control.h
 void applyFailsafeIfNeeded(uint32_t nowMs) {
-  if (ALL_FAILSAFES_DISABLED) {
+  if (failsafesBypassed()) {
     portENTER_CRITICAL(&gFailsafeMux);
     gFailsafe.reset();
     gState.failsafeReason = control_protocol::kFailsafeNone;
@@ -6106,7 +9398,11 @@ void applyFailsafeIfNeeded(uint32_t nowMs) {
   fsIn.tiltMagDeg = tiltMag;
   fsIn.tiltUnsafeDeg = TILT_UNSAFE_DEG;
   fsIn.imuValid = imuValidSnap;
-  fsIn.armed = (appliedThrottleLocal > 0);
+  // "Armed" for failsafe purposes = motors are being driven. With armed idle
+  // (P1 fix) the props spin at MIN_ACTIVE while appliedThrottlePercent reads 0,
+  // so idle must count as armed here — otherwise the unsafe-tilt / IMU-invalid /
+  // loop-overrun failsafes would not protect a craft whose props are turning.
+  fsIn.armed = (appliedThrottleLocal > 0) || gState.pid.armedIdleActive;
   fsIn.lastFlightLoopMs = lastFlightTickMs;
   fsIn.loopTimeoutMs = 30;
 
@@ -6267,18 +9563,166 @@ bool serviceSafeLandingDescent(uint32_t nowMs, uint32_t nowUs,
   if (!gSafeLandState.ctrl_engaged) {
     gLandingCtrl.begin();
     gSafeLandState.ctrl_engaged = true;
-    Serial.println("[SAFE-LAND] engaging sensor-driven descent (TOF + LandingController)");
+    fcu_log::logf(fcu_log::Level::Warn, "[SAFE-LAND] engaging sensor-driven descent (TOF + LandingController)\n");
   }
 
   const auto out = gLandingCtrl.update(altSnap.measuredMm, vzMs, dtPidS, nowMs);
   outThrottle = static_cast<uint8_t>(constrain(static_cast<int>(out.throttlePct), 0, 100));
   outRequestDisarm = out.requestDisarm;
   if (out.requestDisarm) {
-    Serial.println("[SAFE-LAND] touchdown — disarming motors");
+    fcu_log::logf(fcu_log::Level::Warn, "[SAFE-LAND] touchdown — disarming motors\n");
     gSafeLandState.ctrl_engaged = false;
   }
   return true;
 }
+
+#if ENABLE_EXPERIMENTAL_EKF
+// Autonomy velocity provider — the POS_HOLD integration seam. Returns the EKF's
+// loop-rate fused NED velocity when FCU_USE_EKF_VELOCITY=1 and the estimate is
+// trustworthy; else false so the caller keeps its existing source. OFF by
+// default: wiring the (currently uncalled) VelocityController to this is the
+// next step once the EKF is flight-validated. ekf_sim_test S9 proves, in a
+// closed-loop sim, that EKF velocity holds a target to ~0.15 m/s.
+[[maybe_unused]] static bool getAutonomyVelocityNed(float& vN, float& vE, float& vD) {
+#if FCU_USE_EKF_VELOCITY
+  if (gEkfReady.load(std::memory_order_relaxed)) {
+    const gnc::EstimatorHealth eh = gEkf.getHealth();
+    if (eh.estimator_ready && eh.velocity_valid) {
+      const gnc::EstimatorState es = gEkf.getState();
+      vN = es.velocity_ned.x; vE = es.velocity_ned.y; vD = es.velocity_ned.z;
+      return true;
+    }
+  }
+#endif
+  (void)vN; (void)vE; (void)vD;
+  return false;
+}
+
+[[maybe_unused]] static bool getAutonomyVelocityBody(float yawDeg,
+                                                     float& vxBody,
+                                                     float& vyBody,
+                                                     float& vzUp) {
+  float vN = 0.0f;
+  float vE = 0.0f;
+  float vD = 0.0f;
+  if (!getAutonomyVelocityNed(vN, vE, vD)) {
+    vxBody = 0.0f;
+    vyBody = 0.0f;
+    vzUp = 0.0f;
+    return false;
+  }
+  const PositionController::BodyVelocity body =
+      PositionController::nedToBodyVelocity(yawDeg, vN, vE);
+  vxBody = body.vxMs;
+  vyBody = body.vyMs;
+  vzUp = -vD;  // EKF NED down+ -> VelocityController up+
+  return true;
+}
+
+static void publishEkfDiagSnapshot() {
+  EkfDiagSnapshot snap;
+  snap.ready = gEkfReady.load(std::memory_order_relaxed);
+  if (snap.ready) {
+    const gnc::EstimatorState es = gEkf.getState();
+    const gnc::EstimatorHealth eh = gEkf.getHealth();
+    float er = 0.0f, ep = 0.0f, ey = 0.0f;
+    math3::quaternionToEuler(es.attitude, er, ep, ey);
+    snap.yawDeg = wrapDeg180(math3::radToDeg(ey));
+    snap.velNed[0] = es.velocity_ned.x;
+    snap.velNed[1] = es.velocity_ned.y;
+    snap.velNed[2] = es.velocity_ned.z;
+    snap.posNed[0] = es.position_ned.x;
+    snap.posNed[1] = es.position_ned.y;
+    snap.posNed[2] = es.position_ned.z;
+    snap.attValid = eh.attitude_valid;
+    snap.posValid = eh.position_valid;
+    snap.velValid = eh.velocity_valid;
+    snap.gpsValid = eh.gps_valid;
+    snap.magValid = eh.mag_valid;
+    snap.innovationFault = eh.innovation_fault;
+    snap.gpsInnov[0] = eh.gps_innov_north_m;
+    snap.gpsInnov[1] = eh.gps_innov_east_m;
+    snap.gpsInnov[2] = eh.gps_innov_down_m;
+    snap.magInnovDeg = math3::radToDeg(eh.mag_innov_rad);
+    snap.gpsAccept = eh.gps_accept_count;
+    snap.gpsReject = eh.gps_reject_count;
+    snap.magAccept = eh.mag_accept_count;
+    snap.magReject = eh.mag_reject_count;
+  }
+  portENTER_CRITICAL(&gFlightMux);
+  gEkfDiag = snap;
+  portEXIT_CRITICAL(&gFlightMux);
+}
+
+// Apply one queued off-core measurement to gEkf. Called ONLY from flightTask
+// (the single owner) after predictIMU, so all estimator mutation stays on one
+// core. Origin-set happens once (gated on !originValid); GPS updates are no-ops
+// inside the EKF until the origin exists, so they need no extra guard here. (F4)
+static void applyEkfMeasurement(const EkfMeasurement& m) {
+  switch (m.type) {
+    case EkfMeasurement::Type::Baro:
+      (void)gEkf.updateBarometer(m.baroAltM, m.nowMs);
+      break;
+    case EkfMeasurement::Type::Tof:
+      (void)gEkf.updateTOF(m.tofRangeMm, m.nowMs);
+      break;
+    case EkfMeasurement::Type::GpsOrigin:
+      if (!gEkf.originValid()) {
+        gEkf.setOrigin(m.gps.latRad, m.gps.lonRad, m.gps.altMsl);
+        fcu_log::logf(fcu_log::Level::Info, "[EKF] origin set (sensorTask candidate, applied on flight core)\n");
+      }
+      break;
+    case EkfMeasurement::Type::GpsUpdate:
+    {
+      const math3::Vector3 gpsVel{m.gps.velN, m.gps.velE, m.gps.velD};
+      (void)gEkf.updateGPS(m.gps.latRad, m.gps.lonRad, m.gps.altMsl,
+                           gpsVel, m.gps.hasVelocity, m.nowMs);
+      break;
+    }
+  }
+}
+
+// [EKF SHADOW LOG] One-flight EKF-vs-live capture for offline validation. Emits
+// [EKF] lines at FCU_EKF_SHADOW_LOG_HZ comparing the EKF attitude to the live
+// complementary filter, plus EKF velocity / position / gyro-bias / health. No-op
+// unless FCU_EKF_SHADOW_LOG=1. Called from the flight task (sole writer of
+// gState.attitude) so the live read is race-free.
+static void emitEkfShadowLog(uint32_t nowMs) {
+#if FCU_EKF_SHADOW_LOG
+  static uint32_t s_nextMs = 0;
+  if (static_cast<int32_t>(nowMs - s_nextMs) < 0) return;
+  s_nextMs = nowMs + (1000U / FCU_EKF_SHADOW_LOG_HZ);
+  const gnc::EstimatorState es = gEkf.getState();
+  const gnc::EstimatorHealth eh = gEkf.getHealth();
+  float er, ep, ey;
+  math3::quaternionToEuler(es.attitude, er, ep, ey);
+  const float ekfR = math3::radToDeg(er), ekfP = math3::radToDeg(ep), ekfY = math3::radToDeg(ey);
+  const float liveR = gState.attitude.rollDeg, liveP = gState.attitude.pitchDeg, liveY = gState.attitude.yawDeg;
+  float pvN = 0, pvE = 0, pvD = 0;
+  const bool seam = getAutonomyVelocityNed(pvN, pvE, pvD);  // exercise the seam + show if active
+  fcu_log::logf(fcu_log::Level::Info, "[EKF] t=%lu ekf=%.1f/%.1f/%.1f live=%.1f/%.1f/%.1f d=%.1f/%.1f/%.1f "
+                "v=%.2f/%.2f/%.2f p=%.1f/%.1f/%.1f bg=%.2f/%.2f/%.2f rdy=%u av=%u gps=%lu/%lu if=%u\n",
+                static_cast<unsigned long>(nowMs),
+                static_cast<double>(ekfR), static_cast<double>(ekfP), static_cast<double>(ekfY),
+                static_cast<double>(liveR), static_cast<double>(liveP), static_cast<double>(liveY),
+                static_cast<double>(ekfR - liveR), static_cast<double>(ekfP - liveP),
+                static_cast<double>(wrapDeg180(ekfY - liveY)),
+                static_cast<double>(es.velocity_ned.x), static_cast<double>(es.velocity_ned.y),
+                static_cast<double>(es.velocity_ned.z),
+                static_cast<double>(es.position_ned.x), static_cast<double>(es.position_ned.y),
+                static_cast<double>(es.position_ned.z),
+                static_cast<double>(math3::radToDeg(es.gyro_bias.x)),
+                static_cast<double>(math3::radToDeg(es.gyro_bias.y)),
+                static_cast<double>(math3::radToDeg(es.gyro_bias.z)),
+                static_cast<unsigned>(eh.estimator_ready), static_cast<unsigned>(seam),
+                static_cast<unsigned long>(eh.gps_accept_count),
+                static_cast<unsigned long>(eh.gps_reject_count),
+                static_cast<unsigned>(eh.innovation_fault));
+#else
+  (void)nowMs;
+#endif
+}
+#endif  // ENABLE_EXPERIMENTAL_EKF
 
 // [FLIGHT CONTROL] — declared in include/flight_control.h
 void updateControlLoop(uint32_t nowMs) {
@@ -6294,6 +9738,7 @@ void updateControlLoop(uint32_t nowMs) {
   const float dtSeconds = static_cast<float>(elapsedUs) * 0.000001f;
   gState.pid.lastUpdateUs = nowUs;
   gState.pid.lastUpdateMs = nowMs;
+  gState.pid.lastDtUs = elapsedUs;  // mirrored for the [FLT_STATE] line
   gState.loopRate.ticks++;
   if (nowMs - gState.loopRate.lastSampleMs >= 1000U) {
     const uint32_t deltaMs = nowMs - gState.loopRate.lastSampleMs;
@@ -6312,7 +9757,7 @@ void updateControlLoop(uint32_t nowMs) {
 #if DYN_NOTCH_DEBUG
   if (DYNAMIC_NOTCH_DEBUG_ENABLED && (nowMs - gLastDynamicNotchLogMs) >= 1000U) {
     gLastDynamicNotchLogMs = nowMs;
-    Serial.printf("[DYN_NOTCH] active=%u bypass=%u f=%.1fHz target=%.1fHz fs=%.1fHz\n",
+    fcu_log::logf(fcu_log::Level::Debug, "[DYN_NOTCH] active=%u bypass=%u f=%.1fHz target=%.1fHz fs=%.1fHz\n",
                   static_cast<unsigned>(gDynamicNotch.active()),
                   static_cast<unsigned>(gDynamicNotch.runtimeBypass()),
                   gDynamicNotch.centerHz(),
@@ -6338,18 +9783,48 @@ void updateControlLoop(uint32_t nowMs) {
       dbgGyRaw = sample.gy_dps;
       dbgGzRaw = sample.gz_dps;
 #if ENABLE_DYNAMIC_NOTCH
+      // Apply a dashboard-requested notch reconfigure (disarmed bench only).
+      if (gNotchCfgDirty.load(std::memory_order_acquire)) {
+        DynamicNotchConfig cfg;
+        portENTER_CRITICAL(&gFlightMux);
+        cfg = gNotchPendingCfg;
+        gNotchCfgDirty.store(false, std::memory_order_relaxed);
+        portEXIT_CRITICAL(&gFlightMux);
+        gDynamicNotch.configure(cfg);
+      }
       gDynamicNotch.process(sample.gx_dps, sample.gy_dps, sample.gz_dps);
 #endif
 #if FCU_ENABLE_RPM_FILTER
       gRpmNotch.process(sample.gx_dps, sample.gy_dps, sample.gz_dps);
 #endif
+      // Vibration/FFT capture tap: pre-notch (dbg*) vs post-notch (sample.*).
+      // No-op unless a capture is active; never blocks the loop.
+      {
+        const float rawG[3] = {dbgGxRaw, dbgGyRaw, dbgGzRaw};
+        const float finG[3] = {sample.gx_dps, sample.gy_dps, sample.gz_dps};
+        gNotchAnalyzer.tick(rawG, finG, micros());
+      }
       serviceGyroCalibration(sample, nowMs);
       portENTER_CRITICAL(&gFlightMux);
+      gState.pid.gyroPreFilterDps[0] = dbgGxRaw;
+      gState.pid.gyroPreFilterDps[1] = dbgGyRaw;
+      gState.pid.gyroPreFilterDps[2] = dbgGzRaw;
+      gState.pid.gyroPidDps[0] = sample.gx_dps;
+      gState.pid.gyroPidDps[1] = sample.gy_dps;
+      gState.pid.gyroPidDps[2] = sample.gz_dps;
       gState.imuSample = sample;
       gState.imuSampleValid = true;
       gState.pid.imuFailGraceTicks = 0;
       updateAttitudeFromImu(sample, gState.attitude, dtSeconds);
+      // computeMagHeadingDeg runs inside updateAttitudeFromImu and only writes
+      // gState.attitude; mirror the active-source heading back onto the sample /
+      // imuSample so the EKF mag update and telemetry read a real heading.
+      sample.magHeadingDeg = gState.attitude.magHeadingDeg;
+      gState.imuSample.magHeadingDeg = gState.attitude.magHeadingDeg;
       portEXIT_CRITICAL(&gFlightMux);
+      // Persistent-level calibration averages the fresh attitude estimate while
+      // verifying the frame is stationary. No-op unless a capture is active.
+      serviceLevelCalibration(sample, nowMs);
 
 #if ENABLE_EXPERIMENTAL_EKF
       // ---- EKF prediction (shadow mode) -----------------------------------
@@ -6374,6 +9849,16 @@ void updateControlLoop(uint32_t nowMs) {
           (void)gEkf.updateMagnetometer(sample.magHeadingDeg * (gnc::kPi / 180.0f),
                                          nowMs);
         }
+        // Drain off-core measurements (baro/ToF/GPS) and apply them here so gEkf
+        // is only ever mutated from this task. Bounded: a handful per tick. (F4)
+        if (gEkfMeasQ != nullptr) {
+          EkfMeasurement meas;
+          while (xQueueReceive(gEkfMeasQ, &meas, 0) == pdTRUE) {
+            applyEkfMeasurement(meas);
+          }
+        }
+        publishEkfDiagSnapshot();
+        emitEkfShadowLog(nowMs);   // [EKF] one-flight shadow capture (gated)
       }
 #endif
     } else {
@@ -6458,8 +9943,57 @@ void updateControlLoop(uint32_t nowMs) {
   portEXIT_CRITICAL(&gFlightMux);
   const SensorSnapshot sensorSnap = readSensorSnapshot();
 
+#if (FCU_LEVEL_DIAG_LOG_HZ > 0)
+  // [LVLDIAG] One-line, rate-limited discriminator for the left-veer / low-M3
+  // investigation. Emitted HERE — BEFORE the disarmed / zero-throttle / failsafe
+  // early-returns below — so it prints in EVERY state, including the props-off
+  // bench read (Test A), where the loop never reaches the mixer. corrR/corrP/
+  // accTrust are fresh from this tick's attitude; the mixer/integrator fields
+  // (m1..m4, Iroll/Ipitch, iFroz, base, sat) are published by this task AFTER the
+  // mixer, so here they carry the PREVIOUS tick's values — ~0 while disarmed,
+  // meaningful only in flight (Test B). m3 = mixUnclamped[2] = front-left.
+  {
+    static uint32_t s_lvlDiagNextMs = 0;
+    constexpr uint32_t kLvlDiagPeriodMs = 1000U / static_cast<uint32_t>(FCU_LEVEL_DIAG_LOG_HZ);
+    if (static_cast<int32_t>(nowMs - s_lvlDiagNextMs) >= 0) {
+      s_lvlDiagNextMs = nowMs + kLvlDiagPeriodMs;
+      // correctedAttitude = raw estimate - mounting offset - manual trim: the
+      // exact angle the outer loop tries to drive to zero (see mixer-stage use).
+      const float diagCorrR = attitudeSnap.rollDeg -
+                              gLevelCorr.rollOffsetDeg.load(std::memory_order_relaxed) -
+                              gLevelCorr.rollTrimDeg.load(std::memory_order_relaxed);
+      const float diagCorrP = attitudeSnap.pitchDeg -
+                              gLevelCorr.pitchOffsetDeg.load(std::memory_order_relaxed) -
+                              gLevelCorr.pitchTrimDeg.load(std::memory_order_relaxed);
+      fcu_log::logf(fcu_log::Level::Info,
+          "[LVLDIAG] t=%lu thr=%u rawR=%.2f rawP=%.2f corrR=%.2f corrP=%.2f "
+          "accTrust=%u gx=%.2f gy=%.2f Iroll=%.1f Ipitch=%.1f iFroz=%u base=%.0f "
+          "m1=%.0f m2=%.0f m3=%.0f m4=%.0f minSat=%u maxSat=%u\n",
+          static_cast<unsigned long>(micros()),
+          static_cast<unsigned>(gState.pid.smoothedThrottlePct + 0.5f),
+          static_cast<double>(attitudeSnap.rollDeg),
+          static_cast<double>(attitudeSnap.pitchDeg),
+          static_cast<double>(diagCorrR),
+          static_cast<double>(diagCorrP),
+          static_cast<unsigned>(attitudeSnap.accelTrusted),
+          static_cast<double>(imuSampleSnap.gx_dps),
+          static_cast<double>(imuSampleSnap.gy_dps),
+          static_cast<double>(gState.pid.rollTerms.integral),
+          static_cast<double>(gState.pid.pitchTerms.integral),
+          static_cast<unsigned>(gState.pid.integratorFrozen),
+          static_cast<double>(gState.pid.mixBase),
+          static_cast<double>(gState.pid.mixUnclamped[0]),
+          static_cast<double>(gState.pid.mixUnclamped[1]),
+          static_cast<double>(gState.pid.mixUnclamped[2]),
+          static_cast<double>(gState.pid.mixUnclamped[3]),
+          static_cast<unsigned>(gState.pid.mixerMinSat),
+          static_cast<unsigned>(gState.pid.mixerMaxSat));
+    }
+  }
+#endif
+
   if (escStartupSettleActive(nowMs)) {
-    forceMotorStop();
+    forceMotorStop("esc_settle");
     return;
   }
 
@@ -6473,8 +10007,31 @@ void updateControlLoop(uint32_t nowMs) {
 #if FCU_ENABLE_RPM_FILTER
   rpmFilterArmOk = rpmFilterSafeToArm();
 #endif
-  const bool allowFlight = flightMode && flightSwitchOn && safeBoot && rpmFilterArmOk &&
-                           (!failsafe || controlledLinkLoss);
+  bool allowFlight = flightMode && flightSwitchOn && safeBoot && rpmFilterArmOk &&
+                     (!failsafe || controlledLinkLoss);
+  // ESC passthrough blocks arming outright. Log (rate-limited) only when an arm
+  // is actually attempted while passthrough owns the motor pins.
+  if (allowFlight && esc_passthrough::isActive()) {
+    static uint32_t lastBlockLogMs = 0;
+    if (nowMs - lastBlockLogMs > 1000U) {
+      lastBlockLogMs = nowMs;
+      Serial.printf("[ESCPASS] arming BLOCKED -- passthrough active\n");
+    }
+    allowFlight = false;
+  }
+
+  // Arming-edge PID reset: one clean reset when allowFlight goes false->true
+  // so a new flight never inherits integrators/derivative state from the
+  // previous session. This replaces the old implicit "reset on every
+  // zero-throttle tick" with an explicit transition event. prevAllowFlight is
+  // flight-task-only state (same single-writer convention as
+  // smoothedThrottlePct below).
+  if (allowFlight && !gState.pid.prevAllowFlight) {
+    portENTER_CRITICAL(&gFlightMux);
+    resetPidOutputs("arming");
+    portEXIT_CRITICAL(&gFlightMux);
+  }
+  gState.pid.prevAllowFlight = allowFlight;
 
   if (failsafe && failsafeReasonSnap != control_protocol::kFailsafeNone && !controlledLinkLoss) {
     if (!serviceFailsafeSoftRelease(nowMs) && !failsafeClearSafeToAccept()) {
@@ -6531,7 +10088,7 @@ void updateControlLoop(uint32_t nowMs) {
   // again.
   if (!(allowFlight && controlledLinkLoss)) {
     if (gSafeLandingActive) {
-      Serial.println("[SAFE-LAND] disengaged (link recovered or armed state changed)");
+      fcu_log::logf(fcu_log::Level::Warn, "[SAFE-LAND] disengaged (link recovered or armed state changed)\n");
     }
     resetSafeLandingDescent();
   }
@@ -6548,12 +10105,19 @@ void updateControlLoop(uint32_t nowMs) {
                                     imuValidSnap, slThrottle, slDisarm)) {
       gSafeLandingActive = true;
       if (slDisarm) {
-        forceMotorStop();
+        // Touchdown confirmed by the LandingController (ToF + Vz hold window)
+        // — one of the legitimate "confirmed landed" hard-stop transitions.
+        forceMotorStop("touchdown_disarm");
         resetSafeLandingDescent();
         return;
       }
       effectiveThrottle = slThrottle;
-      altHoldActive = true;  // sensor descent is effectively altitude-hold-with-target
+      // Deliberately NOT altHoldActive=true (2026-06 fix): during safe-landing
+      // the LandingController owns the throttle. Setting altHoldActive here
+      // made the altitude-hold block below ALSO run, with a stale target
+      // (atk.targetMeters — ATK isn't active, so typically 0 m), stacking up
+      // to -30% bias on top of the landing throttle: two controllers fighting
+      // one actuator during the most safety-critical automated maneuver.
     } else {
       // Legacy linear ramp — TOF unavailable or conditions unsuitable. No
       // change from prior behavior. gSafeLandingActive stays false.
@@ -6634,10 +10198,35 @@ void updateControlLoop(uint32_t nowMs) {
   gState.control.appliedThrottlePercent = smoothedThrottle;
   portEXIT_CRITICAL(&gControlMux);
 
-  if (smoothedThrottle == 0 || !imuValidSnap) {
-    forceMotorStop();
+  if (!imuValidSnap) {
+    // Dead/stale IMU while motors could be driven: hard stop, never fly blind.
+    // The FailsafeManager latches kFailsafeImuInvalid in parallel.
+    forceMotorStop("imu_invalid");
     return;
   }
+
+  // ---- Armed-idle (P1 safety fix) ------------------------------------------
+  // OLD: zero throttle => forceMotorStop() + PID reset, even armed & airborne.
+  //      A mid-air throttle chop killed the props and wiped controller state.
+  // NEW: zero throttle stops the motors ONLY when disarmed (or with
+  //      FCU_ARMED_IDLE_ENABLE=0). While armed, motors hold the existing
+  //      DShot minimum-active command and the rate PIDs keep running with
+  //      integration frozen by the low-throttle gate below, so raising the
+  //      stick resumes controlled flight immediately.
+  // Note: the controlled-link-loss + zero-throttle case never reaches here —
+  // it exits via the soft-release branch above.
+  bool armedIdleActive = false;
+  if (smoothedThrottle == 0) {
+    if (!allowFlight || !ARMED_IDLE_ENABLED) {
+      // DISARMED (flight switch off / no flight mode / safe-boot incomplete /
+      // failsafe) — the legitimate zero-throttle hard stop.
+      forceMotorStop(!allowFlight ? "disarmed" : "zero_throttle_legacy");
+      gState.pid.armedIdleActive = false;
+      return;
+    }
+    armedIdleActive = true;
+  }
+  gState.pid.armedIdleActive = armedIdleActive;
 
   // Compose stick setpoints. Manual stick always wins; autonomy only steers
   // when enabled AND user hasn't moved sticks/throttle.
@@ -6650,12 +10239,12 @@ void updateControlLoop(uint32_t nowMs) {
   float effYawStick = 0.0f;
 #if USE_IBUS_CONTROL
   if (!controlledLinkLoss) {
-    effYawStick = static_cast<float>(gIbusYawStickPercent);
+    effYawStick = static_cast<float>(gIbusYawStickPercent.load(std::memory_order_relaxed));
   }
 #elif USE_ELRS_CRSF_CONTROL
   // ELRS/CRSF manual yaw rides its own side channel (same rationale as iBUS).
   if (!controlledLinkLoss) {
-    effYawStick = static_cast<float>(gCrsfYawStickPercent);
+    effYawStick = static_cast<float>(gCrsfYawStickPercent.load(std::memory_order_relaxed));
   }
 #endif
   bool autonomyLand = false;
@@ -6680,7 +10269,7 @@ void updateControlLoop(uint32_t nowMs) {
 #endif
 
   if (autonomyStop) {
-    forceMotorStop();
+    forceMotorStop("autonomy_stop");
     return;
   }
   if (autonomyLand) {
@@ -6699,32 +10288,86 @@ void updateControlLoop(uint32_t nowMs) {
       constrain((effYawStick / 100.0f) * MAX_YAW_RATE_SETPOINT_DPS,
                 -MAX_YAW_RATE_SETPOINT_DPS, MAX_YAW_RATE_SETPOINT_DPS);
 
+  // ---- Integrator gating (P2/P3 anti-windup) --------------------------------
+  // Freeze — hold, never reset — the rate-PID integrators when:
+  //  * commanded throttle is below PID_ITERM_MIN_THROTTLE_PCT: on the ground /
+  //    armed idle, the axes can't act on the airframe, so integrating attitude
+  //    error is pure windup (this also covers "no I while effectively
+  //    disarmed-but-spinning");
+  //  * the mixer reported motor saturation on the PREVIOUS tick: a clipped
+  //    motor can't realize additional moment, so further integration only
+  //    overshoots when authority returns. One tick (2 ms) of delay is the
+  //    price of computing the gate before the PIDs run.
+  // P and D remain fully active in both cases, and the PID-internal
+  // conditional integration (output-level anti-windup) still applies on top.
+  const bool allowIntegration =
+      (smoothedThrottle >= PID_ITERM_MIN_THROTTLE_PCT) && !gState.pid.mixerSatPrevTick;
+
+  // ---- Apply persistent level correction + manual trim (EXACTLY ONCE) -------
+  // correctedAttitude = rawEstimate - mountingOffset - manualTrim. This is the
+  // SINGLE point where leveling enters the controller; the raw estimate
+  // (attitudeSnap / gState.attitude) is deliberately left untouched so the
+  // dashboard can show raw-vs-corrected side by side and so the correction can
+  // never be double-applied. The offset is the value "Calibrate Level & Save"
+  // measured while the frame was physically level, so a level frame now yields
+  // ~zero angle error and the mixer stops biasing two motors. Reading the
+  // atomics before the mux keeps the critical section short.
+  const float levelRollOff  = gLevelCorr.rollOffsetDeg.load(std::memory_order_relaxed);
+  const float levelPitchOff = gLevelCorr.pitchOffsetDeg.load(std::memory_order_relaxed);
+  const float rollTrim      = gLevelCorr.rollTrimDeg.load(std::memory_order_relaxed);
+  const float pitchTrim     = gLevelCorr.pitchTrimDeg.load(std::memory_order_relaxed);
+  const float correctedRollDeg  = attitudeSnap.rollDeg  - levelRollOff  - rollTrim;
+  const float correctedPitchDeg = attitudeSnap.pitchDeg - levelPitchOff - pitchTrim;
+
   FcuPidTerms rollT;
   FcuPidTerms pitchT;
   FcuPidTerms yawT;
   portENTER_CRITICAL(&gFlightMux);
   const float rollRateSetpointDps =
-      constrain((rollAngleSetpointDeg - attitudeSnap.rollDeg) * gState.pid.angleRollGain,
+      constrain((rollAngleSetpointDeg - correctedRollDeg) * gState.pid.angleRollGain,
                 -MAX_ANGLE_RATE_SETPOINT_DPS, MAX_ANGLE_RATE_SETPOINT_DPS);
   const float pitchRateSetpointDps =
-      constrain((pitchAngleSetpointDeg - attitudeSnap.pitchDeg) * gState.pid.anglePitchGain,
+      constrain((pitchAngleSetpointDeg - correctedPitchDeg) * gState.pid.anglePitchGain,
                 -MAX_ANGLE_RATE_SETPOINT_DPS, MAX_ANGLE_RATE_SETPOINT_DPS);
-  rollT = gState.pid.roll.update(rollRateSetpointDps, imuSampleSnap.gx_dps, dtSeconds);
-  pitchT = gState.pid.pitch.update(pitchRateSetpointDps, imuSampleSnap.gy_dps, dtSeconds);
-  yawT = gState.pid.yaw.update(yawRateSetpointDps, imuSampleSnap.gz_dps, dtSeconds);
+  rollT = gState.pid.roll.update(rollRateSetpointDps, imuSampleSnap.gx_dps, dtSeconds,
+                                 allowIntegration);
+  pitchT = gState.pid.pitch.update(pitchRateSetpointDps, imuSampleSnap.gy_dps, dtSeconds,
+                                   allowIntegration);
+  yawT = gState.pid.yaw.update(yawRateSetpointDps, imuSampleSnap.gz_dps, dtSeconds,
+                               allowIntegration);
   gState.pid.rollRateSetpointDps = rollRateSetpointDps;
   gState.pid.pitchRateSetpointDps = pitchRateSetpointDps;
   gState.pid.yawRateSetpointDps = yawRateSetpointDps;
+  gState.pid.angleRollSetpointDeg = rollAngleSetpointDeg;
+  gState.pid.anglePitchSetpointDeg = pitchAngleSetpointDeg;
+  gState.pid.correctedRollDeg = correctedRollDeg;
+  gState.pid.correctedPitchDeg = correctedPitchDeg;
+  gState.pid.levelRollOffsetDeg = levelRollOff;
+  gState.pid.levelPitchOffsetDeg = levelPitchOff;
+  gState.pid.rollTrimDeg = rollTrim;
+  gState.pid.pitchTrimDeg = pitchTrim;
   gState.pid.rollTerms = rollT;
   gState.pid.pitchTerms = pitchT;
   gState.pid.yawTerms = yawT;
+  gState.pid.integratorFrozen = !allowIntegration;
   gState.pid.active = true;
+  // Per-axis "rate PID hit its own output clamp" flags (telemetry/debug).
+  gState.pid.rollPidSat = fabsf(rollT.output) >= (PID_OUTPUT_LIMIT_RAW - 0.5f);
+  gState.pid.pitchPidSat = fabsf(pitchT.output) >= (PID_OUTPUT_LIMIT_RAW - 0.5f);
+  gState.pid.yawPidSat = fabsf(yawT.output) >= (PID_OUTPUT_LIMIT_RAW - 0.5f);
   portEXIT_CRITICAL(&gFlightMux);
 
   // Mixer base uses the SLEW-LIMITED throttle, not the raw target. This is
   // the whole point of the slew limit — without this, the mixer would step
   // and only the appliedThrottlePercent telemetry would be smoothed.
-  const float base = static_cast<float>(throttleToMotorRaw(smoothedThrottle));
+  // Armed idle overrides the zero-throttle base (throttleToMotorRaw(0) == 0)
+  // with the DShot minimum-active command so the props never stop while armed.
+  // `base` is further reduced by the upper-bound desaturation below, so the
+  // value printed by the rig/tuning logs is the post-desat base actually flown.
+  float base = static_cast<float>(throttleToMotorRaw(smoothedThrottle));
+  if (armedIdleActive) {
+    base = static_cast<float>(ARMED_IDLE_MOTOR_RAW);
+  }
   const float roll = rollT.output * MIX_ROLL_SIGN;
   const float pitch = pitchT.output * MIX_PITCH_SIGN;
   const float yaw = yawT.output * MIX_YAW_SIGN;
@@ -6754,8 +10397,8 @@ void updateControlLoop(uint32_t nowMs) {
     constexpr uint32_t kEmitPeriodMs = 1000U / static_cast<uint32_t>(FCU_TUNING_LOG_HZ);
     if (static_cast<int32_t>(nowMs - s_tuneNextEmitMs) >= 0) {
       s_tuneNextEmitMs = nowMs + kEmitPeriodMs;
-      if (serialHasRoom(SERIAL_TUNE_MIN_FREE_BYTES)) {
-        Serial.printf(
+      {
+        fcu_log::logf(fcu_log::Level::Info,
             "[TUNE] %lu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%u\n",
             static_cast<unsigned long>(micros()),
             rollAngleSetpointDeg,
@@ -6771,7 +10414,7 @@ void updateControlLoop(uint32_t nowMs) {
         // Pitch-axis equivalent of [TUNE]. Same field order — substitute
         // "roll" with "pitch" mentally: angleSetpoint, attitude, rateSetpoint,
         // gyro, P, I, D, output, throttle. Plot-friendly CSV.
-        Serial.printf(
+        fcu_log::logf(fcu_log::Level::Info,
             "[TUNE_P] %lu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%u\n",
             static_cast<unsigned long>(micros()),
             pitchAngleSetpointDeg,
@@ -6784,27 +10427,121 @@ void updateControlLoop(uint32_t nowMs) {
             pitchT.output,
             static_cast<unsigned>(effectiveThrottle));
 #endif
-      } else {
-        noteSerialBackpressure(true);
       }
     }
   }
 #endif
 
 
-  // Quad-X mix for verified motor layout (2026-05 user-confirmed):
-  // M1 front-left (CCW), M2 rear-left (CW), M3 front-right (CW), M4 rear-right (CCW).
+  // [MIXER] Quad-X mix for verified motor layout (2026-06 user-confirmed):
+  // M1 front-right (CW), M2 rear-right (CCW), M3 front-left (CCW), M4 rear-left (CW).
   // Front motors (M1, M3) use pitchFront which is multiplied by
-  // MIX_PITCH_FRONT_BIAS (default 1.0, no change). Rear motors (M2, M4) use
-  // pitchRear which equals the original pitch value. At bias=1.0 this is
-  // byte-for-byte identical to the legacy mixer.
-  std::array<uint16_t, 4> mixed = {
-      clampMotorRaw(base + roll - pitchFront + yaw),  // M1 front-left (CCW)
-      clampMotorRaw(base + roll + pitchRear  - yaw),  // M2 rear-left (CW)
-      clampMotorRaw(base - roll - pitchFront - yaw),  // M3 front-right (CW)
-      clampMotorRaw(base - roll + pitchRear  + yaw),  // M4 rear-right (CCW)
+  // MIX_PITCH_FRONT_BIAS; rear motors (M2, M4) use pitchRear.
+  //
+  // Saturation handling (P2 safety fix) replaces the old independent
+  // per-motor clamp, which silently distorted the commanded roll/pitch/yaw
+  // moments whenever one motor clipped:
+  //   1. If the correction spread alone exceeds the whole motor range, scale
+  //      all corrections uniformly (preserves moment ratios; severe, rare —
+  //      flagged corrScaled).
+  //   2. Upper bound: reduce `base` so the highest motor sits at the DShot
+  //      ceiling — attitude authority is preserved at the cost of collective
+  //      thrust (flagged maxSat). This is the standard market-FCU trade:
+  //      losing a little altitude is recoverable, losing attitude is not.
+  //   3. Lower bound: per-motor clamp at the armed floor (MIN_ACTIVE), flagged
+  //      minSat. Deliberately NOT compensated by raising `base` — that would
+  //      be air-mode-style collective boost, a behavior change too aggressive
+  //      to introduce untested. TODO(airmode): consider lower-bound base shift
+  //      after armed-idle + desat are flight-proven.
+  // All saturation flags feed the integrator gate on the next tick.
+  const float corr[4] = {
+      -roll - pitchFront - yaw,   // M1 front-right (CW)
+      -roll + pitchRear  + yaw,   // M2 rear-right  (CCW)
+      roll - pitchFront + yaw,    // M3 front-left  (CCW)
+      roll + pitchRear  - yaw,    // M4 rear-left   (CW)
   };
+  float corrMin = corr[0];
+  float corrMax = corr[0];
+  for (size_t i = 1; i < 4; ++i) {
+    if (corr[i] < corrMin) corrMin = corr[i];
+    if (corr[i] > corrMax) corrMax = corr[i];
+  }
+  const float floorRaw = static_cast<float>(MOTOR_OUTPUT_MIN_ACTIVE_RAW);
+  const float ceilRaw = static_cast<float>(MOTOR_OUTPUT_ABS_MAX_RAW);
+  float corrScale = 1.0f;
+  bool corrScaled = false;
+  const float corrSpread = corrMax - corrMin;
+  if (corrSpread > (ceilRaw - floorRaw)) {
+    corrScale = (ceilRaw - floorRaw) / corrSpread;
+    corrMin *= corrScale;
+    corrMax *= corrScale;
+    corrScaled = true;
+  }
+  bool maxSat = false;
+  if (base + corrMax > ceilRaw) {
+    base = ceilRaw - corrMax;
+    maxSat = true;
+  }
+  if (base < floorRaw) {
+    base = floorRaw;  // never below the armed idle floor
+  }
+  bool minSat = false;
+  float mixPreClamp[4];  // pre-floor values for [TUNE_DBG]
+  std::array<uint16_t, 4> mixed;
+  for (size_t i = 0; i < 4; ++i) {
+    const float v = base + corr[i] * corrScale;
+    mixPreClamp[i] = v;
+    float clamped = v;
+    if (clamped < floorRaw) {
+      clamped = floorRaw;  // armed floor: props keep spinning, flag the clip
+      minSat = true;
+    }
+    mixed[i] = clampMotorRaw(clamped);
+  }
+  // Publish flags (flight-task single-writer; consumed by telemetry, the
+  // debug logs, and next tick's integrator gate).
+  gState.pid.mixerMinSat = minSat;
+  gState.pid.mixerMaxSat = maxSat;
+  gState.pid.mixerCorrScaled = corrScaled;
+  gState.pid.mixerSatPrevTick = (minSat || maxSat || corrScaled);
+  // Mixer telemetry (instrumentation): the per-axis contributions and the
+  // pre-floor/clamp motor values let the dashboard explain exactly which two
+  // motors are elevated and by which axis. Single-writer (flight task); 32-bit
+  // aligned stores are atomic on the S3, and these feed only the decimated
+  // dashboard, so no extra mux is taken (matches the sat-flag publish above).
+  gState.pid.mixBase = base;
+  gState.pid.mixRoll = roll;
+  gState.pid.mixPitchFront = pitchFront;
+  gState.pid.mixPitchRear = pitchRear;
+  gState.pid.mixYaw = yaw;
+  gState.pid.mixUnclamped[0] = mixPreClamp[0];
+  gState.pid.mixUnclamped[1] = mixPreClamp[1];
+  gState.pid.mixUnclamped[2] = mixPreClamp[2];
+  gState.pid.mixUnclamped[3] = mixPreClamp[3];
   applyMotorOutputs(mixed);
+
+  // ---- Airborne heuristic update (logging only — see gAirborneLikely decl).
+  {
+    static uint32_t s_airborneHoldStartMs = 0;
+    if (!allowFlight) {
+      gAirborneLikely = false;
+      s_airborneHoldStartMs = 0;
+    } else if (smoothedThrottle >= 20U) {
+      if (s_airborneHoldStartMs == 0U) {
+        s_airborneHoldStartMs = nowMs;
+      } else if (!gAirborneLikely && (nowMs - s_airborneHoldStartMs) >= 500U) {
+        gAirborneLikely = true;
+      }
+    } else {
+      s_airborneHoldStartMs = 0;  // low throttle does not clear the latch
+    }
+  }
+
+  // [FLT_STATE] emission moved to emitFlightStateLine(), called from
+  // flightTask AFTER this function — so the line prints in EVERY state
+  // (disarmed, failsafe, ESC settle), not only on mixer-reaching ticks.
+  // (Armed-idle audit fix: the original placement here went silent exactly
+  // when visibility mattered most.)
 
 #if FCU_GYRO_ANOMALY_LOG
   {
@@ -6824,8 +10561,8 @@ void updateControlLoop(uint32_t nowMs) {
     if ((rawPitchSpike || filtPitchSpike || rawFiltJump || accelBad || loopStall || imuGrace) &&
         static_cast<int32_t>(nowMs - s_nextGyroAnomLogMs) >= 0) {
       s_nextGyroAnomLogMs = nowMs + 200U;
-      if (serialHasRoom(SERIAL_TUNE_MIN_FREE_BYTES)) {
-        Serial.printf(
+      {
+        fcu_log::logf(fcu_log::Level::Warn,
             "[GYRO_ANOM] t=%lu raw_p=%.2f filt_p=%.2f raw_filt_dp=%.2f "
             "acc_norm=%.3f accel_ok=%u dt_raw_us=%lu dt_used_us=%lu imu_g=%u "
             "pitch=%.2f roll=%.2f flags=raw%u,filt%u,delta%u,acc%u,dt%u,imu%u\n",
@@ -6846,8 +10583,6 @@ void updateControlLoop(uint32_t nowMs) {
             static_cast<unsigned>(accelBad),
             static_cast<unsigned>(loopStall),
             static_cast<unsigned>(imuGrace));
-      } else {
-        noteSerialBackpressure(true);
       }
     }
   }
@@ -6865,8 +10600,8 @@ void updateControlLoop(uint32_t nowMs) {
       const int frontAvg = (static_cast<int>(mixed[0]) + static_cast<int>(mixed[2])) / 2;
       const int rearAvg = (static_cast<int>(mixed[1]) + static_cast<int>(mixed[3])) / 2;
       const int frontMinusRear = frontAvg - rearAvg;
-      if (serialHasRoom(SERIAL_TUNE_MIN_FREE_BYTES)) {
-        Serial.printf(
+      {
+        fcu_log::logf(fcu_log::Level::Debug,
             "[PITCH_RIG] t=%lu dt_raw=%lu dt_used=%lu acc=[%.3f,%.3f,%.3f] "
             "acc_norm=%.3f accel_ok=%u att_pr=[%.2f,%.2f] gyro_p_raw=%.2f "
             "gyro_p_filt=%.2f raw_filt_dp=%.2f sp_p=[%.2f,%.2f] "
@@ -6899,8 +10634,6 @@ void updateControlLoop(uint32_t nowMs) {
             static_cast<unsigned>(mixed[2]),
             static_cast<unsigned>(mixed[3]),
             static_cast<unsigned>(gState.pid.imuFailGraceTicks));
-      } else {
-        noteSerialBackpressure(true);
       }
     }
   }
@@ -6923,12 +10656,13 @@ void updateControlLoop(uint32_t nowMs) {
     constexpr uint32_t kPeriodMs = 1000U / static_cast<uint32_t>(FCU_TUNING_DEBUG_HZ);
     if (static_cast<int32_t>(nowMs - s_tdbgNextMs) >= 0) {
       s_tdbgNextMs = nowMs + kPeriodMs;
-      if (serialHasRoom(SERIAL_TUNE_MIN_FREE_BYTES)) {
-        Serial.printf(
+      {
+        fcu_log::logf(fcu_log::Level::Debug,
             "[TUNE_DBG] t=%lu raw=[%.2f,%.2f,%.2f] filt=[%.2f,%.2f,%.2f] "
             "att=[%.2f,%.2f,%.2f] sp_ang=[%.2f,%.2f] sp_rate=[%.2f,%.2f,%.2f] "
             "pid_r=[%.2f,%.2f,%.2f] pid_p=[%.2f,%.2f,%.2f] "
-            "pid_y=[%.2f,%.2f,%.2f] thr=%u m=[%u,%u,%u,%u]\n",
+            "pid_y=[%.2f,%.2f,%.2f] thr=%u m=[%u,%u,%u,%u] "
+            "arm=%u idle=%u dtus=%lu sat=%02X pre=[%.0f,%.0f,%.0f,%.0f]\n",
             static_cast<unsigned long>(micros()),
             static_cast<double>(dbgGxRaw),
             static_cast<double>(dbgGyRaw),
@@ -6957,9 +10691,15 @@ void updateControlLoop(uint32_t nowMs) {
             static_cast<unsigned>(mixed[0]),
             static_cast<unsigned>(mixed[1]),
             static_cast<unsigned>(mixed[2]),
-            static_cast<unsigned>(mixed[3]));
-      } else {
-        noteSerialBackpressure(true);
+            static_cast<unsigned>(mixed[3]),
+            static_cast<unsigned>(allowFlight),
+            static_cast<unsigned>(armedIdleActive),
+            static_cast<unsigned long>(elapsedUs),
+            static_cast<unsigned>(mixerSatFlagsByte()),
+            static_cast<double>(mixPreClamp[0]),
+            static_cast<double>(mixPreClamp[1]),
+            static_cast<double>(mixPreClamp[2]),
+            static_cast<double>(mixPreClamp[3]));
       }
     }
   }
@@ -7124,6 +10864,9 @@ void sendTelemetry(uint32_t nowMs) {
     if (aux.autoTakeoffState == control_protocol::kAutoTakeoffAbort) {
       aux.flags2 |= control_protocol::kTelemetry2FlagAbortRequested;
     }
+    // Mixer saturation + armed-idle flags (was the reserved byte — remotes
+    // built against the old header simply ignore it).
+    aux.mixerSatFlags = mixerSatFlagsByte();
 
 #if FCU_PIN_TELM_CE >= 0 && FCU_PIN_TELM_CSN >= 0
     if (sendTelemetryPayloadNoWait(&aux, sizeof(aux))) {
@@ -7198,7 +10941,7 @@ void serviceEscStartupSettle(uint32_t nowMs) {
 
   if (!gState.escSettleCompleteLogged) {
     gState.escSettleCompleteLogged = true;
-    Serial.println("[ESC] startup settle complete; remote throttle can drive motors in flight mode");
+    fcu_log::logf(fcu_log::Level::Info, "[ESC] startup settle complete; remote throttle can drive motors in flight mode\n");
   }
 }
 
@@ -7246,6 +10989,24 @@ void loadCalibrationFromNvs() {
     gCal.baro_ground_pa.store(b.pressure_pa, std::memory_order_relaxed);
     gCal.baro_valid.store(true, std::memory_order_relaxed);
   }
+  // Persistent level correction + manual trim — loaded and applied at the
+  // controller (see updateControlLoop). Validated (version/range/NaN) inside
+  // loadLevelCalibration; an invalid/corrupt record yields valid=false and the
+  // craft flies uncorrected rather than with a bad offset. The startup
+  // stationary cal below deliberately never overwrites this.
+  const auto lc = gPidNvs.loadLevelCalibration(LEVEL_CAL_MAX_OFFSET_DEG, LEVEL_TRIM_MAX_DEG);
+  if (lc.valid) {
+    gLevelCorr.rollOffsetDeg.store(lc.roll_offset_deg, std::memory_order_relaxed);
+    gLevelCorr.pitchOffsetDeg.store(lc.pitch_offset_deg, std::memory_order_relaxed);
+    gLevelCorr.rollTrimDeg.store(lc.roll_trim_deg, std::memory_order_relaxed);
+    gLevelCorr.pitchTrimDeg.store(lc.pitch_trim_deg, std::memory_order_relaxed);
+    gLevelCorr.loaded.store(true, std::memory_order_relaxed);
+  }
+  Serial.printf("[CAL] level correction: %s roll_off=%.3f pitch_off=%.3f trim=[%.3f,%.3f] (age=%u)\n",
+                lc.valid ? "LOADED" : "NONE",
+                static_cast<double>(lc.roll_offset_deg), static_cast<double>(lc.pitch_offset_deg),
+                static_cast<double>(lc.roll_trim_deg), static_cast<double>(lc.pitch_trim_deg),
+                static_cast<unsigned>(lc.boot_age));
   Serial.printf("[CAL] loaded: accel=%s(age=%u) mag=%s(age=%u) baro=%s(age=%u) bootCnt=%u\n",
                 a.valid ? "OK" : "MISSING",
                 static_cast<unsigned>(a.boot_age),
@@ -7306,20 +11067,40 @@ void runBootStationaryCal() {
                   static_cast<double>(r.accel_offset_g.z));
     Serial.printf("[CAL] baro ground = %.2f Pa\n",
                   static_cast<double>(r.baro_ground_pa));
-    gCal.accel_off_x.store(r.accel_offset_g.x, std::memory_order_relaxed);
-    gCal.accel_off_y.store(r.accel_offset_g.y, std::memory_order_relaxed);
-    gCal.accel_off_z.store(r.accel_offset_g.z, std::memory_order_relaxed);
-    gCal.accel_valid.store(true, std::memory_order_relaxed);
+    // ---- Accel offset: RAM-only bootstrap; NEVER overwrites a saved value ----
+    // ROOT-CAUSE FIX for the unequal-motor bug. The old code persisted a fresh
+    // accel offset to NVS on EVERY successful boot, so whatever resting tilt the
+    // frame had at power-on (landing gear, uneven ground, battery sag) silently
+    // became the "level" reference — and a truly level frame then read tilted,
+    // biasing two motors. Now the boot stationary cal only SEEDS the accel
+    // offset in RAM, and only when NO valid offset was already loaded from NVS
+    // (a first-boot bootstrap so the EKF has a sane bias). It no longer writes
+    // the accel offset to NVS at all; the persistent leveling reference is owned
+    // exclusively by "Calibrate Level & Save", which startup can no longer clobber.
+    const bool haveSavedAccel = gCal.accel_valid.load(std::memory_order_relaxed);
+    fcu_nvs::FcuPidNvs::AccelOffset bootAo;
+    bootAo.x = r.accel_offset_g.x;
+    bootAo.y = r.accel_offset_g.y;
+    bootAo.z = r.accel_offset_g.z;
+    bootAo.valid = true;
+    const bool bootAccelSane = fcu_nvs::FcuPidNvs::accelOffsetLooksSane(bootAo);
+    if (!haveSavedAccel && bootAccelSane) {
+      gCal.accel_off_x.store(bootAo.x, std::memory_order_relaxed);
+      gCal.accel_off_y.store(bootAo.y, std::memory_order_relaxed);
+      gCal.accel_off_z.store(bootAo.z, std::memory_order_relaxed);
+      gCal.accel_valid.store(true, std::memory_order_relaxed);
+      Serial.println("[CAL] boot accel offset seeded in RAM (first-boot bootstrap; NOT persisted)");
+    } else if (!bootAccelSane) {
+      Serial.println("[CAL][WARN] boot accel offset rejected as out-of-range; check IMU orientation");
+    } else {
+      Serial.println("[CAL] saved accel offset kept; boot stationary cal does NOT overwrite it");
+    }
+    // The baro ground reference is a per-flight altitude zero (not a leveling
+    // reference), so refreshing it each boot is correct and still persisted.
     if (r.baro_samples_used > 0) {
       gCal.baro_ground_pa.store(r.baro_ground_pa, std::memory_order_relaxed);
       gCal.baro_valid.store(true, std::memory_order_relaxed);
-    }
-    if (gPidNvs.ready()) {
-      fcu_nvs::FcuPidNvs::AccelOffset ao;
-      ao.x = r.accel_offset_g.x; ao.y = r.accel_offset_g.y; ao.z = r.accel_offset_g.z;
-      ao.valid = true;
-      (void)gPidNvs.saveAccelOffset(ao);
-      if (r.baro_samples_used > 0) {
+      if (gPidNvs.ready()) {
         fcu_nvs::FcuPidNvs::BaroGround bg;
         bg.pressure_pa = r.baro_ground_pa;
         bg.valid = true;
@@ -7335,6 +11116,64 @@ void runBootStationaryCal() {
 // FreeRTOS tasks
 // -----------------------------
 
+// ---- [FLT_STATE] 2 Hz flight-path state line (P5) ---------------------------
+// Always on, ~2 lines/s ≈ 300 B/s. One glance answers: armed? idle? airborne
+// (heuristic)? failsafe + reason? throttle in/smoothed? loop dt? which
+// saturations? motor outputs? last PID reset reason/when/count.
+// Called from flightTask after every control tick — including ticks where
+// updateControlLoop early-returned (disarmed / failsafe / ESC settle), which
+// is when this line matters most. Reads only published gState (snapshots
+// under the owning muxes; pid bools are flight-task-written single bytes).
+// Rate-limited + serialHasRoom-gated: can never block the 500 Hz loop.
+void emitFlightStateLine(uint32_t nowMs) {
+  static uint32_t s_fltStateNextMs = 0;
+  if (static_cast<int32_t>(nowMs - s_fltStateNextMs) < 0) {
+    return;
+  }
+  s_fltStateNextMs = nowMs + 500U;
+
+  uint8_t pktThrottle = 0;
+  uint8_t appliedThrottle = 0;
+  bool failsafeActive = false;
+  portENTER_CRITICAL(&gControlMux);
+  pktThrottle = gState.control.lastPacket.throttlePercent;
+  appliedThrottle = gState.control.appliedThrottlePercent;
+  failsafeActive = gState.control.failsafeActive;
+  portEXIT_CRITICAL(&gControlMux);
+
+  std::array<uint16_t, 4> motorSnap;
+  portENTER_CRITICAL(&gFlightMux);
+  motorSnap = gState.motorRaw;
+  portEXIT_CRITICAL(&gFlightMux);
+
+  fcu_log::logf(fcu_log::Level::Info,
+      "[FLT_STATE] t=%lu arm=%u idle=%u air=%u fs=%u r=%u thr=%u sm=%u "
+      "dtus=%lu sat=[mn%u mx%u sc%u r%u p%u y%u] m=[%u,%u,%u,%u] "
+      "rst=%s@%lu n=%lu\n",
+      static_cast<unsigned long>(nowMs),
+      static_cast<unsigned>(gState.pid.prevAllowFlight),
+      static_cast<unsigned>(gState.pid.armedIdleActive),
+      static_cast<unsigned>(gAirborneLikely),
+      static_cast<unsigned>(failsafeActive),
+      static_cast<unsigned>(readFailsafeReason()),
+      static_cast<unsigned>(pktThrottle),
+      static_cast<unsigned>(appliedThrottle),
+      static_cast<unsigned long>(gState.pid.lastDtUs),
+      static_cast<unsigned>(gState.pid.mixerMinSat),
+      static_cast<unsigned>(gState.pid.mixerMaxSat),
+      static_cast<unsigned>(gState.pid.mixerCorrScaled),
+      static_cast<unsigned>(gState.pid.rollPidSat),
+      static_cast<unsigned>(gState.pid.pitchPidSat),
+      static_cast<unsigned>(gState.pid.yawPidSat),
+      static_cast<unsigned>(motorSnap[0]),
+      static_cast<unsigned>(motorSnap[1]),
+      static_cast<unsigned>(motorSnap[2]),
+      static_cast<unsigned>(motorSnap[3]),
+      gState.pid.lastResetReason,
+      static_cast<unsigned long>(gState.pid.lastResetMs),
+      static_cast<unsigned long>(gState.pid.resetCount));
+}
+
 void flightTask(void* /*arg*/) {
   subscribeCurrentTaskToWatchdog("flight");
   TickType_t lastWake = xTaskGetTickCount();
@@ -7343,6 +11182,16 @@ void flightTask(void* /*arg*/) {
     const uint32_t iterStartUs = micros();
     const uint32_t nowMs = millis();
 
+    // ESC passthrough owns the four motor pins while active: skip ALL motor
+    // I/O, failsafe and control so we never fight the configurator bridge for
+    // the DShot lines. (Compiled away unless ENABLE_ESC_PASSTHROUGH=1.)
+    if (esc_passthrough::isActive()) {
+      updateTaskHealth(gHealth.flight, iterStartUs, millis(), FLIGHT_OVERRUN_WARN_US);
+      feedTaskWatchdog();
+      vTaskDelayUntil(&lastWake, period);
+      continue;
+    }
+
     if (gState.escReady) {
       gMotor0.update();
       gMotor1.update();
@@ -7350,7 +11199,15 @@ void flightTask(void* /*arg*/) {
       gMotor3.update();
     }
     serviceEscStartupSettle(nowMs);
-#if ENABLE_PID_WEBSERVER
+#if ENABLE_USB_CONFIG
+    if (serviceConfiguratorMotorTest(nowMs)) {
+      updateTaskHealth(gHealth.flight, iterStartUs, millis(), FLIGHT_OVERRUN_WARN_US);
+      feedTaskWatchdog();
+      vTaskDelayUntil(&lastWake, period);
+      continue;
+    }
+#endif
+#if ENABLE_PID_WEBSERVER || ENABLE_USB_CONFIG
     if (servicePidWebMotorSpin(nowMs)) {
       updateTaskHealth(gHealth.flight, iterStartUs, millis(), FLIGHT_OVERRUN_WARN_US);
       feedTaskWatchdog();
@@ -7360,6 +11217,26 @@ void flightTask(void* /*arg*/) {
 #endif
     applyFailsafeIfNeeded(nowMs);
     updateControlLoop(nowMs);
+    emitFlightStateLine(nowMs);
+#if ENABLE_PID_WEBSERVER || ENABLE_USB_CONFIG
+    recordPidWebDiagCaptureTick(nowMs);
+#endif
+
+    // Publish the wireless/log safety gate (atomic stores, ~ns). "Armed" for
+    // this purpose = flight switch allows flight OR any motor output active
+    // (armed idle counts) — the same definition the FailsafeManager uses.
+    // WiFi may only run while fully idle: disarmed AND the observer FSM in
+    // IDLE AND no motor output. Arming flips `armed`, which both forces a
+    // WiFi teardown (wifi_mgr::service) and engages the armed log policy.
+    {
+      const bool motorsActive =
+          anyMotorOutputActive(gState.motorRaw) || gState.pid.armedIdleActive;
+      const bool armed = gState.pid.prevAllowFlight || motorsActive;
+      const bool fsmIdle =
+          gFlightStatePublished.load(std::memory_order_relaxed) == flight_state::State::IDLE;
+      wifi_mgr::publishSafety(!armed && fsmIdle, armed);
+      fcu_log::publishArmed(armed);
+    }
 
     updateTaskHealth(gHealth.flight, iterStartUs, millis(), FLIGHT_OVERRUN_WARN_US);
     feedTaskWatchdog();
@@ -7411,10 +11288,16 @@ void sensorTask(void* /*arg*/) {
   for (;;) {
     const uint32_t iterStartUs = micros();
     const uint32_t nowMs = millis();
+#if ENABLE_PID_WEBSERVER || ENABLE_USB_CONFIG
+    serviceSensorRescan(nowMs);
+#endif
     pollTof(nowMs);
     pollBmp(nowMs);
     pollGps(nowMs);
     pollPiAutonomy(nowMs);
+#if FCU_ESC_TELEM
+    pollEscUartTelemetry(nowMs);  // KISS TLM round-robin (UART2 owner when enabled)
+#endif
     emitPiTelemetry(nowMs);   // FCU -> Pi: GPS + FCU_STATE @ ~5 Hz, self-throttled
     pollBattery(nowMs);
     updateFlightStateMachine(nowMs);  // observer-mode FSM, ~50 Hz
@@ -7422,9 +11305,14 @@ void sensorTask(void* /*arg*/) {
     // setPattern() is cheap when the pattern hasn't changed. Bursts queued
     // by GPS events still overlay this — they finish, then we resume the
     // pattern set here.
-    gNavLed.setPattern(computeNavLedPattern());
-    gNavLed.tick(nowMs);
-#if ENABLE_PID_WEBSERVER
+#if ENABLE_BLE_CONFIG
+    if (!fcu_ble_config::ledOverrideActive())
+#endif
+    {
+      gNavLed.setPattern(computeNavLedPattern());
+      gNavLed.tick(nowMs);
+    }
+#if ENABLE_PID_WEBSERVER || ENABLE_USB_CONFIG
     publishPidWebSafety();
 #endif
     updateTaskHealth(gHealth.sensors, iterStartUs, millis(), SENSOR_OVERRUN_WARN_US);
@@ -7433,12 +11321,61 @@ void sensorTask(void* /*arg*/) {
   }
 }
 
+#if ENABLE_ESC_PASSTHROUGH
+// Adapters that bind the isolated esc_passthrough module to the flight globals.
+// Function pointers can't capture, so these are free functions.
+static bool ptIsArmed() {
+  return gState.pid.prevAllowFlight ||
+         anyMotorOutputActive(gState.motorRaw) ||
+         gState.pid.armedIdleActive;
+}
+static bool ptSuspendMotor(uint8_t m) {
+  switch (m) {
+    case 0: return gMotor0.enterPassthrough();
+    case 1: return gMotor1.enterPassthrough();
+    case 2: return gMotor2.enterPassthrough();
+    case 3: return gMotor3.enterPassthrough();
+    default: return false;
+  }
+}
+static bool ptResumeMotor(uint8_t m) {
+  switch (m) {
+    case 0: return gMotor0.exitPassthrough();
+    case 1: return gMotor1.exitPassthrough();
+    case 2: return gMotor2.exitPassthrough();
+    case 3: return gMotor3.exitPassthrough();
+    default: return false;
+  }
+}
+// Send one DShot command frame (1..47) to all four motors. Used by esc fix3d /
+// esc dshotcmd. Caller (esc_passthrough) has already stopped the motors and
+// gated the flight loop off them, so this is the sole writer.
+static bool ptSendDshotCommandAll(uint16_t cmd) {
+  if (!gState.escReady) return false;
+  const bool ok0 = gMotor0.sendDshotCommandFrame(cmd);
+  const bool ok1 = gMotor1.sendDshotCommandFrame(cmd);
+  const bool ok2 = gMotor2.sendDshotCommandFrame(cmd);
+  const bool ok3 = gMotor3.sendDshotCommandFrame(cmd);
+  return ok0 && ok1 && ok2 && ok3;
+}
+#endif  // ENABLE_ESC_PASSTHROUGH
+
 // -----------------------------
 // Setup / loop
 // -----------------------------
 
 void setup() {
   Serial.begin(115200);
+  // USB-CDC writes must NEVER wait. With the default TX timeout (~100 ms), a
+  // host that is attached but not draining (frozen monitor, marginal USB-C
+  // cable — this airframe's known failure mode) makes every Serial write from
+  // a task stall up to that timeout. Timeout 0 = drop what doesn't fit. The
+  // log router + serialHasRoom() gates make the drops visible as counters.
+  Serial.setTxTimeoutMs(0);
+  // Non-blocking log ring (include/log_router.h). Producers (flight/sensor/
+  // radio/CRSF tasks) enqueue; loop() drains to USB and, when enabled and
+  // disarmed, the WiFi UDP sink. Must be up before the tasks are created.
+  fcu_log::init();
   delay(100);
 
   const esp_reset_reason_t resetReason = esp_reset_reason();
@@ -7501,6 +11438,11 @@ void setup() {
     // ---- consume them inline. Order matters: loadCalibrationFromNvs() only
     // ---- writes to gCal; sensor inits read from gCal.
     loadCalibrationFromNvs();
+    const bool savedFailsafeBypass = gPidNvs.loadFailsafeBypass(ALL_FAILSAFES_DISABLED);
+    gFailsafeBypass.store(savedFailsafeBypass, std::memory_order_relaxed);
+    Serial.printf("[NVS] failsafe bypass=%u (compiled default %u)\n",
+                  static_cast<unsigned>(savedFailsafeBypass),
+                  static_cast<unsigned>(ALL_FAILSAFES_DISABLED));
     gPidNvs.loadInto(gState.control.lastPacket);
     // One-shot migration: if NVS has all-zero yaw rate gains (the old default
     // before the hover-crash fix), overwrite them with the new bench-safe
@@ -7547,6 +11489,11 @@ void setup() {
     Serial.printf("[NVS] mix pitch_front_bias=%.3f (default %.3f)\n",
                   static_cast<double>(savedBias),
                   static_cast<double>(MIX_PITCH_FRONT_BIAS_DEFAULT));
+    // Magnetometer heading trim (key "magTrim"). Missing => 0 (no trim).
+    // Applied in computeMagHeadingDeg after declination.
+    gMagTrimDeg.store(gPidNvs.loadMagTrimDeg(0.0f), std::memory_order_relaxed);
+    Serial.printf("[NVS] mag heading trim=%.1f deg\n",
+                  static_cast<double>(gMagTrimDeg.load(std::memory_order_relaxed)));
 
     // ---- Autonomy-controller NVS-backed gains -----------------------------
     // Default values live in each controller's Config struct; loadXxxGains()
@@ -7636,7 +11583,22 @@ void setup() {
   notchConfig.minCommand = MOTOR_OUTPUT_MIN_ACTIVE_RAW;
   notchConfig.maxCommand = MOTOR_OUTPUT_MAX_RAW;
   notchConfig.useSecondHarmonic = DYNAMIC_NOTCH_USE_SECOND_HARMONIC;
-  gDynamicNotch.configure(notchConfig);
+  // Persistent notch override (dashboard "Save Filter to NVS"). Validated in
+  // loadNotchConfig; only min/max/Q + enabled are user-tunable — the
+  // command->frequency mapping stays from the compiled defaults.
+  {
+    const auto nv = gPidNvs.loadNotchConfig();
+    if (nv.valid) {
+      notchConfig.minFrequencyHz = nv.minHz;
+      notchConfig.maxFrequencyHz = nv.maxHz;
+      notchConfig.q = nv.q;
+      Serial.printf("[DYN_NOTCH] NVS override min=%.1f max=%.1f q=%.1f enabled=%u\n",
+                    (double)nv.minHz, (double)nv.maxHz, (double)nv.q, (unsigned)nv.enabled);
+    }
+    gDynamicNotch.configure(notchConfig);
+    gNotchCfg = notchConfig;
+    if (nv.valid && !nv.enabled) gDynamicNotch.setRuntimeBypass(true);
+  }
   Serial.printf("[DYN_NOTCH] enabled min=%.1f max=%.1f map=%.1f..%.1fHz q=%.1f update=%.1fHz harmonic2=%u\n",
                 DYNAMIC_NOTCH_MIN_HZ,
                 DYNAMIC_NOTCH_MAX_HZ,
@@ -7683,13 +11645,20 @@ void setup() {
   Serial.println("[RPM_FILTER] disabled (define FCU_ENABLE_RPM_FILTER=1 to enable)");
 #endif
 
-#if FCU_ENABLE_ESC_SERIAL_TLM
-  Serial.printf("[ESC_TLM][WARN] serial telemetry requested uart=%d rx=%d, but parser hookup is intentionally not enabled in this pass\n",
-                ESC_TLM_UART_NUM,
-                ESC_TLM_RX_PIN);
+#if FCU_ESC_TELEM
+  Serial.printf("[ESC_TLM] serial telemetry enabled rx=%d baud=%lu pole_pairs=%u (BDShot disabled in this build)\n",
+                PIN_ESC_TELEM,
+                static_cast<unsigned long>(ESC_TELEM_BAUD),
+                static_cast<unsigned>(ESC_TELEM_POLE_PAIRS));
 #else
-  Serial.println("[ESC_TLM] serial ESC telemetry disabled; BDShot remains the RPM-filter source");
+  Serial.println("[ESC_TLM] serial ESC telemetry disabled; BDShot/RPM filter uses signal-wire telemetry when enabled");
 #endif
+  Serial.printf("[DSHOT] mode=DSHOT300 bidir=%u throttle_max=%u abs_max=%u min_active=%u rmt_symbols=%u\n",
+                static_cast<unsigned>(BIDIR_DSHOT_ENABLED),
+                static_cast<unsigned>(MOTOR_OUTPUT_MAX_RAW),
+                static_cast<unsigned>(MOTOR_OUTPUT_ABS_MAX_RAW),
+                static_cast<unsigned>(MOTOR_OUTPUT_MIN_ACTIVE_RAW),
+                static_cast<unsigned>(FCU_RMT_TX_BUFFER_SYMBOLS));
 
   // Keep chip-select lines deasserted before bus init.
   prepareRadioChipSelects();
@@ -7702,6 +11671,21 @@ void setup() {
     Serial.printf("[ESC] startup settle %lu ms: holding motors at DSHOT zero while control link comes up\n",
                   static_cast<unsigned long>(ESC_STARTUP_SETTLE_MS));
   }
+
+#if ENABLE_ESC_PASSTHROUGH
+  // Wire the USB-CDC ESC passthrough mode to the motor objects. Compiled in only
+  // when ENABLE_ESC_PASSTHROUGH=1; it never auto-activates (explicit command).
+  {
+    esc_passthrough::Hooks ptHooks;
+    ptHooks.isArmed        = &ptIsArmed;
+    ptHooks.forceMotorStop = &forceMotorStop;
+    ptHooks.suspendMotor   = &ptSuspendMotor;
+    ptHooks.resumeMotor    = &ptResumeMotor;
+    ptHooks.sendDshotCommandAll = &ptSendDshotCommandAll;
+    ptHooks.motorCount     = 4;
+    esc_passthrough::begin(ptHooks);
+  }
+#endif
   feedTaskWatchdog();
   gState.imuReady = initImu(gState.imuSpiUsedHz, gState.imuSample, gState.imuSampleValid);
   feedTaskWatchdog();
@@ -7723,6 +11707,12 @@ void setup() {
     gnc::EstimatorNoiseParams noise;
     gnc::EstimatorGates gates;
     gEkf.init(accel0, noise, gates);
+    // Single-owner EKF: create the measurement queue before any task spawns so
+    // sensorTask can post and flightTask can drain from first tick. (F4)
+    gEkfMeasQ = xQueueCreate(16, sizeof(EkfMeasurement));
+    if (gEkfMeasQ == nullptr) {
+      Serial.println("[EKF] FATAL: measurement queue alloc failed; off-core sensor updates disabled");
+    }
     gEkfReady.store(true, std::memory_order_relaxed);
     Serial.printf("[EKF] init OK (shadow_only=%u, control_gate=%u)\n",
                   static_cast<unsigned>(gEkfShadowOnly),
@@ -7771,7 +11761,7 @@ void setup() {
   gAltCtrl.reset();
   gAutoTakeoff.reset();
   gFailsafe.reset();
-  if (ALL_FAILSAFES_DISABLED) {
+  if (failsafesBypassed()) {
     portENTER_CRITICAL(&gControlMux);
     gState.control.failsafeActive = false;
     portEXIT_CRITICAL(&gControlMux);
@@ -7779,7 +11769,8 @@ void setup() {
   }
   gFailsafe.configure(BATT_LOW_VOLTS, TILT_UNSAFE_DEG, CONTROL_FAILSAFE_TIMEOUT_MS,
                       AutonomyUart::kCommandTimeoutMs, 30U);
-  Serial.printf("[FCU] failsafe config disabled=%u tilt_only=%u tilt=%.1fdeg low_batt_latch=%u\n",
+  Serial.printf("[FCU] failsafe config bypass=%u compiled_default=%u tilt_only=%u tilt=%.1fdeg low_batt_latch=%u\n",
+                static_cast<unsigned>(failsafesBypassed()),
                 static_cast<unsigned>(ALL_FAILSAFES_DISABLED),
                 static_cast<unsigned>(TILT_ONLY_FAILSAFE_ENABLED),
                 static_cast<double>(TILT_UNSAFE_DEG),
@@ -7811,8 +11802,8 @@ void setup() {
                 static_cast<double>(PID_DTERM_LPF_HZ),
                 static_cast<double>(PID_INTEGRAL_LIMIT_RAW),
                 static_cast<double>(PID_OUTPUT_LIMIT_RAW));
-  if (ALL_FAILSAFES_DISABLED) {
-    Serial.println("[FCU][BENCH] automatic failsafe latches disabled in this build; do not fly");
+  if (failsafesBypassed()) {
+    Serial.println("[FCU][BENCH] automatic failsafe latches are bypassed at runtime; do not fly");
   }
   if (TILT_ONLY_FAILSAFE_ENABLED) {
     Serial.println("[FCU][BENCH] only unsafe tilt latches failsafe; link/IMU/loop/ToF/Pi/battery latches disabled");
@@ -7923,7 +11914,7 @@ void setup() {
                   static_cast<int>(flightTaskOk),
                   static_cast<int>(ibusTaskOk),
                   static_cast<int>(crsfTaskOk));
-    forceMotorStop();
+    forceMotorStop("fatal_task_create");
     Serial.flush();
     delay(100);
     ESP.restart();
@@ -7950,6 +11941,44 @@ void setup() {
   initPidWebserver();
 #endif
 
+#if ENABLE_USB_CONFIG
+  {
+    pid_webserver::Callbacks cbs = buildConfiguratorCallbacks();
+    fcu_configurator::init(cbs, "esp32-s3-mini-configurator");
+    fcu_configurator::SystemCallbacks sysCbs;
+    sysCbs.safeToMutate = pidWebWriteSafe;
+    sysCbs.rescanSensors = requestSensorRescan;
+    sysCbs.reboot = requestSystemReboot;
+    sysCbs.enterBootloader = requestSystemBootloader;
+    fcu_configurator::setSystemCallbacks(sysCbs);
+    fcu_configurator::MotorTestCallbacks motorCbs;
+    motorCbs.arm = configuratorMotorTestArm;
+    motorCbs.set = configuratorMotorTestSet;
+    motorCbs.stop = configuratorMotorTestStop;
+    fcu_configurator::setMotorTestCallbacks(motorCbs);
+  }
+#endif
+#if ENABLE_BLE_CONFIG
+  fcu_ble_config::init(millis());
+#endif
+
+#if FCU_WIFI_STACK_ENABLED
+  // Flight-build wireless features (compile-gated; see include/wifi_manager.h).
+  // Registration only — NO WiFi radio activity here. The stack is brought up
+  // exclusively by wifi_mgr::service() (loop task) after an explicit enable
+  // request, and only while disarmed with motors stopped.
+  {
+    wifi_mgr::Callbacks wcb;
+    wcb.stopMotors = forceMotorStop;
+    wifi_mgr::init(wcb, FCU_PID_WIFI_SSID, FCU_PID_WIFI_PASS, FCU_PID_AUTH_TOKEN);
+    Serial.printf("[WIFI] features compiled in (logging=%d ota=%d toggle=%d ch=%d) — OFF until enabled while disarmed\n",
+                  static_cast<int>(FCU_ENABLE_WIFI_LOGGING),
+                  static_cast<int>(FCU_ENABLE_WIFI_OTA),
+                  static_cast<int>(FCU_ENABLE_RADIO_WIFI_TOGGLE),
+                  static_cast<int>(FCU_WIFI_TOGGLE_AUX_CHANNEL));
+  }
+#endif
+
   Serial.printf("[FCU] RTOS tasks ready: flight@core%d/p%u radio@core%d/p%u sensors@core%d/p%u\n",
                 FLIGHT_TASK_CORE, static_cast<unsigned>(FLIGHT_TASK_PRIORITY),
                 RADIO_TASK_CORE, static_cast<unsigned>(RADIO_TASK_PRIORITY),
@@ -7959,9 +11988,35 @@ void setup() {
 void loop() {
   const uint32_t iterStartUs = micros();
   const uint32_t nowMs = millis();
+  // USB-CDC ESC passthrough CLI + dry-run pump + inactivity timeout. loop() is
+  // the designated low-priority I/O context. No-op unless ENABLE_ESC_PASSTHROUGH=1.
+  esc_passthrough::pollCli(Serial, nowMs);
+  // Wireless lifecycle + log-ring drain. loop() is the designated low-priority
+  // I/O context: it is the ONLY place that touches WiFi bring-up/teardown and
+  // the only writer to the log sinks. Both calls are cheap no-ops while the
+  // features are compiled out or idle.
+  wifi_mgr::service(nowMs);
+#if ENABLE_PID_WEBSERVER
+  pid_webserver::service(nowMs);
+#endif
+#if ENABLE_USB_CONFIG
+  fcu_configurator::service(Serial, nowMs);
+#endif
+#if ENABLE_BLE_CONFIG
+  fcu_ble_config::service(nowMs, pidWebWriteSafe());
+#endif
+  fcu_log::drain(nowMs);
+#if ENABLE_USB_CONFIG
+  serviceSystemAction(nowMs);
+#endif
+  // FFT for the dashboard notch analysis runs HERE (loop = lowest priority),
+  // never on the flight task. One pass after the capture buffer fills.
+  if (gNotchAnalyzer.needsAnalyze()) {
+    gNotchAnalyzer.analyze();
+  }
   const SensorSnapshot sensorSnap = readSensorSnapshot();
 
-  if (nowMs - gState.lastLogMs >= ZERO_LOG_PERIOD_MS) {
+  if (!esc_passthrough::isActive() && nowMs - gState.lastLogMs >= ZERO_LOG_PERIOD_MS) {
     gState.lastLogMs = nowMs;
 
     bool linkActive;
@@ -8021,7 +12076,7 @@ void loop() {
       }
     }
 
-    Serial.printf("[FCU] ctrl=%u telem=%u tx_pri=%lu tx_aux=%lu esc_hold=%u link=%u failsafe=%u rx_pkts=%lu thr=%u m1/2/3/4=%u/%u/%u/%u batt=%s att=%.1f/%.1f/%.1f mag=%u/%.1f/%.1f tof=%u gps_fix=%u sat=%u pid=%.1f/%.1f/%.1f\n",
+    fcu_log::logf(fcu_log::Level::Info, "[FCU] ctrl=%u telem=%u tx_pri=%lu tx_aux=%lu esc_hold=%u link=%u failsafe=%u rx_pkts=%lu thr=%u m1/2/3/4=%u/%u/%u/%u batt=%s att=%.1f/%.1f/%.1f mag=%u/%.1f/%.1f tof=%u gps_fix=%u sat=%u pid=%.1f/%.1f/%.1f\n",
                   static_cast<unsigned>(gState.ctrlRadioReady),
                   static_cast<unsigned>(gState.telemRadioReady),
                   static_cast<unsigned long>(gState.telemetryPrimaryTxCount),
@@ -8053,7 +12108,7 @@ void loop() {
     //   pid_ticks   = monotonic count of PID consumptions since boot
     // pid_age_ms close to 0 = RX path is healthy. A growing max over time
     // means the radio task is being starved or the remote is dropping out.
-    Serial.printf("[LAT] pkt_rate=%uHz pid_age_ms=%u pid_age_max=%u pid_loop=%uHz pid_ticks=%lu\n",
+    fcu_log::logf(fcu_log::Level::Info, "[LAT] pkt_rate=%uHz pid_age_ms=%u pid_age_max=%u pid_loop=%uHz pid_ticks=%lu\n",
                   static_cast<unsigned>(pktsPerSec),
                   static_cast<unsigned>(pktAgeNow),
                   static_cast<unsigned>(pktAgeMax),
@@ -8069,7 +12124,7 @@ void loop() {
     portENTER_CRITICAL(&gControlMux);
     divSnap = gDiversity;
     portEXIT_CRITICAL(&gControlMux);
-    Serial.printf("[DIV] rxA=%lu rxB=%lu accA=%lu accB=%lu dup=%lu badCrc=%lu telmTx=%lu/%lu/%lu mode=%s\n",
+    fcu_log::logf(fcu_log::Level::Info, "[DIV] rxA=%lu rxB=%lu accA=%lu accB=%lu dup=%lu badCrc=%lu telmTx=%lu/%lu/%lu mode=%s\n",
                   static_cast<unsigned long>(divSnap.pktsRxA),
                   static_cast<unsigned long>(divSnap.pktsRxB),
                   static_cast<unsigned long>(divSnap.pktsAcceptedA),
@@ -8084,10 +12139,32 @@ void loop() {
     // Flight state machine status — observer mode. Look for [FSM] transition
     // lines to see when the FCU changes states; this line is a "where am I
     // right now" snapshot.
-    Serial.printf("[FSM] state=%s time_in_state=%lums transitions=%lu\n",
-                  gFlightSm.stateName(),
-                  static_cast<unsigned long>(gFlightSm.timeInStateMs(nowMs)),
-                  static_cast<unsigned long>(gFlightSm.transitionCount()));
+    const uint32_t fsmEntered = gFlightStateEnteredMs.load(std::memory_order_relaxed);
+    const uint32_t fsmTimeInState = (nowMs >= fsmEntered) ? (nowMs - fsmEntered) : 0U;
+    fcu_log::logf(fcu_log::Level::Info, "[FSM] state=%s time_in_state=%lums transitions=%lu\n",
+                  flight_state::FlightStateMachine::name(
+                      gFlightStatePublished.load(std::memory_order_relaxed)),
+                  static_cast<unsigned long>(fsmTimeInState),
+                  static_cast<unsigned long>(
+                      gFlightTransitionCount.load(std::memory_order_relaxed)));
+
+    // Motor output health — commanded vs accepted + per-motor write-ok bitmask,
+    // so a silently failing ESC write is visible beyond the rate-limited [ESC]
+    // fail log. (F10)
+    std::array<uint16_t, 4> mCmd{}, mAcc{};
+    uint8_t mMask = 0;
+    portENTER_CRITICAL(&gFlightMux);
+    mCmd = gState.motorRaw;
+    mAcc = gState.motorAcceptedRaw;
+    mMask = gState.motorWriteOkMask;
+    portEXIT_CRITICAL(&gFlightMux);
+    fcu_log::logf(fcu_log::Level::Info, "[MOTOR] cmd=%u/%u/%u/%u acc=%u/%u/%u/%u write_ok=0x%X write_fail=%lu\n",
+                  static_cast<unsigned>(mCmd[0]), static_cast<unsigned>(mCmd[1]),
+                  static_cast<unsigned>(mCmd[2]), static_cast<unsigned>(mCmd[3]),
+                  static_cast<unsigned>(mAcc[0]), static_cast<unsigned>(mAcc[1]),
+                  static_cast<unsigned>(mAcc[2]), static_cast<unsigned>(mAcc[3]),
+                  static_cast<unsigned>(mMask),
+                  static_cast<unsigned long>(gState.zeroSendFailCount));
 
     // Control-link health. Read-side metrics from the radio task's view of
     // the link, derived from existing ControlPacket sequence numbers:
@@ -8099,7 +12176,7 @@ void loop() {
     // loss>2% or jitter>10ms means the radio environment is noisy or the
     // remote is dropping out. Combine with [LAT] pid_age_ms to triangulate
     // whether the issue is on the wire (here) or in scheduling (LAT).
-    Serial.printf("[LINK] ctrl_loss=%u%% jitter_ms=%u max_gap=%u total_lost=%lu\n",
+    fcu_log::logf(fcu_log::Level::Info, "[LINK] ctrl_loss=%u%% jitter_ms=%u max_gap=%u total_lost=%lu\n",
                   static_cast<unsigned>(linkLossPercent),
                   static_cast<unsigned>(linkJitterMs),
                   static_cast<unsigned>(linkMaxGap),
@@ -8133,7 +12210,7 @@ void loop() {
       imuFails = gState.pid.imuFailGraceTicks;
       portEXIT_CRITICAL(&gFlightMux);
       // motorSnap was already captured above for the [FCU] log line.
-      Serial.printf("[THR_DBG] rx=%u tgt=%u sm=%u age=%ums hz=%u fs=%u imu_g=%u "
+      fcu_log::logf(fcu_log::Level::Info, "[THR_DBG] rx=%u tgt=%u sm=%u age=%ums hz=%u fs=%u imu_g=%u "
                     "m=[%u,%u,%u,%u] dt=%.2f\n",
                     static_cast<unsigned>(rxThr),
                     static_cast<unsigned>(tgtThr),
@@ -8161,7 +12238,7 @@ void loop() {
     // gated separately in updateControlLoop by manualOverride, armed state,
     // and autonomy.enabled — Pi cannot bypass any of those.
     const uint32_t aiAge = gPiAutonomy.aiAgeMs(nowMs);
-    Serial.printf("[AI] raw=%u eff=%u conf=%.2f class=%u age_ms=%lu healthy=%u "
+    fcu_log::logf(fcu_log::Level::Info, "[AI] raw=%u eff=%u conf=%.2f class=%u age_ms=%lu healthy=%u "
                   "ok=%lu bad_cs=%lu parse=%lu timeout=%lu lowconf=%lu\n",
                   static_cast<unsigned>(gPiAutonomy.aiRawDecision()),
                   static_cast<unsigned>(gPiAutonomy.aiEffectiveDecision()),
@@ -8193,7 +12270,7 @@ void loop() {
     if (freeInternalHeap < gHealth.minInternalHeap) {
       gHealth.minInternalHeap = freeInternalHeap;
     }
-    Serial.printf("[HEALTH] stack_free(words) flight=%u radio=%u sensors=%u loop=%u heap_free=%lu min=%lu internal=%lu/%lu wdt=%u serial_drop=%lu tune_drop=%lu\n",
+    fcu_log::logf(fcu_log::Level::Info, "[HEALTH] stack_free(words) flight=%u radio=%u sensors=%u loop=%u heap_free=%lu min=%lu internal=%lu/%lu wdt=%u serial_drop=%lu tune_drop=%lu\n",
                   static_cast<unsigned>(flightHw),
                   static_cast<unsigned>(radioHw),
                   static_cast<unsigned>(sensorHw),
@@ -8205,7 +12282,7 @@ void loop() {
                   static_cast<unsigned>(gHealth.taskWdtReady),
                   static_cast<unsigned long>(gHealth.serialBackpressureCount),
                   static_cast<unsigned long>(gHealth.droppedTuneLogs));
-    Serial.printf("[TASK] hb_ms flight=%lu radio=%lu sensors=%lu loop=%lu dur_us=%lu/%lu/%lu/%lu max_us=%lu/%lu/%lu/%lu overrun=%lu/%lu/%lu/%lu radio_bad=%lu/%lu telm_fail=%lu\n",
+    fcu_log::logf(fcu_log::Level::Info, "[TASK] hb_ms flight=%lu radio=%lu sensors=%lu loop=%lu dur_us=%lu/%lu/%lu/%lu max_us=%lu/%lu/%lu/%lu overrun=%lu/%lu/%lu/%lu radio_bad=%lu/%lu telm_fail=%lu\n",
                   static_cast<unsigned long>(nowMs - gHealth.flight.heartbeatMs),
                   static_cast<unsigned long>(nowMs - gHealth.radio.heartbeatMs),
                   static_cast<unsigned long>(nowMs - gHealth.sensors.heartbeatMs),
@@ -8228,7 +12305,7 @@ void loop() {
     const uint32_t bmpAgeMs = (sensorSnap.baro.valid && sensorSnap.baro.lastUpdateMs != 0U)
         ? (nowMs - sensorSnap.baro.lastUpdateMs)
         : 0xFFFFFFFFU;
-    Serial.printf("[BMP] ready=%u valid=%u alt=%.2fm pressure=%.1fPa temp=%.2fC age=%s%lu reads=%lu fails=%lu fail=%s last_us=%lu max_us=%lu\n",
+    fcu_log::logf(fcu_log::Level::Info, "[BMP] ready=%u valid=%u alt=%.2fm pressure=%.1fPa temp=%.2fC age=%s%lu reads=%lu fails=%lu fail=%s last_us=%lu max_us=%lu\n",
                   static_cast<unsigned>(sensorSnap.baro.ready),
                   static_cast<unsigned>(sensorSnap.baro.valid),
                   sensorSnap.baro.relativeAltM,
@@ -8241,6 +12318,26 @@ void loop() {
                   baroFailReasonName(sensorSnap.baro.lastFailReason),
                   static_cast<unsigned long>(sensorSnap.baro.lastReadDurationUs),
                   static_cast<unsigned long>(sensorSnap.baro.maxReadDurationUs));
+    // Log-router + wireless health. drop = ring full (producers never wait),
+    // sup = armed-policy suppressions, usb = written/dropped-no-room/withheld
+    // -by-WiFi-suspension, udp = lines handed to the WiFi sink.
+    const fcu_log::Stats logStats = fcu_log::stats();
+    const wifi_mgr::Stats wifiStats = wifi_mgr::stats();
+    fcu_log::logf(fcu_log::Level::Info,
+                  "[LOG] enq=%lu drop=%lu sup=%lu trunc=%lu usb=%lu/%lu/%lu udp=%lu wifi=%s conn=%lu/%lu teardown_armed=%lu udp_fail=%lu\n",
+                  static_cast<unsigned long>(logStats.enqueued),
+                  static_cast<unsigned long>(logStats.droppedFull),
+                  static_cast<unsigned long>(logStats.suppressedArmed),
+                  static_cast<unsigned long>(logStats.truncated),
+                  static_cast<unsigned long>(logStats.usbWritten),
+                  static_cast<unsigned long>(logStats.usbDropped),
+                  static_cast<unsigned long>(logStats.usbSuspended),
+                  static_cast<unsigned long>(logStats.udpLines),
+                  wifi_mgr::stateName(),
+                  static_cast<unsigned long>(wifiStats.connectAttempts),
+                  static_cast<unsigned long>(wifiStats.connectFailures),
+                  static_cast<unsigned long>(wifiStats.forcedTeardownsArmed),
+                  static_cast<unsigned long>(wifiStats.udpSendFailures));
   }
 
   updateTaskHealth(gHealth.loop, iterStartUs, millis(), 60000U);

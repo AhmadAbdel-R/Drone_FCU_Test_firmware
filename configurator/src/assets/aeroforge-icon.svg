@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="AeroForge Configurator">
+  <rect width="128" height="128" rx="24" fill="#151715"/>
+  <path d="M64 16 98 68 64 112 30 68 64 16Z" fill="#2ad184"/>
+  <path d="M64 31 82 68 64 91 46 68 64 31Z" fill="#151715"/>
+  <path d="M22 64h84v8H22z" fill="#e8eee9"/>
+  <circle cx="28" cy="68" r="10" fill="#e8eee9"/>
+  <circle cx="100" cy="68" r="10" fill="#e8eee9"/>
+</svg>

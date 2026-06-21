@@ -87,6 +87,15 @@ dshot_result_t DShotRMT::sendThrottle(uint16_t throttle)
     _last_throttle = constrain(throttle, DSHOT_THROTTLE_MIN, DSHOT_THROTTLE_MAX);
 
     _packet = _buildDShotPacket(_last_throttle);
+    // One-shot UART-telemetry request (see requestTelemetrySignal()). Only in
+    // normal mode — bidirectional already sets the bit in _buildDShotPacket.
+    // The CRC must be recomputed because it covers the telemetry bit.
+    if (!_is_bidirectional && _uart_telemetry_request_atomic.exchange(false))
+    {
+        _packet.telemetric_request = 1;
+        const uint16_t data_for_crc = (_packet.throttle_value << 1) | 0x01;
+        _packet.checksum = _calculateCRC(data_for_crc);
+    }
     return _sendPacket(_packet);
 }
 
@@ -328,7 +337,14 @@ dshot_packet_t DShotRMT::_buildDShotPacket(const uint16_t &value) const
     dshot_packet_t packet = {};
 
     packet.throttle_value = value & DSHOT_THROTTLE_MAX;
-    packet.telemetric_request = _is_bidirectional ? 1 : 0;
+    // DShot settings commands (values 1..47) MUST be transmitted with the
+    // telemetry/ack bit HIGH (DShot settings-request spec; see dshot_command.h:
+    // "the TLM Byte must always be high if 1-47 are used to send settings").
+    // Normal throttle frames (0, or 48..2047) keep the bidirectional-mode
+    // default. Without this, sendCommand() is a silent no-op on a
+    // non-bidirectional link because the ESC never treats the frame as a command.
+    const bool is_command_frame = (value >= 1) && (value <= DSHOT_CMD_MAX);
+    packet.telemetric_request = (_is_bidirectional || is_command_frame) ? 1 : 0;
 
     // The data for CRC calculation includes the 11-bit value and the 1-bit telemetry flag.
     uint16_t data_for_crc = (packet.throttle_value << 1) | packet.telemetric_request;

@@ -2,6 +2,10 @@
 
 #if ENABLE_PID_WEBSERVER
 
+#if defined(FCU_DISABLE_FAILSAFES) && (FCU_DISABLE_FAILSAFES)
+#warning "PID-web build default is failsafe bypass; runtime PID-web setting can re-enable, but treat as BENCH-ONLY until verified."
+#endif
+
 #include <Arduino.h>
 #include <esp_err.h>
 #include <esp_log.h>
@@ -10,20 +14,76 @@
 #include <esp_http_server.h>
 
 #include <atomic>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+#include "pidweb_dashboard_html.h"
 
 namespace pid_webserver {
 
 namespace {
 
 constexpr const char* kTag = "PIDWEB";
+#ifndef FCU_PID_WIFI_RECONNECT_BACKOFF_MS
+#define FCU_PID_WIFI_RECONNECT_BACKOFF_MS 3000U
+#endif
+#ifndef FCU_PID_WIFI_HEALTH_LOG_MS
+#define FCU_PID_WIFI_HEALTH_LOG_MS 5000U
+#endif
+#ifndef FCU_PID_HTTPD_STACK_BYTES
+#define FCU_PID_HTTPD_STACK_BYTES (6 * 1024)
+#endif
+#ifndef FCU_PID_TELEM_STACK_BYTES
+#define FCU_PID_TELEM_STACK_BYTES 4096
+#endif
 
 Callbacks gCb;
 httpd_handle_t gServer = nullptr;
 std::atomic<bool> gSafeToWrite{false};
 std::atomic<bool> gRunning{false};
+const char* gSsid = "";
+const char* gPassword = "";
+uint32_t gConnectTimeoutMs = 10000U;
+uint32_t gNextReconnectMs = 0;
+uint32_t gReconnectDeadlineMs = 0;
+uint32_t gLastHealthLogMs = 0;
+uint32_t gLastIp = 0;
+bool gReconnectInProgress = false;
+
+// Shared-secret token required on every mutating request via the X-Auth-Token
+// header. Set once before start(); only read thereafter, so a plain buffer is
+// fine. Empty token => all mutating requests rejected (fail-closed).
+char gAuthToken[96] = {};
+
+// Constant-time string compare so a wrong token can't be teased out by timing.
+// Returns true iff a and b are equal and the same length.
+bool constantTimeEquals(const char* a, const char* b) {
+  const size_t la = strlen(a);
+  const size_t lb = strlen(b);
+  uint8_t diff = static_cast<uint8_t>(la ^ lb);
+  const size_t n = (la > lb) ? la : lb;
+  for (size_t i = 0; i < n; ++i) {
+    const uint8_t ca = (i < la) ? static_cast<uint8_t>(a[i]) : 0;
+    const uint8_t cb = (i < lb) ? static_cast<uint8_t>(b[i]) : 0;
+    diff |= static_cast<uint8_t>(ca ^ cb);
+  }
+  return diff == 0;
+}
+
+// Authorize a mutating request: requires the X-Auth-Token header to match the
+// configured token. Fails closed when no token is configured.
+bool authorized(httpd_req_t* req) {
+  if (gAuthToken[0] == '\0') {
+    return false;
+  }
+  char hdr[96] = {};
+  if (httpd_req_get_hdr_value_str(req, "X-Auth-Token", hdr, sizeof(hdr)) != ESP_OK) {
+    return false;
+  }
+  return constantTimeEquals(hdr, gAuthToken);
+}
 
 // ---- HTML page (embedded). Tiny so it fits in PROGMEM trivially. ----
 // Single-file: HTML+CSS+JS, polls /api/pid + /api/state every 500ms, exposes
@@ -49,6 +109,12 @@ const char kIndexHtml[] PROGMEM = R"HTML(<!doctype html>
  .warn{color:#ffb020} .ok{color:#3ce074} .err{color:#ff4d4d}
 </style></head><body>
 <h1>FCU PID Tuner <span id="safe" class="warn">checking...</span></h1>
+<div class="status" style="margin:-4px 0 10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+ <span id="authState">auth: ?</span>
+ <button class="btn" style="padding:4px 10px;font-size:12px" onclick="setToken()">Set token</button>
+ <button class="btn" style="padding:4px 10px;font-size:12px" onclick="clearToken()">Clear</button>
+ <span style="color:#5a6070">Token persists in this browser. Required for any edit/save.</span>
+</div>
 <div id="grps"></div>
 <div class="grp"><h2>Motor orientation</h2><div class="actions">
  <button class="btn motor" onclick="spinMotor(1)">Spin motor 1</button>
@@ -90,6 +156,26 @@ const char kIndexHtml[] PROGMEM = R"HTML(<!doctype html>
  <textarea id="fullLogText" readonly style="width:100%;height:380px;background:#0c0f12;color:#cdd2db;border:1px solid #2a2f38;border-radius:6px;padding:8px 10px;font:11px/1.35 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;resize:vertical;white-space:pre"></textarea>
 </div>
 <script>
+// Auth token: priority is URL ?token=... > localStorage > prompt.
+// Mutating (PUT/POST) requests carry it as the X-Auth-Token header. Read-only
+// GETs (poll/state/tune) are not gated, so the page always renders.
+let TOKEN=new URLSearchParams(location.search).get('token')||localStorage.getItem('fcuToken')||'';
+if(TOKEN){try{localStorage.setItem('fcuToken',TOKEN);}catch(e){}}
+function authHdrs(extra){const h=Object.assign({},extra||{});if(TOKEN)h['X-Auth-Token']=TOKEN;return h;}
+function updateAuthBadge(){const el=document.getElementById('authState');if(!el)return;el.textContent=TOKEN?('auth: OK ('+TOKEN.length+' chars)'):'auth: NO TOKEN - click Set token';el.className=TOKEN?'ok':'err';}
+function setToken(){const t=prompt('Paste FCU auth token (value of FCU_PID_AUTH_TOKEN in pidweb_secrets.h):',TOKEN);if(t===null)return;TOKEN=t.trim();try{if(TOKEN)localStorage.setItem('fcuToken',TOKEN);else localStorage.removeItem('fcuToken');}catch(e){}updateAuthBadge();poll();}
+function clearToken(){TOKEN='';try{localStorage.removeItem('fcuToken');}catch(e){}updateAuthBadge();}
+let auth401Notified=false;
+async function afetch(url,opts){
+ const r=await fetch(url,opts);
+ if(r.status===401 && !auth401Notified){
+  auth401Notified=true;
+  setTimeout(()=>{auth401Notified=false;},5000);
+  if(!TOKEN){alert('Auth required. Click Set token at top and paste FCU_PID_AUTH_TOKEN.');}
+  else{alert('Auth rejected (401). Token is wrong - click Set token to update.');}
+ }
+ return r;
+}
 // Per-field slider ceilings match the FCU's safety clamps in main.cpp:
 //   MAX_PID_KP_MILLI = 5000   (rate P)
 //   MAX_PID_KI_MILLI = 3000   (rate I)
@@ -137,7 +223,7 @@ async function poll(){
 async function pushMix(){
  const v=parseFloat(document.getElementById('mixBias').value);
  if(!(v>=1.0&&v<=2.0)){alert('Bias must be 1.00–2.00');return;}
- try{ const r=await fetch('/api/mix',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({bias:v})});
+ try{ const r=await afetch('/api/mix',{method:'PUT',headers:authHdrs({'content-type':'application/json'}),body:JSON.stringify({bias:v})});
   if(r.ok){poll();}else{let msg='Apply failed';try{const j=await r.json();if(j.error)msg+=': '+j.error;}catch(e){}alert(msg);}
  }catch(e){alert('Apply failed: '+e);}
 }
@@ -146,16 +232,16 @@ async function saveMix(){
  await postAction('/api/mix/save','Mixer bias saved to NVS','Save failed');
 }
 let pushTimer=null;
-function push(){ clearTimeout(pushTimer); pushTimer=setTimeout(async()=>{ try{await fetch('/api/pid',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({gains})});}catch(e){} },120);}
+function push(){ clearTimeout(pushTimer); pushTimer=setTimeout(async()=>{ try{await afetch('/api/pid',{method:'PUT',headers:authHdrs({'content-type':'application/json'}),body:JSON.stringify({gains})});}catch(e){} },120);}
 async function save(){
- const r=await fetch('/api/pid/save',{method:'POST'});
+ const r=await afetch('/api/pid/save',{method:'POST',headers:authHdrs()});
  if(r.ok){ alert('Saved to NVS'); return; }
  let msg='Save failed';
  try{ const j=await r.json(); if(j.error) msg += ': '+j.error; }catch(e){}
  alert(msg);
 }
 async function postAction(url, okText, failText){
- const r=await fetch(url,{method:'POST'});
+ const r=await afetch(url,{method:'POST',headers:authHdrs()});
  if(r.ok){ if(okText) alert(okText); poll(); return true; }
  let msg=failText;
  try{ const j=await r.json(); if(j.error) msg += ': '+j.error; }catch(e){}
@@ -237,7 +323,9 @@ async function copyFullLog(){
  if(ok){ alert('Copied '+tuneLog.length+' entries to clipboard.'); }
  else{ alert('Auto-copy blocked by browser. Use Ctrl+A then Ctrl+C in the text box.'); }
 }
-buildUI(); poll(); setInterval(poll,500); setInterval(pollTune,1000); pollTune();
+buildUI(); updateAuthBadge();
+if(!TOKEN){ setTimeout(()=>{ if(!TOKEN) setToken(); }, 300); }
+poll(); setInterval(poll,500); setInterval(pollTune,1000); pollTune();
 </script></body></html>)HTML";
 
 // ---- helpers ----
@@ -319,8 +407,194 @@ bool parseGainsArray(const char* body, int16_t out[12]) {
   return count == 12;
 }
 
+bool parseRollPitch(const char* body, float& roll, float& pitch) {
+  return parseJsonFloat(body, "roll", roll) && parseJsonFloat(body, "pitch", pitch);
+}
+
+// ============================================================================
+// Live telemetry: JSON frame builder + WebSocket push.
+// ----------------------------------------------------------------------------
+// The dashboard receives the full signal-path frame ~25 Hz over a WebSocket.
+// A dedicated low-priority task (core 0, prio 2 — below httpd's 3, far below
+// flight/radio/sensor) reads the snapshot via getDashTelemetry, formats JSON,
+// and pushes to every connected WS client. The flight loop is never touched.
+// ============================================================================
+std::atomic<uint8_t> gWsClients{0};
+std::atomic<uint16_t> gWebTelemHz{0};
+TaskHandle_t gTelemTask = nullptr;
+
+// Bounded JSON appender: vsnprintf into a fixed buffer, truncation-safe.
+struct JsonAppender {
+  char* buf;
+  size_t cap;
+  size_t len;
+  void f(const char* fmt, ...) {
+    if (len + 1 >= cap) return;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + len, cap - len, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if (static_cast<size_t>(n) >= cap - len) {
+      len = cap - 1;  // truncated — stop appending
+    } else {
+      len += static_cast<size_t>(n);
+    }
+  }
+};
+// JSON has no NaN/Inf literal — sanitize every float so a transient bad value
+// can never produce a frame the browser's JSON.parse rejects.
+static float jf(float v) { return isfinite(v) ? v : 0.0f; }
+
+int formatDashJson(char* out, size_t cap, const DashTelemetry& d,
+                   uint8_t wsClients, uint16_t webHz) {
+  JsonAppender j{out, cap, 0};
+  j.f("{\"sys\":{\"up\":%lu,\"armed\":%d,\"fs\":%d,\"fsr\":%u,\"fsb\":%d,\"fsc\":%d,\"link\":%d,\"thr\":%u,"
+      "\"loop\":%u,\"bv\":%.2f,\"bp\":%d,\"blow\":%d,\"ben\":%d,\"heap\":%lu,"
+      "\"minheap\":%lu,\"ovr\":%lu,\"maxus\":%lu,\"wsc\":%u,\"whz\":%u,\"mode\":%u}",
+      (unsigned long)d.uptimeMs, d.armed ? 1 : 0, d.failsafeActive ? 1 : 0, d.failsafeReason,
+      d.failsafeBypass ? 1 : 0, d.failsafeBypassCompiledDefault ? 1 : 0,
+      d.controlLinkUp ? 1 : 0, d.throttlePct, d.loopHz, jf(d.battVolts),
+      (d.battPercent == 0xFF) ? -1 : (int)d.battPercent, d.battLow ? 1 : 0, d.battEnabled ? 1 : 0,
+      (unsigned long)d.freeHeap, (unsigned long)d.minFreeHeap, (unsigned long)d.flightOverruns,
+      (unsigned long)d.flightMaxUs, wsClients, webHz, d.flightMode);
+  j.f(",\"att\":{\"rr\":%.2f,\"rp\":%.2f,\"ry\":%.2f,\"cr\":%.2f,\"cp\":%.2f,"
+      "\"tr\":%.2f,\"tp\":%.2f,\"tyr\":%.1f,\"er\":%.2f,\"ep\":%.2f,\"at\":%d}",
+      jf(d.rawRollDeg), jf(d.rawPitchDeg), jf(d.rawYawDeg), jf(d.corrRollDeg), jf(d.corrPitchDeg),
+      jf(d.targetRollDeg), jf(d.targetPitchDeg), jf(d.targetYawRateDps), jf(d.rollErrDeg),
+      jf(d.pitchErrDeg), d.accelTrusted ? 1 : 0);
+  j.f(",\"imu\":{\"a\":[%.4f,%.4f,%.4f],\"ao\":[%.4f,%.4f,%.4f],\"av\":%d,\"am\":%.4f,"
+      "\"g\":[%.3f,%.3f,%.3f],\"gb\":[%.3f,%.3f,%.3f],\"gbv\":%d,\"rdy\":%d}",
+      jf(d.accelG[0]), jf(d.accelG[1]), jf(d.accelG[2]), jf(d.accelOffG[0]), jf(d.accelOffG[1]),
+      jf(d.accelOffG[2]), d.accelValid ? 1 : 0, jf(d.accelMag), jf(d.gyroDps[0]), jf(d.gyroDps[1]),
+      jf(d.gyroDps[2]), jf(d.gyroBiasDps[0]), jf(d.gyroBiasDps[1]), jf(d.gyroBiasDps[2]),
+      d.gyroBiasValid ? 1 : 0, d.imuReady ? 1 : 0);
+  j.f(",\"lvl\":{\"o\":[%.3f,%.3f],\"t\":[%.3f,%.3f],\"ld\":%d,\"st\":%u,\"er\":%u,\"n\":%u,"
+      "\"std\":[%.3f,%.3f]}",
+      jf(d.levelOffsetDeg[0]), jf(d.levelOffsetDeg[1]), jf(d.trimDeg[0]), jf(d.trimDeg[1]),
+      d.levelLoaded ? 1 : 0, d.levelCalState, d.levelCalErr, d.levelCalAccepted,
+      jf(d.levelCalStdDeg[0]), jf(d.levelCalStdDeg[1]));
+  j.f(",\"pid\":{\"r\":[%.2f,%.2f,%.2f,%.2f,%.2f],\"p\":[%.2f,%.2f,%.2f,%.2f,%.2f],"
+      "\"y\":[%.2f,%.2f,%.2f,%.2f,%.2f],\"sp\":[%.2f,%.2f,%.2f],\"smin\":%d,\"smax\":%d,"
+      "\"ssc\":%d,\"sat\":[%d,%d,%d]}",
+      jf(d.pidRoll[0]), jf(d.pidRoll[1]), jf(d.pidRoll[2]), jf(d.pidRoll[3]), jf(d.pidRoll[4]),
+      jf(d.pidPitch[0]), jf(d.pidPitch[1]), jf(d.pidPitch[2]), jf(d.pidPitch[3]), jf(d.pidPitch[4]),
+      jf(d.pidYaw[0]), jf(d.pidYaw[1]), jf(d.pidYaw[2]), jf(d.pidYaw[3]), jf(d.pidYaw[4]),
+      jf(d.rateSpDps[0]), jf(d.rateSpDps[1]), jf(d.rateSpDps[2]),
+      d.satMin ? 1 : 0, d.satMax ? 1 : 0, d.satScaled ? 1 : 0,
+      d.pidSat[0] ? 1 : 0, d.pidSat[1] ? 1 : 0, d.pidSat[2] ? 1 : 0);
+  j.f(",\"mix\":{\"base\":%.1f,\"r\":%.2f,\"pf\":%.2f,\"pr\":%.2f,\"y\":%.2f,"
+      "\"unc\":[%.1f,%.1f,%.1f,%.1f],\"m\":[%u,%u,%u,%u],\"bias\":%.3f}",
+      jf(d.mixBase), jf(d.mixRoll), jf(d.mixPitchFront), jf(d.mixPitchRear), jf(d.mixYaw),
+      jf(d.mixUnclamped[0]), jf(d.mixUnclamped[1]), jf(d.mixUnclamped[2]), jf(d.mixUnclamped[3]),
+      d.motorRaw[0], d.motorRaw[1], d.motorRaw[2], d.motorRaw[3], jf(d.mixBias));
+  j.f(",\"rc\":{\"comp\":%d,\"up\":%d,\"fs\":%d,\"lq\":%u,\"rssi\":%d,\"fr\":%u,\"age\":%lu,"
+      "\"loss\":%u,\"pps\":%u,\"ch\":[%u,%u,%u,%u,%u,%u,%u,%u]}",
+      d.crsfCompiled ? 1 : 0, d.rcLinkUp ? 1 : 0, d.rcFailsafe ? 1 : 0, d.rcLq, d.rcRssiDbm,
+      d.rcFrameRateHz, (unsigned long)d.rcFrameAgeMs, d.rcLossPercent, d.rcPacketsPerSec,
+      d.rcChannelsUs[0], d.rcChannelsUs[1], d.rcChannelsUs[2], d.rcChannelsUs[3],
+      d.rcChannelsUs[4], d.rcChannelsUs[5], d.rcChannelsUs[6], d.rcChannelsUs[7]);
+  j.f(",\"sen\":{\"baro\":{\"r\":%d,\"v\":%d,\"pa\":%.1f,\"alt\":%.2f,\"t\":%.1f,\"age\":%lu},"
+      "\"tof\":{\"comp\":%d,\"r\":%d,\"rng\":%d,\"mm\":%u,\"age\":%lu},"
+      "\"gps\":{\"comp\":%d,\"r\":%d,\"fix\":%d,\"sats\":%u,\"q\":%u,\"lat\":%ld,\"lon\":%ld,\"age\":%lu,"
+      "\"gsv\":%d,\"cv\":%d,\"vv\":%d,\"sp\":%u,\"spd\":%.2f,\"cog\":%u,\"vn\":%.2f,\"ve\":%.2f,\"rmc\":%lu},"
+      "\"mag\":{\"v\":%d,\"hdg\":%.1f,\"f\":%.1f,\"cal\":%d},\"ekf\":%d,"
+      "\"ekfd\":{\"av\":%d,\"pv\":%d,\"vv\":%d,\"gv\":%d,\"mv\":%d,\"if\":%d,\"yaw\":%.1f,"
+      "\"v\":[%.2f,%.2f,%.2f],\"p\":[%.1f,%.1f,%.1f],\"gi\":[%.1f,%.1f,%.1f],"
+      "\"mi\":%.1f,\"gps\":[%lu,%lu],\"mag\":[%lu,%lu],\"drop\":%lu}}",
+      d.baroReady ? 1 : 0, d.baroValid ? 1 : 0, jf(d.baroPa), jf(d.baroAltM), jf(d.baroTempC),
+      (unsigned long)d.baroAgeMs, d.tofCompiled ? 1 : 0, d.tofReady ? 1 : 0, d.tofRanging ? 1 : 0,
+      d.tofMm, (unsigned long)d.tofAgeMs, d.gpsCompiled ? 1 : 0, d.gpsReady ? 1 : 0, d.gpsFix ? 1 : 0,
+      d.gpsSats, d.gpsFixQual, (long)d.gpsLatE7, (long)d.gpsLonE7, (unsigned long)d.gpsAgeMs,
+      d.gpsGroundSpeedValid ? 1 : 0, d.gpsCourseValid ? 1 : 0, d.gpsVelocityValid ? 1 : 0,
+      d.gpsGroundSpeedKmh10, jf(d.gpsGroundSpeedMs), d.gpsCourseCentiDeg,
+      jf(d.gpsVelNorthMs), jf(d.gpsVelEastMs), (unsigned long)d.gpsRmcAgeMs,
+      d.magValid ? 1 : 0, jf(d.magHeadingDeg), jf(d.magFieldUt), d.magCalValid ? 1 : 0,
+      d.ekfReady ? 1 : 0,
+      d.ekfAttValid ? 1 : 0, d.ekfPosValid ? 1 : 0, d.ekfVelValid ? 1 : 0,
+      d.ekfGpsValid ? 1 : 0, d.ekfMagValid ? 1 : 0, d.ekfInnovationFault ? 1 : 0,
+      jf(d.ekfYawDeg), jf(d.ekfVelNed[0]), jf(d.ekfVelNed[1]), jf(d.ekfVelNed[2]),
+      jf(d.ekfPosNed[0]), jf(d.ekfPosNed[1]), jf(d.ekfPosNed[2]),
+      jf(d.ekfGpsInnov[0]), jf(d.ekfGpsInnov[1]), jf(d.ekfGpsInnov[2]),
+      jf(d.ekfMagInnovDeg), (unsigned long)d.ekfGpsAccept, (unsigned long)d.ekfGpsReject,
+      (unsigned long)d.ekfMagAccept, (unsigned long)d.ekfMagReject,
+      (unsigned long)d.ekfMeasDropped);
+  j.f(",\"pi\":{\"comp\":%d,\"alive\":%d,\"hb\":%lu},"
+      "\"srv\":{\"att\":%d,\"pan\":%u,\"tilt\":%u,\"pant\":%u,\"tiltt\":%u}}",
+      d.piCompiled ? 1 : 0, d.piLinkAlive ? 1 : 0, (unsigned long)d.piHeartbeatAgeMs,
+      d.servoAttached ? 1 : 0, d.panUs, d.tiltUs, d.panTargetUs, d.tiltTargetUs);
+  return static_cast<int>(j.len);
+}
+
+// Push one text frame to every connected WebSocket client. Enumerates the
+// httpd client list and filters to WS sockets — no manual fd bookkeeping.
+void wsBroadcast(const char* json, size_t len) {
+  if (gServer == nullptr) return;
+  int fds[8];
+  size_t num = sizeof(fds) / sizeof(fds[0]);
+  if (httpd_get_client_list(gServer, &num, fds) != ESP_OK) return;
+  httpd_ws_frame_t frame;
+  memset(&frame, 0, sizeof(frame));
+  frame.type = HTTPD_WS_TYPE_TEXT;
+  frame.payload = reinterpret_cast<uint8_t*>(const_cast<char*>(json));
+  frame.len = len;
+  uint8_t wsCount = 0;
+  for (size_t i = 0; i < num; ++i) {
+    if (httpd_ws_get_fd_info(gServer, fds[i]) == HTTPD_WS_CLIENT_WEBSOCKET) {
+      ++wsCount;
+      (void)httpd_ws_send_frame_async(gServer, fds[i], &frame);
+    }
+  }
+  gWsClients.store(wsCount, std::memory_order_relaxed);
+}
+
+// WS endpoint. The framework completes the handshake on the GET upgrade; we
+// only push telemetry, so inbound frames are drained and ignored.
+esp_err_t handleWs(httpd_req_t* req) {
+  if (req->method == HTTP_GET) {
+    return ESP_OK;  // handshake done by the framework
+  }
+  httpd_ws_frame_t frame;
+  memset(&frame, 0, sizeof(frame));
+  frame.type = HTTPD_WS_TYPE_TEXT;
+  uint8_t buf[64];
+  frame.payload = buf;
+  return httpd_ws_recv_frame(req, &frame, sizeof(buf) - 1);
+}
+
+void telemetryTask(void*) {
+  static char buf[3400];  // own buffer (handler uses a separate one)
+  uint32_t lastRateMs = millis();
+  uint16_t frames = 0;
+  for (;;) {
+    if (gRunning.load() && gCb.getDashTelemetry != nullptr) {
+      DashTelemetry t;
+      gCb.getDashTelemetry(t);
+      const int n = formatDashJson(buf, sizeof(buf), t,
+                                   gWsClients.load(std::memory_order_relaxed),
+                                   gWebTelemHz.load(std::memory_order_relaxed));
+      if (n > 0) wsBroadcast(buf, static_cast<size_t>(n));
+      ++frames;
+    }
+    const uint32_t now = millis();
+    if (now - lastRateMs >= 1000U) {
+      gWebTelemHz.store(frames, std::memory_order_relaxed);
+      frames = 0;
+      lastRateMs = now;
+    }
+    vTaskDelay(pdMS_TO_TICKS(40));  // ~25 Hz dashboard push
+  }
+}
+
 // ---- handlers ----
 esp_err_t handleIndex(httpd_req_t* req) {
+  httpd_resp_set_type(req, "text/html; charset=utf-8");
+  return httpd_resp_send(req, PIDWEB_DASHBOARD_HTML, HTTPD_RESP_USE_STRLEN);
+}
+
+// Minimal legacy tuner kept as a fallback at /legacy (also keeps the original
+// PROGMEM page referenced).
+esp_err_t handleLegacyIndex(httpd_req_t* req) {
   httpd_resp_set_type(req, "text/html; charset=utf-8");
   return httpd_resp_send(req, kIndexHtml, HTTPD_RESP_USE_STRLEN);
 }
@@ -341,6 +615,7 @@ esp_err_t handleGetPid(httpd_req_t* req) {
 
 esp_err_t handlePutPid(httpd_req_t* req) {
   if (!gCb.applyPid) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
   if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
   char body[384];
   int n = recvBody(req, body, sizeof(body));
@@ -353,6 +628,7 @@ esp_err_t handlePutPid(httpd_req_t* req) {
 
 esp_err_t handleSavePid(httpd_req_t* req) {
   if (!gCb.saveAllToNvs) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
   if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
   if (!gCb.saveAllToNvs()) return sendError(req, 500, "nvs_write_failed");
   return sendJson(req, "{\"ok\":true,\"persisted\":true}");
@@ -360,6 +636,7 @@ esp_err_t handleSavePid(httpd_req_t* req) {
 
 esp_err_t handleRevertPid(httpd_req_t* req) {
   if (!gCb.revertFromNvs) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
   if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
   if (!gCb.revertFromNvs()) return sendError(req, 500, "revert_failed");
   return sendJson(req, "{\"ok\":true}");
@@ -367,6 +644,7 @@ esp_err_t handleRevertPid(httpd_req_t* req) {
 
 esp_err_t handleResetPid(httpd_req_t* req) {
   if (!gCb.resetToDefaults) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
   if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
   if (!gCb.resetToDefaults()) return sendError(req, 500, "reset_failed");
   return sendJson(req, "{\"ok\":true,\"defaults\":true}");
@@ -374,6 +652,7 @@ esp_err_t handleResetPid(httpd_req_t* req) {
 
 esp_err_t handleCalibrateImu(httpd_req_t* req) {
   if (!gCb.calibrateImu) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
   if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
   if (!gCb.calibrateImu()) return sendError(req, 409, "calibration_refused");
   return sendJson(req, "{\"ok\":true,\"requested\":true}");
@@ -381,6 +660,7 @@ esp_err_t handleCalibrateImu(httpd_req_t* req) {
 
 esp_err_t handleSpinMotor(httpd_req_t* req) {
   if (!gCb.spinMotor) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
   if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
 
   char query[32] = {};
@@ -414,6 +694,7 @@ esp_err_t handleGetMix(httpd_req_t* req) {
 
 esp_err_t handlePutMix(httpd_req_t* req) {
   if (!gCb.setMixPitchFrontBias) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
   if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
   char body[96];
   int n = recvBody(req, body, sizeof(body));
@@ -427,8 +708,29 @@ esp_err_t handlePutMix(httpd_req_t* req) {
 
 esp_err_t handleSaveMix(httpd_req_t* req) {
   if (!gCb.saveMixPitchFrontBiasToNvs) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
   if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
   if (!gCb.saveMixPitchFrontBiasToNvs()) return sendError(req, 500, "nvs_write_failed");
+  return sendJson(req, "{\"ok\":true,\"persisted\":true}");
+}
+
+esp_err_t handlePutFailsafe(httpd_req_t* req) {
+  if (!gCb.setFailsafeBypass) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
+  char body[96];
+  if (recvBody(req, body, sizeof(body)) < 0) return sendError(req, 400, "bad_body");
+  float bypass = 0.0f;
+  if (!parseJsonFloat(body, "bypass", bypass)) return sendError(req, 400, "bad_json");
+  if (!gCb.setFailsafeBypass(bypass > 0.5f)) return sendError(req, 409, "apply_refused");
+  return sendJson(req, "{\"ok\":true}");
+}
+
+esp_err_t handleSaveFailsafe(httpd_req_t* req) {
+  if (!gCb.saveFailsafeBypassToNvs) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
+  if (!gCb.saveFailsafeBypassToNvs()) return sendError(req, 500, "nvs_write_failed");
   return sendJson(req, "{\"ok\":true,\"persisted\":true}");
 }
 
@@ -494,6 +796,341 @@ esp_err_t handleGetHealth(httpd_req_t* req) {
   return sendJson(req, body);
 }
 
+// One-shot dashboard frame (initial load / WS-less fallback). Uses its own
+// static buffer so it can't race the telemetry task's buffer.
+esp_err_t handleGetDash(httpd_req_t* req) {
+  if (!gCb.getDashTelemetry) return sendError(req, 500, "no_callback");
+  static char dashBuf[3400];
+  DashTelemetry t;
+  gCb.getDashTelemetry(t);
+  const int n = formatDashJson(dashBuf, sizeof(dashBuf), t,
+                               gWsClients.load(), gWebTelemHz.load());
+  if (n <= 0) return sendError(req, 500, "fmt");
+  return sendJson(req, dashBuf);
+}
+
+esp_err_t handleGetCal(httpd_req_t* req) {
+  if (!gCb.getCalInfo) return sendError(req, 500, "no_callback");
+  CalInfo c;
+  gCb.getCalInfo(c);
+  char body[480];
+  int n = snprintf(body, sizeof(body),
+      "{\"off\":[%.3f,%.3f],\"trim\":[%.3f,%.3f],\"loaded\":%s,\"calState\":%u,\"calErr\":%u,"
+      "\"std\":[%.3f,%.3f],\"samples\":%u,\"accelOff\":[%.4f,%.4f,%.4f],\"accelValid\":%s,"
+      "\"gyroBias\":[%.3f,%.3f,%.3f],\"gyroBiasValid\":%s,\"magCal\":%s,\"safe\":%s,"
+      "\"maxOff\":%.1f,\"maxTrim\":%.1f,\"step\":%.2f}",
+      (double)c.levelOffsetDeg[0], (double)c.levelOffsetDeg[1], (double)c.trimDeg[0],
+      (double)c.trimDeg[1], c.levelLoaded ? "true" : "false", c.levelCalState, c.levelCalErr,
+      (double)c.levelCalStdDeg[0], (double)c.levelCalStdDeg[1], c.levelCalSamples,
+      (double)c.accelOffG[0], (double)c.accelOffG[1], (double)c.accelOffG[2],
+      c.accelValid ? "true" : "false", (double)c.gyroBiasDps[0], (double)c.gyroBiasDps[1],
+      (double)c.gyroBiasDps[2], c.gyroBiasValid ? "true" : "false", c.magCalValid ? "true" : "false",
+      c.safe ? "true" : "false", (double)c.maxOffsetDeg, (double)c.maxTrimDeg, (double)c.trimStepDeg);
+  if (n < 0 || n >= (int)sizeof(body)) return sendError(req, 500, "fmt");
+  return sendJson(req, body);
+}
+
+// Generic auth+safe-gated no-body action.
+esp_err_t doBoolAction(httpd_req_t* req, bool (*cb)(), const char* okBody) {
+  if (cb == nullptr) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
+  if (!cb()) return sendError(req, 409, "refused");
+  return sendJson(req, okBody ? okBody : "{\"ok\":true}");
+}
+
+esp_err_t handleLevelCalibrate(httpd_req_t* req) {
+  return doBoolAction(req, gCb.calibrateLevel, "{\"ok\":true,\"requested\":true}");
+}
+esp_err_t handleLevelSave(httpd_req_t* req) {
+  return doBoolAction(req, gCb.saveLevelToNvs, "{\"ok\":true,\"persisted\":true}");
+}
+esp_err_t handleLevelReload(httpd_req_t* req) { return doBoolAction(req, gCb.reloadLevelFromNvs, nullptr); }
+esp_err_t handleLevelClear(httpd_req_t* req) { return doBoolAction(req, gCb.clearLevel, nullptr); }
+esp_err_t handleTrimReset(httpd_req_t* req) { return doBoolAction(req, gCb.resetTrim, nullptr); }
+esp_err_t handleLevelRestore(httpd_req_t* req) { return doBoolAction(req, gCb.restoreLevelPrev, nullptr); }
+esp_err_t handleAccelSave(httpd_req_t* req) {
+  return doBoolAction(req, gCb.saveAccelOffset, "{\"ok\":true,\"persisted\":true}");
+}
+esp_err_t handleAccelClear(httpd_req_t* req) {
+  return doBoolAction(req, gCb.clearAccelOffset, "{\"ok\":true,\"cleared\":true}");
+}
+esp_err_t handleMagStart(httpd_req_t* req) {
+  return doBoolAction(req, gCb.startMagCalibration, "{\"ok\":true,\"active\":true}");
+}
+esp_err_t handleMagFinish(httpd_req_t* req) {
+  return doBoolAction(req, gCb.finishMagCalibration, "{\"ok\":true,\"persisted\":true}");
+}
+
+// ---- Settings (magnetometer heading trim) ---------------------------------
+// GET  /api/settings        -> {"magTrimDeg":<deg>,"safe":<bool>}
+// POST /api/settings  body {"magTrimDeg":<deg>}  applies AND persists (the web
+// page's "Save" button), so the trim survives a reboot.
+esp_err_t handleGetSettings(httpd_req_t* req) {
+  float trim = 0.0f;
+  if (gCb.getMagTrimDeg) gCb.getMagTrimDeg(trim);
+  char body[80];
+  int n = snprintf(body, sizeof(body), "{\"magTrimDeg\":%.1f,\"safe\":%s}",
+                   static_cast<double>(trim), gSafeToWrite.load() ? "true" : "false");
+  if (n < 0 || n >= (int)sizeof(body)) return sendError(req, 500, "fmt");
+  return sendJson(req, body);
+}
+
+esp_err_t handlePostSettings(httpd_req_t* req) {
+  if (!gCb.setMagTrimDeg) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
+  char body[96];
+  if (recvBody(req, body, sizeof(body)) < 0) return sendError(req, 400, "bad_body");
+  float trim = 0.0f;
+  if (!parseJsonFloat(body, "magTrimDeg", trim)) return sendError(req, 400, "bad_json");
+  if (!(trim >= -360.0f && trim <= 360.0f)) return sendError(req, 400, "out_of_range");
+  if (!gCb.setMagTrimDeg(trim)) return sendError(req, 409, "apply_refused");
+  if (gCb.saveMagTrimDegToNvs) gCb.saveMagTrimDegToNvs();  // POST == Save (persist)
+  return sendJson(req, "{\"ok\":true,\"persisted\":true}");
+}
+
+// POST /api/calibrate?mag=1 -> {"status":"started"} (alias for the existing
+// mag min/max capture; same callback as /api/mag/start).
+esp_err_t handleCalibrate(httpd_req_t* req) {
+  if (!gCb.startMagCalibration) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
+  char query[32] = {};
+  char magText[8] = {};
+  if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+      httpd_query_key_value(query, "mag", magText, sizeof(magText)) != ESP_OK ||
+      strtol(magText, nullptr, 10) != 1) {
+    return sendError(req, 400, "missing_mag");
+  }
+  if (!gCb.startMagCalibration()) return sendError(req, 409, "calibration_refused");
+  return sendJson(req, "{\"status\":\"started\"}");
+}
+
+esp_err_t handleLevelOffset(httpd_req_t* req) {
+  if (!gCb.applyLevelOffset) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
+  char body[96];
+  if (recvBody(req, body, sizeof(body)) < 0) return sendError(req, 400, "bad_body");
+  float r = 0.0f, p = 0.0f;
+  if (!parseRollPitch(body, r, p)) return sendError(req, 400, "bad_json");
+  if (!gCb.applyLevelOffset(r, p)) return sendError(req, 409, "refused");
+  return sendJson(req, "{\"ok\":true}");
+}
+
+esp_err_t handleTrim(httpd_req_t* req) {
+  if (!gCb.applyTrim) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
+  char body[96];
+  if (recvBody(req, body, sizeof(body)) < 0) return sendError(req, 400, "bad_body");
+  float r = 0.0f, p = 0.0f;
+  if (!parseRollPitch(body, r, p)) return sendError(req, 400, "bad_json");
+  if (!gCb.applyTrim(r, p)) return sendError(req, 409, "refused");
+  return sendJson(req, "{\"ok\":true}");
+}
+
+// ---- vibration / FFT / notch ----
+esp_err_t handleGetNotch(httpd_req_t* req) {
+  if (!gCb.getNotchInfo) return sendError(req, 500, "no_callback");
+  NotchInfo n;
+  gCb.getNotchInfo(n);
+  char body[440];
+  int len = snprintf(body, sizeof(body),
+      "{\"comp\":%s,\"en\":%s,\"center\":%.1f,\"min\":%.1f,\"max\":%.1f,\"q\":%.2f,"
+      "\"running\":%s,\"done\":%s,\"effHz\":%.1f,\"n\":%u,\"cap\":128,"
+      "\"peakHz\":[%.1f,%.1f,%.1f],\"peakMag\":[%.3f,%.3f,%.3f],\"floor\":[%.3f,%.3f,%.3f],"
+      "\"recCenter\":%.1f,\"recQ\":%.2f,\"conf\":%.2f}",
+      n.dynamicCompiled ? "true" : "false", n.enabled ? "true" : "false", (double)n.centerHz,
+      (double)n.minHz, (double)n.maxHz, (double)n.q, n.analysisRunning ? "true" : "false",
+      n.analysisDone ? "true" : "false", (double)n.effectiveSampleHz, n.sampleCount,
+      (double)n.peakHz[0], (double)n.peakHz[1], (double)n.peakHz[2],
+      (double)n.peakMag[0], (double)n.peakMag[1], (double)n.peakMag[2],
+      (double)n.noiseFloor[0], (double)n.noiseFloor[1], (double)n.noiseFloor[2],
+      (double)n.recommendCenterHz, (double)n.recommendQ, (double)n.confidence);
+  if (len < 0 || len >= (int)sizeof(body)) return sendError(req, 500, "fmt");
+  return sendJson(req, body);
+}
+esp_err_t handleGetFft(httpd_req_t* req) {
+  if (!gCb.getFftSpectrum) return sendError(req, 500, "no_callback");
+  char q[48] = {0}, av[8] = {0}, sv[8] = {0};
+  uint8_t axis = 0, stage = 0;
+  if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+    if (httpd_query_key_value(q, "axis", av, sizeof(av)) == ESP_OK) axis = (uint8_t)atoi(av);
+    if (httpd_query_key_value(q, "stage", sv, sizeof(sv)) == ESP_OK) stage = (uint8_t)atoi(sv);
+  }
+  static float mags[128];
+  float hpb = 0.0f;
+  const uint16_t nb = gCb.getFftSpectrum(axis, stage, mags, 128, hpb);
+  static char buf[2048];
+  JsonAppender j{buf, sizeof(buf), 0};
+  j.f("{\"hzPerBin\":%.4f,\"bins\":%u,\"mag\":[", (double)hpb, nb);
+  for (uint16_t k = 0; k < nb; ++k) j.f("%s%.4f", k ? "," : "", (double)mags[k]);
+  j.f("]}");
+  return sendJson(req, buf);
+}
+esp_err_t handleNotchStart(httpd_req_t* req) { return doBoolAction(req, gCb.startNotchAnalysis, "{\"ok\":true,\"running\":true}"); }
+esp_err_t handleNotchStop(httpd_req_t* req) { return doBoolAction(req, gCb.stopNotchAnalysis, nullptr); }
+esp_err_t handleNotchSave(httpd_req_t* req) { return doBoolAction(req, gCb.saveNotchToNvs, "{\"ok\":true,\"persisted\":true}"); }
+esp_err_t handleNotchReload(httpd_req_t* req) { return doBoolAction(req, gCb.reloadNotchFromNvs, nullptr); }
+esp_err_t handleNotchApply(httpd_req_t* req) {
+  if (!gCb.applyNotchTemp) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
+  char body[96];
+  if (recvBody(req, body, sizeof(body)) < 0) return sendError(req, 400, "bad_body");
+  float c = 0.0f, qq = 0.0f;
+  if (!parseJsonFloat(body, "center", c) || !parseJsonFloat(body, "q", qq)) return sendError(req, 400, "bad_json");
+  if (!gCb.applyNotchTemp(c, qq)) return sendError(req, 409, "refused");
+  return sendJson(req, "{\"ok\":true}");
+}
+esp_err_t handleNotchEnabled(httpd_req_t* req) {
+  if (!gCb.setNotchEnabled) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
+  char body[64];
+  if (recvBody(req, body, sizeof(body)) < 0) return sendError(req, 400, "bad_body");
+  float en = 0.0f;
+  if (!parseJsonFloat(body, "en", en)) return sendError(req, 400, "bad_json");
+  if (!gCb.setNotchEnabled(en > 0.5f)) return sendError(req, 409, "refused");
+  return sendJson(req, "{\"ok\":true}");
+}
+
+// ---- pan/tilt servos ----
+esp_err_t handleGetServo(httpd_req_t* req) {
+  if (!gCb.getServo) return sendError(req, 500, "no_callback");
+  ServoState s;
+  gCb.getServo(s);
+  char body[320];
+  int n = snprintf(body, sizeof(body),
+      "{\"att\":%s,\"pan\":%u,\"tilt\":%u,\"panT\":%u,\"tiltT\":%u,\"panMin\":%u,\"panC\":%u,"
+      "\"panMax\":%u,\"tiltMin\":%u,\"tiltC\":%u,\"tiltMax\":%u,\"panInv\":%s,\"tiltInv\":%s,\"ov\":%s}",
+      s.attached ? "true" : "false", s.panUs, s.tiltUs, s.panTargetUs, s.tiltTargetUs,
+      s.panMinUs, s.panCenterUs, s.panMaxUs, s.tiltMinUs, s.tiltCenterUs, s.tiltMaxUs,
+      s.panInverted ? "true" : "false", s.tiltInverted ? "true" : "false",
+      s.webOverrideActive ? "true" : "false");
+  if (n < 0 || n >= (int)sizeof(body)) return sendError(req, 500, "fmt");
+  return sendJson(req, body);
+}
+esp_err_t handleServoSet(httpd_req_t* req) {
+  if (!gCb.setServoMicros) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
+  char body[96];
+  if (recvBody(req, body, sizeof(body)) < 0) return sendError(req, 400, "bad_body");
+  float p = 0, t = 0;
+  if (!parseJsonFloat(body, "pan", p) || !parseJsonFloat(body, "tilt", t)) return sendError(req, 400, "bad_json");
+  if (!gCb.setServoMicros((uint16_t)p, (uint16_t)t)) return sendError(req, 409, "refused");
+  return sendJson(req, "{\"ok\":true}");
+}
+esp_err_t handleServoNudge(httpd_req_t* req) {
+  if (!gCb.nudgeServo) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
+  char body[96];
+  if (recvBody(req, body, sizeof(body)) < 0) return sendError(req, 400, "bad_body");
+  float dp = 0, dt = 0;
+  parseJsonFloat(body, "dpan", dp);
+  parseJsonFloat(body, "dtilt", dt);
+  if (!gCb.nudgeServo((int16_t)dp, (int16_t)dt)) return sendError(req, 409, "refused");
+  return sendJson(req, "{\"ok\":true}");
+}
+esp_err_t handleServoCenter(httpd_req_t* req) {
+  if (!gCb.centerServo) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
+  char body[64] = {0};
+  recvBody(req, body, sizeof(body));
+  float p = 1, t = 1;
+  parseJsonFloat(body, "pan", p);
+  parseJsonFloat(body, "tilt", t);
+  if (!gCb.centerServo(p > 0.5f, t > 0.5f)) return sendError(req, 409, "refused");
+  return sendJson(req, "{\"ok\":true}");
+}
+esp_err_t handleServoStop(httpd_req_t* req) { return doBoolAction(req, gCb.stopServo, nullptr); }
+esp_err_t handleServoRelease(httpd_req_t* req) {
+  if (!gCb.releaseServoOverride) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  if (!gCb.releaseServoOverride()) return sendError(req, 409, "refused");
+  return sendJson(req, "{\"ok\":true}");
+}
+esp_err_t handleServoConfig(httpd_req_t* req) {
+  if (!gCb.saveServoConfig) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
+  char body[224];
+  if (recvBody(req, body, sizeof(body)) < 0) return sendError(req, 400, "bad_body");
+  float pmn = 0, pc = 0, pmx = 0, tmn = 0, tc = 0, tmx = 0, pi = 0, ti = 0;
+  if (!parseJsonFloat(body, "panMin", pmn) || !parseJsonFloat(body, "panCenter", pc) ||
+      !parseJsonFloat(body, "panMax", pmx) || !parseJsonFloat(body, "tiltMin", tmn) ||
+      !parseJsonFloat(body, "tiltCenter", tc) || !parseJsonFloat(body, "tiltMax", tmx)) {
+    return sendError(req, 400, "bad_json");
+  }
+  parseJsonFloat(body, "panInv", pi);
+  parseJsonFloat(body, "tiltInv", ti);
+  if (!gCb.saveServoConfig((uint16_t)pmn, (uint16_t)pc, (uint16_t)pmx, (uint16_t)tmn, (uint16_t)tc,
+                           (uint16_t)tmx, pi > 0.5f, ti > 0.5f)) {
+    return sendError(req, 409, "refused");
+  }
+  return sendJson(req, "{\"ok\":true,\"persisted\":true}");
+}
+
+// ---- diagnostic capture ----
+esp_err_t handleGetCapture(httpd_req_t* req) {
+  if (!gCb.getCaptureStatus) return sendError(req, 500, "no_callback");
+  CaptureStatus c;
+  gCb.getCaptureStatus(c);
+  char body[256];
+  const int n = snprintf(body, sizeof(body),
+      "{\"active\":%s,\"waiting\":%s,\"hasData\":%s,\"overflow\":%s,"
+      "\"samples\":%u,\"cap\":%u,\"effHz\":%.1f,\"dropped\":%lu}",
+      c.active ? "true" : "false", c.waitingForArm ? "true" : "false",
+      c.hasData ? "true" : "false", c.overflow ? "true" : "false",
+      c.samples, c.capacity, (double)c.effectiveHz, (unsigned long)c.droppedSamples);
+  if (n < 0 || n >= (int)sizeof(body)) return sendError(req, 500, "fmt");
+  return sendJson(req, body);
+}
+
+esp_err_t handleCaptureStart(httpd_req_t* req) {
+  return doBoolAction(req, gCb.startCapture, "{\"ok\":true,\"active\":true}");
+}
+
+esp_err_t handleCaptureArm(httpd_req_t* req) {
+  return doBoolAction(req, gCb.armTriggeredCapture, "{\"ok\":true,\"waiting\":true}");
+}
+
+esp_err_t handleCaptureStop(httpd_req_t* req) {
+  if (!gCb.stopCapture) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  if (!gCb.stopCapture()) return sendError(req, 409, "refused");
+  return sendJson(req, "{\"ok\":true,\"active\":false}");
+}
+
+esp_err_t handleCaptureClear(httpd_req_t* req) {
+  return doBoolAction(req, gCb.clearCapture, "{\"ok\":true,\"cleared\":true}");
+}
+
+esp_err_t handleCaptureCsv(httpd_req_t* req) {
+  if (!gCb.captureCsvChunk) return sendError(req, 500, "no_callback");
+  httpd_resp_set_type(req, "text/csv; charset=utf-8");
+  httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"fcu_diag_capture.csv\"");
+  static char chunk[2048];
+  uint32_t cursor = 0;
+  for (uint16_t guard = 0; guard < 512; ++guard) {
+    uint32_t next = 0;
+    const uint32_t n = gCb.captureCsvChunk(cursor, chunk, sizeof(chunk), next);
+    if (n > 0U) {
+      const esp_err_t err = httpd_resp_send_chunk(req, chunk, n);
+      if (err != ESP_OK) return err;
+    }
+    if (next == 0U) break;
+    if (n == 0U && next == cursor) break;
+    cursor = next;
+  }
+  return httpd_resp_send_chunk(req, nullptr, 0);
+}
+
 void registerUri(httpd_handle_t srv, const char* path, httpd_method_t method,
                  esp_err_t (*handler)(httpd_req_t*)) {
   httpd_uri_t u = {};
@@ -504,10 +1141,21 @@ void registerUri(httpd_handle_t srv, const char* path, httpd_method_t method,
   httpd_register_uri_handler(srv, &u);
 }
 
+void stopHttpServer(const char* reason) {
+  gRunning.store(false, std::memory_order_relaxed);
+  gWsClients.store(0, std::memory_order_relaxed);
+  if (gServer != nullptr) {
+    httpd_stop(gServer);
+    gServer = nullptr;
+    Serial.printf("[%s] http server stopped (%s)\n", kTag, reason ? reason : "unknown");
+  }
+}
+
 bool waitForWifi(const char* ssid, const char* pass, uint32_t timeoutMs) {
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);  // disable sleep so HTTP latency is low
+  WiFi.setAutoReconnect(true);
   WiFi.begin(ssid, pass);
   const uint32_t start = millis();
   Serial.printf("[%s] connecting to SSID '%s' (timeout %lums)\n",
@@ -525,28 +1173,12 @@ bool waitForWifi(const char* ssid, const char* pass, uint32_t timeoutMs) {
   return true;
 }
 
-}  // namespace
-
-void registerCallbacks(const Callbacks& cbs) {
-  gCb = cbs;
-}
-
-void publishSafety(bool throttleZero, bool fsmArmed) {
-  // Safe to write only if the FCU is bench-idle: throttle at zero AND not
-  // armed by the flight FSM. Either condition flipping locks out writes.
-  gSafeToWrite.store(throttleZero && !fsmArmed, std::memory_order_relaxed);
-}
-
-bool start(const char* ssid, const char* password, uint32_t connectTimeoutMs) {
-  if (gRunning.load()) {
+bool startHttpServer() {
+  if (gRunning.load(std::memory_order_relaxed)) {
     return true;
   }
-  if (ssid == nullptr || ssid[0] == '\0') {
-    Serial.printf("[%s] start refused: SSID empty\n", kTag);
-    return false;
-  }
-
-  if (!waitForWifi(ssid, password, connectTimeoutMs)) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.printf("[%s] http start refused: WiFi status=%d\n", kTag, static_cast<int>(WiFi.status()));
     return false;
   }
 
@@ -554,12 +1186,13 @@ bool start(const char* ssid, const char* password, uint32_t connectTimeoutMs) {
   cfg.server_port = 80;
   cfg.task_priority = 3;        // well below flight/radio/sensor
   cfg.core_id = 0;              // keep off core 1 (flight + radio)
-  cfg.stack_size = 6 * 1024;
-  cfg.max_uri_handlers = 15;
+  cfg.stack_size = FCU_PID_HTTPD_STACK_BYTES;
+  cfg.max_uri_handlers = 60;    // base tuner + dashboard + level/servo/notch/capture
   cfg.lru_purge_enable = true;
 
   esp_err_t err = httpd_start(&gServer, &cfg);
   if (err != ESP_OK) {
+    gServer = nullptr;
     Serial.printf("[%s] httpd_start failed: %s\n", kTag, esp_err_to_name(err));
     return false;
   }
@@ -575,17 +1208,175 @@ bool start(const char* ssid, const char* password, uint32_t connectTimeoutMs) {
   registerUri(gServer, "/api/mix",         HTTP_GET,  handleGetMix);
   registerUri(gServer, "/api/mix",         HTTP_PUT,  handlePutMix);
   registerUri(gServer, "/api/mix/save",    HTTP_POST, handleSaveMix);
+  registerUri(gServer, "/api/failsafe",    HTTP_PUT,  handlePutFailsafe);
+  registerUri(gServer, "/api/failsafe/save", HTTP_POST, handleSaveFailsafe);
   registerUri(gServer, "/api/state",       HTTP_GET,  handleGetState);
   registerUri(gServer, "/api/health",      HTTP_GET,  handleGetHealth);
   registerUri(gServer, "/api/tune",        HTTP_GET,  handleGetTune);
 
-  gRunning.store(true);
+  // ---- Dashboard: legacy fallback, live telemetry, calibration/level/trim ---
+  registerUri(gServer, "/legacy",              HTTP_GET,  handleLegacyIndex);
+  registerUri(gServer, "/api/dash",            HTTP_GET,  handleGetDash);
+  registerUri(gServer, "/api/cal",             HTTP_GET,  handleGetCal);
+  registerUri(gServer, "/api/level/calibrate", HTTP_POST, handleLevelCalibrate);
+  registerUri(gServer, "/api/level/offset",    HTTP_PUT,  handleLevelOffset);
+  registerUri(gServer, "/api/trim",            HTTP_PUT,  handleTrim);
+  registerUri(gServer, "/api/level/save",      HTTP_POST, handleLevelSave);
+  registerUri(gServer, "/api/level/reload",    HTTP_POST, handleLevelReload);
+  registerUri(gServer, "/api/level/clear",     HTTP_POST, handleLevelClear);
+  registerUri(gServer, "/api/trim/reset",      HTTP_POST, handleTrimReset);
+  registerUri(gServer, "/api/level/restore",   HTTP_POST, handleLevelRestore);
+  registerUri(gServer, "/api/accel/save",      HTTP_POST, handleAccelSave);
+  registerUri(gServer, "/api/accel/clear",     HTTP_POST, handleAccelClear);
+  registerUri(gServer, "/api/mag/start",       HTTP_POST, handleMagStart);
+  registerUri(gServer, "/api/mag/finish",      HTTP_POST, handleMagFinish);
+  registerUri(gServer, "/api/settings",        HTTP_GET,  handleGetSettings);
+  registerUri(gServer, "/api/settings",        HTTP_POST, handlePostSettings);
+  registerUri(gServer, "/api/calibrate",       HTTP_POST, handleCalibrate);
+  // ---- Vibration / FFT / notch ----
+  registerUri(gServer, "/api/notch",           HTTP_GET,  handleGetNotch);
+  registerUri(gServer, "/api/notch/fft",       HTTP_GET,  handleGetFft);
+  registerUri(gServer, "/api/notch/start",     HTTP_POST, handleNotchStart);
+  registerUri(gServer, "/api/notch/stop",      HTTP_POST, handleNotchStop);
+  registerUri(gServer, "/api/notch/apply",     HTTP_PUT,  handleNotchApply);
+  registerUri(gServer, "/api/notch/enabled",   HTTP_PUT,  handleNotchEnabled);
+  registerUri(gServer, "/api/notch/save",      HTTP_POST, handleNotchSave);
+  registerUri(gServer, "/api/notch/reload",    HTTP_POST, handleNotchReload);
+  // ---- Pan/tilt servos ----
+  registerUri(gServer, "/api/servo",           HTTP_GET,  handleGetServo);
+  registerUri(gServer, "/api/servo",           HTTP_PUT,  handleServoSet);
+  registerUri(gServer, "/api/servo/nudge",     HTTP_POST, handleServoNudge);
+  registerUri(gServer, "/api/servo/center",    HTTP_POST, handleServoCenter);
+  registerUri(gServer, "/api/servo/stop",      HTTP_POST, handleServoStop);
+  registerUri(gServer, "/api/servo/release",   HTTP_POST, handleServoRelease);
+  registerUri(gServer, "/api/servo/config",    HTTP_PUT,  handleServoConfig);
+  // ---- Diagnostic capture ----
+  registerUri(gServer, "/api/capture",          HTTP_GET,  handleGetCapture);
+  registerUri(gServer, "/api/capture/start",    HTTP_POST, handleCaptureStart);
+  registerUri(gServer, "/api/capture/arm",      HTTP_POST, handleCaptureArm);
+  registerUri(gServer, "/api/capture/stop",     HTTP_POST, handleCaptureStop);
+  registerUri(gServer, "/api/capture/clear",    HTTP_POST, handleCaptureClear);
+  registerUri(gServer, "/api/capture.csv",      HTTP_GET,  handleCaptureCsv);
+
+  // ---- WebSocket telemetry channel (~25 Hz push) ----
+  {
+    httpd_uri_t ws = {};
+    ws.uri = "/ws";
+    ws.method = HTTP_GET;
+    ws.handler = handleWs;
+    ws.is_websocket = true;
+    httpd_register_uri_handler(gServer, &ws);
+  }
+
+  gRunning.store(true, std::memory_order_relaxed);
+  if (gTelemTask == nullptr) {
+    xTaskCreatePinnedToCore(telemetryTask, "pidweb_tlm", FCU_PID_TELEM_STACK_BYTES,
+                            nullptr, 2, &gTelemTask, 0);
+  }
+  gLastIp = static_cast<uint32_t>(WiFi.localIP());
   Serial.printf("[%s] http server up on http://%s/\n",
                 kTag, WiFi.localIP().toString().c_str());
   return true;
 }
 
+}  // namespace
+
+void registerCallbacks(const Callbacks& cbs) {
+  gCb = cbs;
+}
+
+void setAuthToken(const char* token) {
+  if (token == nullptr) {
+    gAuthToken[0] = '\0';
+    return;
+  }
+  strncpy(gAuthToken, token, sizeof(gAuthToken) - 1);
+  gAuthToken[sizeof(gAuthToken) - 1] = '\0';
+}
+
+void publishSafety(bool throttleZero, bool fsmArmed) {
+  // Safe to write only if the FCU is bench-idle: throttle at zero AND not
+  // armed by the flight FSM. Either condition flipping locks out writes.
+  gSafeToWrite.store(throttleZero && !fsmArmed, std::memory_order_relaxed);
+}
+
+bool start(const char* ssid, const char* password, uint32_t connectTimeoutMs) {
+  if (gRunning.load()) {
+    return true;
+  }
+  gSsid = (ssid != nullptr) ? ssid : "";
+  gPassword = (password != nullptr) ? password : "";
+  gConnectTimeoutMs = connectTimeoutMs;
+  if (ssid == nullptr || ssid[0] == '\0') {
+    Serial.printf("[%s] start refused: SSID empty\n", kTag);
+    return false;
+  }
+
+  if (!waitForWifi(ssid, password, connectTimeoutMs)) {
+    gNextReconnectMs = millis();
+    return false;
+  }
+
+  return startHttpServer();
+}
+
 bool running() { return gRunning.load(); }
+
+void service(uint32_t nowMs) {
+  if (gSsid == nullptr || gSsid[0] == '\0') {
+    return;
+  }
+
+  const wl_status_t status = WiFi.status();
+  if (status == WL_CONNECTED) {
+    gReconnectInProgress = false;
+    const uint32_t ip = static_cast<uint32_t>(WiFi.localIP());
+    if (ip != 0U && ip != gLastIp) {
+      gLastIp = ip;
+      Serial.printf("[%s] WiFi IP active: http://%s/ rssi=%d dBm\n",
+                    kTag, WiFi.localIP().toString().c_str(), static_cast<int>(WiFi.RSSI()));
+    }
+    if (!gRunning.load(std::memory_order_relaxed)) {
+      (void)startHttpServer();
+    }
+    if ((nowMs - gLastHealthLogMs) >= FCU_PID_WIFI_HEALTH_LOG_MS) {
+      gLastHealthLogMs = nowMs;
+      Serial.printf("[%s] WiFi health ip=%s rssi=%d dBm http=%u\n",
+                    kTag, WiFi.localIP().toString().c_str(), static_cast<int>(WiFi.RSSI()),
+                    static_cast<unsigned>(gRunning.load(std::memory_order_relaxed)));
+    }
+    return;
+  }
+
+  if (gRunning.load(std::memory_order_relaxed) || gServer != nullptr) {
+    stopHttpServer("wifi_lost");
+  }
+  gLastIp = 0;
+  if (gReconnectInProgress) {
+    if (static_cast<int32_t>(nowMs - gReconnectDeadlineMs) < 0) {
+      return;
+    }
+    gReconnectInProgress = false;
+    gNextReconnectMs = nowMs + FCU_PID_WIFI_RECONNECT_BACKOFF_MS;
+    Serial.printf("[%s] WiFi reconnect timeout status=%d; retry in %lums\n",
+                  kTag, static_cast<int>(status),
+                  static_cast<unsigned long>(FCU_PID_WIFI_RECONNECT_BACKOFF_MS));
+    return;
+  }
+  if (static_cast<int32_t>(nowMs - gNextReconnectMs) < 0) {
+    return;
+  }
+  Serial.printf("[%s] WiFi down status=%d; reconnecting to '%s'\n",
+                kTag, static_cast<int>(status), gSsid);
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.disconnect(false);
+  WiFi.begin(gSsid, gPassword);
+  gReconnectInProgress = true;
+  gReconnectDeadlineMs = nowMs + gConnectTimeoutMs;
+}
 
 }  // namespace pid_webserver
 
@@ -594,7 +1385,9 @@ bool running() { return gRunning.load(); }
 // Stubs so callers can be unconditional. Linker drops them when unreferenced.
 namespace pid_webserver {
 void registerCallbacks(const Callbacks&) {}
+void setAuthToken(const char*) {}
 bool start(const char*, const char*, uint32_t) { return false; }
+void service(uint32_t) {}
 void publishSafety(bool, bool) {}
 bool running() { return false; }
 }  // namespace pid_webserver

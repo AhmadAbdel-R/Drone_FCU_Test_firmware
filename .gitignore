@@ -6,6 +6,7 @@
 # Scratch directories
 .tmp_*/
 .claude/
+.venv/
 
 # VS Code / IDE
 .vscode/.browse.c_cpp.db*
@@ -41,5 +42,21 @@ desktop.ini
 *.bak
 *.orig
 
+# Local secrets — PID-web WiFi credentials + HTTP auth token (never commit)
+src/pidweb_secrets.h
+
 # Logs
 *.log
+
+# Windows configurator generated output
+configurator/node_modules/
+configurator/dist/
+configurator/build/
+configurator/release/
+
+# Third-party reference clone (not part of this project's source)
+betaflight/
+
+# Host-compiled test/sim artifacts
+*.exe
+*.pdb

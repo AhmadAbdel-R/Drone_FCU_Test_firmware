@@ -44,9 +44,20 @@ public:
     gpio_num_t lastDriverErrorPin() const;
     MotorTelemetry motorTelemetry(uint8_t motor) const;
 
+    // Arm a one-shot UART (KISS/BLHeli32 TLM-wire) telemetry request on this
+    // motor's next throttle frame. See DShotRMT::requestTelemetrySignal().
+    Status requestMotorUartTelemetry(uint8_t motor);
+
     // Required by passthrough mode to release/re-acquire the selected motor pin.
     Status suspendMotorDriverForPassthrough(uint8_t motor);
     Status resumeMotorDriverFromPassthrough(uint8_t motor);
+
+    // Transmit ONE DShot special command frame (values 1..47) on this motor.
+    // Used to send config commands (e.g. 3D-mode off, save settings) over the
+    // normal DShot wire. The caller is responsible for stopping the motors,
+    // spacing the calls (>= the DShot frame interval) and repeating enough times
+    // (AM32/BLHeli require ~6+ consecutive) for the ESC to latch the setting.
+    Status sendMotorCommandFrame(uint8_t motor, uint16_t command);
 
 private:
     static bool isConfigValid(const DshotOutputConfig &config);

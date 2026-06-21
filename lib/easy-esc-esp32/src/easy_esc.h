@@ -74,6 +74,7 @@ public:
 
     bool setMotorRaw(uint8_t motor, uint16_t raw);
     bool setMotorPercent(uint8_t motor, float percent); // 0..100
+    bool sendMotorCommandFrame(uint8_t motor, uint16_t command); // one DShot cmd frame (1..47)
     bool setAllRaw(uint16_t raw);
     bool setAllPercent(float percent); // 0..100
 
@@ -115,6 +116,8 @@ public:
     int8_t lastRmtErrorMotor() const;
     gpio_num_t lastRmtErrorPin() const;
     MotorTelemetry motorTelemetry(uint8_t motor) const;
+    // One-shot KISS/TLM-wire telemetry request for one motor's next frame.
+    Status requestMotorUartTelemetry(uint8_t motor);
 
     Status lastStatus() const;
     uint8_t requestedMotorCount() const;
@@ -166,6 +169,10 @@ public:
 
     bool spinRaw(uint16_t raw);
     bool spinPercent(float percent); // 0..100
+    // Send ONE DShot special command frame (1..47) to this motor (e.g. 3D-mode
+    // off, save settings). Motors must be stopped; repeat ~10x spaced >= the
+    // DShot frame interval for the ESC to latch it. See EscDshotOutput.
+    bool sendDshotCommandFrame(uint16_t command);
 
     bool enterPassthrough();
     bool exitPassthrough();
@@ -204,6 +211,9 @@ public:
     int8_t lastRmtErrorMotor() const;
     gpio_num_t lastRmtErrorPin() const;
     MotorTelemetry telemetry() const;
+    // Arm a one-shot KISS/TLM-wire telemetry request on this motor's next
+    // throttle frame. Returns true when the request was accepted.
+    bool requestUartTelemetry();
     Status lastStatus() const;
 
     bool isMotorPinSuitable() const;

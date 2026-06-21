@@ -27,6 +27,7 @@
 
 #include "ekf_estimator.h"
 #include "sim_harness.h"
+#include "velocity_controller.h"
 #include "math3.h"
 #include "frames.h"
 
@@ -244,6 +245,85 @@ void trajPitch15(float, Vector3& p, Vector3& v, Vector3& a, Quaternion& q, Vecto
   r = {0, 0, 0};
 }
 
+// ---- Closed-loop velocity-hold (S9) ----------------------------------------
+// Full GNC loop in the loop: a point-mass vehicle is driven by VelocityController
+// angle commands, the EKF estimates velocity from synthetic sensors of the
+// resulting motion, and that EKF velocity (NOT GPS) is fed back to the
+// controller at 50 Hz. Scores how well the loop holds a target velocity — i.e.
+// whether the EKF's fused velocity is good enough to close the autonomy loop.
+struct CLoopResult { float velRmsErr; float finalVN; float finalVE; bool finite; bool pass; };
+
+CLoopResult runClosedLoopVelHold(float targetVN) {
+  CLoopResult r{0, 0, 0, true, false};
+  EstimatorEKF ekf;
+  ekf.init(specificForceBody(Quaternion{}, Vector3{0, 0, 0}),
+           EstimatorNoiseParams{}, EstimatorGates{});
+  ekf.setOrigin(kOriginLat, kOriginLon, kOriginAlt);
+
+  SimHarness sim;
+  SimHarness::Config scfg;
+  scfg.origin_lat_rad = kOriginLat; scfg.origin_lon_rad = kOriginLon;
+  scfg.origin_alt_msl_m = kOriginAlt; scfg.gps_dropout_prob = 0.0f; scfg.tof_dropout_prob = 0.0f;
+  sim.configure(scfg);
+
+  VelocityController vc;
+  vc.configure(VelocityController::Config{});
+  vc.reset();
+
+  const float drag = 0.3f;          // 1/s — light aerodynamic damping
+  const int ctrlEvery = 10;         // controller @ 50 Hz
+  const float dtCtrl = ctrlEvery * kDt;
+  float vN = 0, vE = 0, pN = 0, pE = 0;
+  float rollCmdDeg = 0, pitchCmdDeg = 0;
+
+  const int steps = static_cast<int>(20.0f / kDt);
+  const int windowStart = steps / 2;
+  uint32_t simUs = 1000000u;
+  double errSq = 0.0; int scored = 0;
+
+  for (int k = 0; k < steps; ++k) {
+    simUs += kUsPerTick; const uint32_t simMs = simUs / 1000u;
+    // Ideal attitude tracking: truth attitude = commanded angles.
+    const Quaternion q = math3::quaternionFromEuler(
+        math3::degToRad(rollCmdDeg), math3::degToRad(pitchCmdDeg), 0.0f);
+    // Point-mass horizontal dynamics: +pitch → +N accel, +roll → +E accel.
+    const float aN = kG * tanf(math3::degToRad(pitchCmdDeg)) - drag * vN;
+    const float aE = kG * tanf(math3::degToRad(rollCmdDeg)) - drag * vE;
+    vN += aN * kDt; vE += aE * kDt; pN += vN * kDt; pE += vE * kDt;
+
+    SimHarness::TruthState truth;
+    truth.position_ned = {pN, pE, 0}; truth.velocity_ned = {vN, vE, 0};
+    truth.attitude = q; truth.angular_rate = {0, 0, 0};
+    truth.specific_force = specificForceBody(q, Vector3{aN, aE, 0});
+    sim.setTruth(truth);
+
+    SimHarness::Gyro gy = sim.generateGyro();
+    SimHarness::Accel ac = sim.generateAccel();
+    ekf.predictIMU(gy.rate_radS, ac.specific_ms2, simUs, simMs);
+    if ((k % kMagEvery) == 0)  { SimHarness::Mag m = sim.generateMag();  if (m.valid) ekf.updateMagnetometer(m.yaw_rad, simMs); }
+    if ((k % kBaroEvery) == 0) { SimHarness::Baro b = sim.generateBaro(); if (b.valid) ekf.updateBarometer(b.altitude_rel_m, simMs); }
+    if ((k % kGpsEvery) == 0)  { SimHarness::Gps g = sim.generateGps();  if (g.valid) ekf.updateGPS(g.lat_rad, g.lon_rad, g.alt_msl_m, g.velocity_ned, g.has_velocity, simMs); }
+
+    if ((k % ctrlEvery) == 0) {
+      const gnc::EstimatorState est = ekf.getState();
+      const VelocityController::Output out =
+          vc.update(targetVN, 0.0f, 0.0f, est.velocity_ned.x, est.velocity_ned.y, est.velocity_ned.z, dtCtrl);
+      rollCmdDeg = out.targetRollDeg;
+      pitchCmdDeg = out.targetPitchDeg;
+    }
+    if (!ekf.getState().velocity_ned.isFinite()) r.finite = false;
+    if (k >= windowStart) {
+      const float eN = vN - targetVN, eE = vE - 0.0f;
+      errSq += static_cast<double>(eN * eN + eE * eE);
+      ++scored;
+    }
+  }
+  r.velRmsErr = scored > 0 ? sqrtf(static_cast<float>(errSq / scored)) : 0.0f;
+  r.finalVN = vN; r.finalVE = vE;
+  r.pass = r.finite && r.velRmsErr < 0.6f;
+  return r;
+}
+
 struct Result { const char* name; Metrics m; bool pass; const char* note; };
 
 bool checkAndPrint(const char* name, const Metrics& m, bool pass, const char* note) {
@@ -325,6 +405,19 @@ int runEkfSimSuite() {
     char note[48];
     snprintf(note, sizeof(note), "(gps_reject=%lu)", static_cast<unsigned long>(m.gpsReject));
     failures += checkAndPrint("S8 gps-glitch-gate", m, pass, note) ? 0 : 1;
+  }
+
+  // S9 — closed-loop velocity hold: VelocityController fed by EKF velocity (not
+  // GPS) drives a point-mass vehicle to a target velocity. Validates the EKF
+  // velocity is good enough to close the autonomy loop.
+  {
+    const float target = 1.5f;
+    CLoopResult c = runClosedLoopVelHold(target);
+    SIM_PRINTF("[EKF-SIM] %-22s velErr=%4.2f m/s  vN=%4.2f (tgt %.1f)  %s\n",
+               "S9 cloop-velhold", static_cast<double>(c.velRmsErr),
+               static_cast<double>(c.finalVN), static_cast<double>(target),
+               c.pass ? "PASS" : "FAIL");
+    failures += c.pass ? 0 : 1;
   }
 
   SIM_PRINTF("[EKF-SIM] === %s (%d failure%s) ===\n\n",

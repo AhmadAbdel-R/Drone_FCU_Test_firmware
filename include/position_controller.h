@@ -44,11 +44,32 @@ class PositionController {
     bool valid = false;
   };
 
+  struct BodyVelocity {
+    float vxMs = 0.0f;  // body forward +
+    float vyMs = 0.0f;  // body right +
+  };
+
+  static BodyVelocity nedToBodyVelocity(float yawDeg, float northMs, float eastMs) {
+    const float yawRad = yawDeg * 0.017453292519943295f;
+    const float c = cosf(yawRad);
+    const float s = sinf(yawRad);
+    BodyVelocity out;
+    out.vxMs = c * northMs + s * eastMs;
+    out.vyMs = -s * northMs + c * eastMs;
+    return out;
+  }
+
   struct Output {
+    float targetNorthMs = 0.0f;
+    float targetEastMs = 0.0f;
     float targetVxMs = 0.0f;
     float targetVyMs = 0.0f;
     float distanceToTargetM = 0.0f;
     bool arrived = false;
+
+    BodyVelocity targetBodyVelocity(float yawDeg) const {
+      return PositionController::nedToBodyVelocity(yawDeg, targetNorthMs, targetEastMs);
+    }
   };
 
   void configure(const Config& cfg) { cfg_ = cfg; }
@@ -87,11 +108,26 @@ class PositionController {
     }
     if (dtSeconds <= 0.0f) dtSeconds = 0.05f;
 
-    const int32_t dLatE7 = target_.latE7 - curLatE7;
-    const int32_t dLonE7 = target_.lonE7 - curLonE7;
+    // 64-bit deltas: int32 subtraction of two E7 coordinates can overflow for
+    // distant or antimeridian targets. Compute wide, unwrap the antimeridian,
+    // and reject targets outside this LOCAL controller's range. (F8)
+    int64_t dLatE7 = static_cast<int64_t>(target_.latE7) - static_cast<int64_t>(curLatE7);
+    int64_t dLonE7 = static_cast<int64_t>(target_.lonE7) - static_cast<int64_t>(curLonE7);
+    constexpr int64_t kE7_180 = 1800000000LL;
+    constexpr int64_t kE7_360 = 3600000000LL;
+    if (dLonE7 > kE7_180) dLonE7 -= kE7_360;
+    else if (dLonE7 < -kE7_180) dLonE7 += kE7_360;
+    // ~0.5° (≈55 km) is far beyond any local position hold; a target past that
+    // is bad/stale — emit no velocity rather than a huge or overflowed setpoint.
+    constexpr int64_t kMaxLocalDeltaE7 = 5000000LL;  // 0.5° in E7
+    if (dLatE7 > kMaxLocalDeltaE7 || dLatE7 < -kMaxLocalDeltaE7 ||
+        dLonE7 > kMaxLocalDeltaE7 || dLonE7 < -kMaxLocalDeltaE7) {
+      return out;  // out-of-range target — zero command, not arrived
+    }
     const float refLatDeg = static_cast<float>(curLatE7) * 1e-7f;
     float dNorth = 0.0f, dEast = 0.0f;
-    latLonE7ToMeters(dLatE7, dLonE7, refLatDeg, dNorth, dEast);
+    latLonE7ToMeters(static_cast<int32_t>(dLatE7), static_cast<int32_t>(dLonE7),
+                     refLatDeg, dNorth, dEast);
 
     out.distanceToTargetM = sqrtf(dNorth * dNorth + dEast * dEast);
 
@@ -103,17 +139,17 @@ class PositionController {
       return out;  // zero velocity command
     }
 
-    // North = +Vx in the body frame after yaw alignment (caller's responsibility
-    // to feed earth-frame target velocity to the velocity loop OR rotate this
-    // by yaw before handoff). For simplicity we treat NED == body since RTH
-    // assumes the drone is yaw-aligned with home heading.
+    // Output remains earth-frame north/east. Call targetBodyVelocity(yawDeg)
+    // immediately before feeding the body-frame VelocityController.
     integXM_ = clampf(integXM_ + dNorth * dtSeconds, -cfg_.maxIntegMeters, cfg_.maxIntegMeters);
     integYM_ = clampf(integYM_ + dEast  * dtSeconds, -cfg_.maxIntegMeters, cfg_.maxIntegMeters);
 
-    out.targetVxMs = clampf(cfg_.kP * dNorth + cfg_.kI * integXM_,
-                            -cfg_.maxCruiseSpeedMs, cfg_.maxCruiseSpeedMs);
-    out.targetVyMs = clampf(cfg_.kP * dEast  + cfg_.kI * integYM_,
-                            -cfg_.maxCruiseSpeedMs, cfg_.maxCruiseSpeedMs);
+    out.targetNorthMs = clampf(cfg_.kP * dNorth + cfg_.kI * integXM_,
+                               -cfg_.maxCruiseSpeedMs, cfg_.maxCruiseSpeedMs);
+    out.targetEastMs = clampf(cfg_.kP * dEast  + cfg_.kI * integYM_,
+                              -cfg_.maxCruiseSpeedMs, cfg_.maxCruiseSpeedMs);
+    out.targetVxMs = out.targetNorthMs;
+    out.targetVyMs = out.targetEastMs;
     haveLast_ = true;
     return out;
   }

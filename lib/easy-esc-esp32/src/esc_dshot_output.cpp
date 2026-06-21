@@ -355,6 +355,24 @@ MotorTelemetry EscDshotOutput::motorTelemetry(uint8_t motor) const
     return _telemetry[motor];
 }
 
+Status EscDshotOutput::requestMotorUartTelemetry(uint8_t motor)
+{
+    if (!_initialized)
+    {
+        return Status::NotInitialized;
+    }
+    if (motor >= _config.motorCount)
+    {
+        return Status::InvalidArg;
+    }
+    if (_passthroughActive || _driverSuspended[motor] || !_drivers[motor])
+    {
+        return Status::PassthroughActive;
+    }
+    _drivers[motor]->requestTelemetrySignal();
+    return Status::Ok;
+}
+
 Status EscDshotOutput::suspendMotorDriverForPassthrough(uint8_t motor)
 {
     if (!_initialized)
@@ -406,6 +424,26 @@ Status EscDshotOutput::resumeMotorDriverFromPassthrough(uint8_t motor)
     _driverSuspended[motor] = false;
     _lastThrottleRaw[motor] = 0;
     return sendMotorRaw(motor, 0);
+}
+
+Status EscDshotOutput::sendMotorCommandFrame(uint8_t motor, uint16_t command)
+{
+    if (!_initialized)
+    {
+        return Status::NotInitialized;
+    }
+    if (motor >= _config.motorCount)
+    {
+        return Status::InvalidArg;
+    }
+    // A command needs the live RMT driver and exclusive use of the wire. The
+    // caller guarantees motors are stopped; we just refuse if the driver is
+    // suspended (passthrough) or missing.
+    if (_passthroughActive || _driverSuspended[motor] || !_drivers[motor])
+    {
+        return Status::PassthroughActive;
+    }
+    return _drivers[motor]->sendCommand(command).success ? Status::Ok : Status::DriverError;
 }
 
 Status EscDshotOutput::createDriver(uint8_t motor)
