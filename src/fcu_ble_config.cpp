@@ -4,6 +4,9 @@
 
 #if ENABLE_BLE_CONFIG
 #include <BLEAdvertising.h>
+#ifndef CONFIG_NIMBLE_ENABLED
+#include <BLE2902.h>
+#endif
 #include <BLECharacteristic.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
@@ -22,6 +25,8 @@ constexpr const char* kTxUuid = "b7f3b8f2-6e6a-4d7a-9df7-2c13f0c00001";
 constexpr const char* kInfoUuid = "b7f3b8f3-6e6a-4d7a-9df7-2c13f0c00001";
 constexpr size_t kRxRingSize = 1024;
 constexpr size_t kNotifyChunkBytes = 160;
+constexpr uint16_t kAdvMinInterval = 0x20;  // 20 ms units are 0.625 ms
+constexpr uint16_t kAdvMaxInterval = 0x40;  // 40 ms
 constexpr uint16_t kFastBlinkOnMs = 62;
 constexpr uint16_t kFastBlinkOffMs = 62;
 
@@ -200,12 +205,19 @@ bool startBle(uint32_t nowMs) {
     return false;
   }
   gRx->setCallbacks(&gRxCallbacks);
+#ifndef CONFIG_NIMBLE_ENABLED
+  gTx->addDescriptor(new BLE2902());
+#endif
   gInfo->setValue("AeroForge ESP32-S3 Mini FCU");
   gBleStream.setTxCharacteristic(gTx);
   service->start();
   BLEAdvertising* advertising = BLEDevice::getAdvertising();
   if (advertising != nullptr) {
     advertising->addServiceUUID(kServiceUuid);
+    advertising->setMinInterval(kAdvMinInterval);
+    advertising->setMaxInterval(kAdvMaxInterval);
+    advertising->setMinPreferred(kAdvMinInterval);
+    advertising->setMaxPreferred(kAdvMaxInterval);
     advertising->setScanResponse(true);
   }
   BLEDevice::startAdvertising();
