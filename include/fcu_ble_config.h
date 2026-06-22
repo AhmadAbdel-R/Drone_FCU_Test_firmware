@@ -41,10 +41,13 @@ struct Status {
   bool requestedEnabled = false;
   bool active = false;
   bool connected = false;
+  bool subscribed = false;       // central enabled TX notifications/indications
   uint32_t rxBytes = 0;
   uint32_t txBytes = 0;
   uint32_t droppedRxBytes = 0;
+  uint32_t droppedTxBytes = 0;   // TX bytes dropped: no subscriber or mbuf exhausted
   uint32_t toggles = 0;
+  uint16_t negotiatedMtu = 0;    // last negotiated ATT MTU (0 = default 23)
 };
 
 void init(uint32_t nowMs, bool bootEnabled = (BLE_DEFAULT_ENABLED != 0),

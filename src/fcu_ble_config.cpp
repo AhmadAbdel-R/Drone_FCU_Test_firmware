@@ -3,15 +3,31 @@
 #include "fcu_configurator.h"
 
 #if ENABLE_BLE_CONFIG
-#include <BLEAdvertising.h>
-#ifndef CONFIG_NIMBLE_ENABLED
-#include <BLE2902.h>
-#endif
-#include <BLECharacteristic.h>
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEService.h>
-#include <BLEUtils.h>
+// Direct ESP-IDF/NimBLE host APIs. We deliberately do NOT use the arduino-esp32
+// BLE wrapper (BLEDevice/BLEServer/BLECharacteristic): that wrapper's NimBLE
+// backend mismanaged the TX CCCD/subscribe path (Windows/Web Bluetooth saw
+// "subscribed: false" forever and startNotifications() hung). Talking to the
+// NimBLE host directly lets the stack auto-create exactly one CCCD for the TX
+// characteristic and reports the real cur_notify/cur_indicate state, so
+// subscriptions work reliably. NimBLE is the active BT host on this framework
+// (arduino-esp32 3.3.x, CONFIG_NIMBLE_ENABLED=y); these headers are the same
+// ones the wrapper itself pulls in.
+#include <string.h>
+
+#include <nimble/nimble_port.h>
+#include <nimble/nimble_port_freertos.h>
+#include <host/ble_hs.h>
+#include <host/ble_hs_id.h>
+#include <host/ble_hs_adv.h>
+#include <host/ble_hs_mbuf.h>
+#include <host/ble_uuid.h>
+#include <host/ble_gap.h>
+#include <host/ble_gatt.h>
+#include <host/ble_att.h>
+#include <host/util/util.h>
+#include <os/os_mbuf.h>
+#include <services/gap/ble_svc_gap.h>
+#include <services/gatt/ble_svc_gatt.h>
 #endif
 
 namespace fcu_ble_config {
@@ -19,14 +35,12 @@ namespace fcu_ble_config {
 namespace {
 
 constexpr const char* kDeviceName = "AeroForge FCU";
-constexpr const char* kServiceUuid = "b7f3b8f0-6e6a-4d7a-9df7-2c13f0c00001";
-constexpr const char* kRxUuid = "b7f3b8f1-6e6a-4d7a-9df7-2c13f0c00001";
-constexpr const char* kTxUuid = "b7f3b8f2-6e6a-4d7a-9df7-2c13f0c00001";
-constexpr const char* kInfoUuid = "b7f3b8f3-6e6a-4d7a-9df7-2c13f0c00001";
+constexpr const char* kInfoValue = "AeroForge ESP32-S3 Mini FCU";
 constexpr size_t kRxRingSize = 1024;
-constexpr size_t kNotifyChunkBytes = 160;
-constexpr uint16_t kAdvMinInterval = 0x20;  // 20 ms units are 0.625 ms
-constexpr uint16_t kAdvMaxInterval = 0x40;  // 40 ms
+constexpr size_t kNotifyChunkBytes = 160;     // < MTU(185) - 3 ATT header bytes
+constexpr uint16_t kPreferredMtu = 185;
+constexpr uint16_t kAdvMinInterval = 0x20;    // units of 0.625 ms -> 20 ms
+constexpr uint16_t kAdvMaxInterval = 0x40;    // 40 ms
 constexpr uint16_t kFastBlinkOnMs = 62;
 constexpr uint16_t kFastBlinkOffMs = 62;
 
@@ -34,7 +48,7 @@ Status gStatus;
 bool gRequestedEnabled = (BLE_DEFAULT_ENABLED != 0);
 PersistRequestedFn gPersistRequested = nullptr;
 bool gActive = false;
-bool gConnected = false;
+volatile bool gConnected = false;
 bool gInitialized = false;
 bool gRawButtonState = true;
 bool gStableButtonState = true;
@@ -64,12 +78,87 @@ void persistRequestedEnabled() {
 }
 
 #if ENABLE_BLE_CONFIG
+
+// ---- 128-bit service/characteristic UUIDs --------------------------------
+// NimBLE stores 128-bit UUIDs little-endian (LSB first), i.e. the reverse of
+// the human-readable big-endian string. Only the time-low low byte differs
+// between the four UUIDs (..f0/f1/f2/f3), which lands at value[12] below.
+//   Service: b7f3b8f0-6e6a-4d7a-9df7-2c13f0c00001
+//   RX:      b7f3b8f1-6e6a-4d7a-9df7-2c13f0c00001
+//   TX:      b7f3b8f2-6e6a-4d7a-9df7-2c13f0c00001
+//   INFO:    b7f3b8f3-6e6a-4d7a-9df7-2c13f0c00001
+const ble_uuid128_t kServiceUuid = BLE_UUID128_INIT(
+    0x01, 0x00, 0xc0, 0xf0, 0x13, 0x2c, 0xf7, 0x9d,
+    0x7a, 0x4d, 0x6a, 0x6e, 0xf0, 0xb8, 0xf3, 0xb7);
+const ble_uuid128_t kRxUuid = BLE_UUID128_INIT(
+    0x01, 0x00, 0xc0, 0xf0, 0x13, 0x2c, 0xf7, 0x9d,
+    0x7a, 0x4d, 0x6a, 0x6e, 0xf1, 0xb8, 0xf3, 0xb7);
+const ble_uuid128_t kTxUuid = BLE_UUID128_INIT(
+    0x01, 0x00, 0xc0, 0xf0, 0x13, 0x2c, 0xf7, 0x9d,
+    0x7a, 0x4d, 0x6a, 0x6e, 0xf2, 0xb8, 0xf3, 0xb7);
+const ble_uuid128_t kInfoUuid = BLE_UUID128_INIT(
+    0x01, 0x00, 0xc0, 0xf0, 0x13, 0x2c, 0xf7, 0x9d,
+    0x7a, 0x4d, 0x6a, 0x6e, 0xf3, 0xb8, 0xf3, 0xb7);
+
+// Attribute value handles, filled in by NimBLE during ble_gatts_add_svcs /
+// host start. The CCCD for TX is implicitly at gTxValHandle + 1.
+uint16_t gRxValHandle = 0;
+uint16_t gTxValHandle = 0;
+uint16_t gInfoValHandle = 0;
+
+// Connection / subscription state. Written from the NimBLE host task (GAP
+// callback), read from the loop() task (TX writes / status). Plain volatile
+// flags are sufficient for this single-central SPSC usage.
+volatile uint16_t gConnHandle = BLE_HS_CONN_HANDLE_NONE;
+volatile bool gTxSubscribed = false;   // client enabled notify or indicate
+volatile bool gTxIndicate = false;     // client chose indicate over notify
+volatile bool gSynced = false;         // host<->controller synced, addr ready
+bool gHostInited = false;              // NimBLE host brought up once (sticky)
+uint8_t gOwnAddrType = BLE_OWN_ADDR_PUBLIC;
+
+int gattAccessCb(uint16_t conn_handle, uint16_t attr_handle,
+                 struct ble_gatt_access_ctxt* ctxt, void* arg);
+int gapEventCb(struct ble_gap_event* event, void* arg);
+
+// GATT table. NimBLE adds the TX CCCD (0x2902) automatically because TX has
+// the notify/indicate flags — we must NOT add one ourselves (that double-CCCD
+// is exactly what broke the wrapper path).
+const struct ble_gatt_chr_def kChrs[] = {
+    {
+        // RX: configurator -> FCU (write / write-without-response)
+        .uuid = &kRxUuid.u,
+        .access_cb = gattAccessCb,
+        .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
+        .val_handle = &gRxValHandle,
+    },
+    {
+        // TX: FCU -> configurator (notify, with indicate offered for Windows)
+        .uuid = &kTxUuid.u,
+        .access_cb = gattAccessCb,
+        .flags = BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_INDICATE,
+        .val_handle = &gTxValHandle,
+    },
+    {
+        // INFO: static identification string (read)
+        .uuid = &kInfoUuid.u,
+        .access_cb = gattAccessCb,
+        .flags = BLE_GATT_CHR_F_READ,
+        .val_handle = &gInfoValHandle,
+    },
+    {0},
+};
+
+const struct ble_gatt_svc_def kGattSvcs[] = {
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = &kServiceUuid.u,
+        .characteristics = kChrs,
+    },
+    {0},
+};
+
 class BleConfigStream final : public Stream {
  public:
-  void setTxCharacteristic(BLECharacteristic* tx) {
-    tx_ = tx;
-  }
-
   void setConnected(bool connected) {
     connected_ = connected;
     if (!connected_) {
@@ -102,23 +191,55 @@ class BleConfigStream final : public Stream {
   }
 
   size_t write(const uint8_t* buffer, size_t size) override {
-    if (!connected_ || tx_ == nullptr || buffer == nullptr || size == 0U) {
+    if (buffer == nullptr || size == 0U) {
       return 0;
+    }
+    if (!gConnected || gConnHandle == BLE_HS_CONN_HANDLE_NONE) {
+      return 0;
+    }
+    if (!gTxSubscribed) {
+      // Connected but the client has not enabled notifications/indications.
+      // Never push a notification before the subscribe (requirement #5); drop
+      // the reply and report it consumed so the caller does not stall retrying.
+      gStatus.droppedTxBytes += static_cast<uint32_t>(size);
+      return size;
     }
     size_t sent = 0;
     while (sent < size) {
       const size_t remaining = size - sent;
       const size_t chunk = remaining > kNotifyChunkBytes ? kNotifyChunkBytes : remaining;
-      tx_->setValue(&buffer[sent], chunk);
-      tx_->notify();
+      // ble_gatts_notify_custom / indicate_custom take ownership of the mbuf and
+      // free it on every path, so we never os_mbuf_free it ourselves.
+      struct os_mbuf* om = ble_hs_mbuf_from_flat(&buffer[sent], chunk);
+      if (om == nullptr) {
+        gStatus.droppedTxBytes += static_cast<uint32_t>(remaining);
+        break;  // mbuf pool exhausted; caller may retry
+      }
+      // The shipping AeroForge Configurator (Web Bluetooth) calls
+      // startNotifications(), which enables NOTIFY because TX advertises the
+      // notify property -> gTxIndicate stays false and we take the notify path
+      // (fire-and-forget, no per-packet ATT confirmation). The indicate branch
+      // exists only for an indicate-only client; note that NimBLE allows just
+      // ONE outstanding indication per connection, so a reply spanning multiple
+      // chunks would drop chunks 2+ here (rc != 0 -> droppedTxBytes) until each
+      // prior indication is confirmed. Acceptable as-is because no shipping
+      // client subscribes via indicate; revisit with a NOTIFY_TX-driven TX
+      // queue if an indicate-only client is ever added.
+      const int rc = gTxIndicate
+                         ? ble_gatts_indicate_custom(gConnHandle, gTxValHandle, om)
+                         : ble_gatts_notify_custom(gConnHandle, gTxValHandle, om);
+      if (rc != 0) {
+        gStatus.droppedTxBytes += static_cast<uint32_t>(remaining);
+        break;
+      }
       sent += chunk;
       gStatus.txBytes += static_cast<uint32_t>(chunk);
     }
-    return size;
+    return sent;
   }
 
   int availableForWrite() override {
-    return connected_ ? 512 : 0;
+    return gConnected ? 512 : 0;
   }
 
   void pushRx(const uint8_t* data, size_t len) {
@@ -136,7 +257,6 @@ class BleConfigStream final : public Stream {
   }
 
  private:
-  BLECharacteristic* tx_ = nullptr;
   bool connected_ = false;
   uint8_t rx_[kRxRingSize] = {};
   volatile size_t head_ = 0;
@@ -144,108 +264,195 @@ class BleConfigStream final : public Stream {
 };
 
 BleConfigStream gBleStream;
-BLEServer* gServer = nullptr;
-BLECharacteristic* gTx = nullptr;
-BLECharacteristic* gRx = nullptr;
-BLECharacteristic* gInfo = nullptr;
 
-class ServerCallbacks final : public BLEServerCallbacks {
- public:
-  void onConnect(BLEServer* server) override {
-    (void)server;
-    gConnected = true;
-    gBleStream.setConnected(true);
+// Single access callback for all three characteristics; dispatch on the value
+// handle that NimBLE assigned at registration time.
+int gattAccessCb(uint16_t conn_handle, uint16_t attr_handle,
+                 struct ble_gatt_access_ctxt* ctxt, void* arg) {
+  (void)conn_handle;
+  (void)arg;
+  switch (ctxt->op) {
+    case BLE_GATT_ACCESS_OP_WRITE_CHR:
+      if (attr_handle == gRxValHandle) {
+        uint8_t buf[256];  // bounded by MTU(185) -> max single write 182 bytes
+        uint16_t outLen = 0;
+        if (ble_hs_mbuf_to_flat(ctxt->om, buf, sizeof(buf), &outLen) == 0) {
+          gBleStream.pushRx(buf, outLen);
+        }
+        return 0;
+      }
+      return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
+    case BLE_GATT_ACCESS_OP_READ_CHR:
+      if (attr_handle == gInfoValHandle) {
+        const int rc = os_mbuf_append(ctxt->om, kInfoValue, strlen(kInfoValue));
+        return (rc == 0) ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+      }
+      if (attr_handle == gTxValHandle) {
+        return 0;  // notify/indicate only; a direct read yields an empty value
+      }
+      return BLE_ATT_ERR_READ_NOT_PERMITTED;
+    default:
+      return BLE_ATT_ERR_UNLIKELY;
+  }
+}
+
+void startAdvertising() {
+  if (!gSynced || !gActive || gConnected) return;
+  if (ble_gap_adv_active()) return;
+
+  // Main advertisement carries the flags + the 128-bit service UUID so
+  // Web Bluetooth can filter on it. The full device name is too large to also
+  // fit (16-byte UUID + name > 31 bytes), so the name goes in the scan response.
+  struct ble_hs_adv_fields adv_fields;
+  memset(&adv_fields, 0, sizeof(adv_fields));
+  adv_fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+  adv_fields.uuids128 = &kServiceUuid;
+  adv_fields.num_uuids128 = 1;
+  adv_fields.uuids128_is_complete = 1;
+  if (ble_gap_adv_set_fields(&adv_fields) != 0) {
+    return;
   }
 
-  void onDisconnect(BLEServer* server) override {
-    (void)server;
-    gConnected = false;
-    gBleStream.setConnected(false);
-    if (gActive) {
-      BLEDevice::startAdvertising();
-    }
-  }
-};
+  struct ble_hs_adv_fields rsp_fields;
+  memset(&rsp_fields, 0, sizeof(rsp_fields));
+  rsp_fields.name = reinterpret_cast<const uint8_t*>(kDeviceName);
+  rsp_fields.name_len = static_cast<uint8_t>(strlen(kDeviceName));
+  rsp_fields.name_is_complete = 1;
+  (void)ble_gap_adv_rsp_set_fields(&rsp_fields);
 
-class RxCallbacks final : public BLECharacteristicCallbacks {
- public:
-  void onWrite(BLECharacteristic* characteristic) override {
-    if (characteristic == nullptr) return;
-    gBleStream.pushRx(characteristic->getData(), characteristic->getLength());
-  }
-};
+  struct ble_gap_adv_params adv_params;
+  memset(&adv_params, 0, sizeof(adv_params));
+  adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;   // connectable, undirected
+  adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;   // general discoverable
+  adv_params.itvl_min = kAdvMinInterval;
+  adv_params.itvl_max = kAdvMaxInterval;
 
-ServerCallbacks gServerCallbacks;
-RxCallbacks gRxCallbacks;
+  (void)ble_gap_adv_start(gOwnAddrType, nullptr, BLE_HS_FOREVER, &adv_params,
+                          gapEventCb, nullptr);
+}
+
+int gapEventCb(struct ble_gap_event* event, void* arg) {
+  (void)arg;
+  switch (event->type) {
+    case BLE_GAP_EVENT_CONNECT:
+      if (event->connect.status == 0) {
+        gConnHandle = event->connect.conn_handle;
+        gTxSubscribed = false;
+        gTxIndicate = false;
+        gConnected = true;
+        gBleStream.setConnected(true);
+      } else {
+        // Connection failed to establish; resume advertising.
+        gConnHandle = BLE_HS_CONN_HANDLE_NONE;
+        startAdvertising();
+      }
+      return 0;
+    case BLE_GAP_EVENT_DISCONNECT:
+      gConnected = false;
+      gTxSubscribed = false;
+      gTxIndicate = false;
+      gConnHandle = BLE_HS_CONN_HANDLE_NONE;
+      gStatus.negotiatedMtu = 0;
+      gBleStream.setConnected(false);
+      startAdvertising();
+      return 0;
+    case BLE_GAP_EVENT_SUBSCRIBE:
+      // The subscribe event reports the characteristic VALUE handle (the CCCD
+      // it backs is at value+1). cur_notify/cur_indicate are the live state.
+      if (event->subscribe.attr_handle == gTxValHandle) {
+        gTxIndicate = event->subscribe.cur_indicate != 0;
+        gTxSubscribed = (event->subscribe.cur_notify != 0) ||
+                        (event->subscribe.cur_indicate != 0);
+      }
+      return 0;
+    case BLE_GAP_EVENT_MTU:
+      gStatus.negotiatedMtu = event->mtu.value;
+      return 0;
+    case BLE_GAP_EVENT_ADV_COMPLETE:
+      startAdvertising();
+      return 0;
+    default:
+      return 0;
+  }
+}
+
+void onSync() {
+  // Ensure we have an identity address, then pick the address type to use.
+  (void)ble_hs_util_ensure_addr(0);
+  if (ble_hs_id_infer_auto(0, &gOwnAddrType) != 0) {
+    gOwnAddrType = BLE_OWN_ADDR_PUBLIC;
+  }
+  gSynced = true;
+  startAdvertising();
+}
+
+void onReset(int reason) {
+  (void)reason;
+  gSynced = false;
+}
+
+void hostTask(void* param) {
+  (void)param;
+  nimble_port_run();  // returns only after nimble_port_stop()
+  nimble_port_freertos_deinit();
+}
+
+bool initHost() {
+  if (nimble_port_init() != 0) {
+    return false;
+  }
+  ble_hs_cfg.reset_cb = onReset;
+  ble_hs_cfg.sync_cb = onSync;
+  ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;  // "Just Works", no bonding
+  ble_hs_cfg.sm_bonding = 0;
+
+  ble_svc_gap_init();
+  ble_svc_gatt_init();
+  if (ble_gatts_count_cfg(kGattSvcs) != 0) return false;
+  if (ble_gatts_add_svcs(kGattSvcs) != 0) return false;
+  (void)ble_svc_gap_device_name_set(kDeviceName);
+  (void)ble_att_set_preferred_mtu(kPreferredMtu);
+
+  nimble_port_freertos_init(hostTask);
+  return true;
+}
 
 bool startBle(uint32_t nowMs) {
   if (gActive) return true;
-  if (!BLEDevice::init(kDeviceName)) {
-    return false;
+  if (!gHostInited) {
+    if (!initHost()) {
+      return false;
+    }
+    gHostInited = true;
   }
-  (void)BLEDevice::setMTU(185);
-  gServer = BLEDevice::createServer();
-  if (gServer == nullptr) {
-    BLEDevice::deinit(false);
-    return false;
-  }
-  gServer->setCallbacks(&gServerCallbacks);
-  BLEService* service = gServer->createService(kServiceUuid);
-  if (service == nullptr) {
-    BLEDevice::deinit(false);
-    return false;
-  }
-  gRx = service->createCharacteristic(kRxUuid,
-                                      BLECharacteristic::PROPERTY_WRITE |
-                                      BLECharacteristic::PROPERTY_WRITE_NR);
-  gTx = service->createCharacteristic(kTxUuid,
-                                      BLECharacteristic::PROPERTY_NOTIFY |
-                                      BLECharacteristic::PROPERTY_INDICATE);
-  gInfo = service->createCharacteristic(kInfoUuid, BLECharacteristic::PROPERTY_READ);
-  if (gRx == nullptr || gTx == nullptr || gInfo == nullptr) {
-    BLEDevice::deinit(false);
-    return false;
-  }
-  gRx->setCallbacks(&gRxCallbacks);
-#ifndef CONFIG_NIMBLE_ENABLED
-  gTx->addDescriptor(new BLE2902());
-#endif
-  gInfo->setValue("AeroForge ESP32-S3 Mini FCU");
-  gBleStream.setTxCharacteristic(gTx);
-  service->start();
-  BLEAdvertising* advertising = BLEDevice::getAdvertising();
-  if (advertising != nullptr) {
-    advertising->addServiceUUID(kServiceUuid);
-    advertising->setMinInterval(kAdvMinInterval);
-    advertising->setMaxInterval(kAdvMaxInterval);
-    advertising->setMinPreferred(kAdvMinInterval);
-    advertising->setMaxPreferred(kAdvMaxInterval);
-    advertising->setScanResponse(true);
-  }
-  BLEDevice::startAdvertising();
   gActive = true;
   gConnected = false;
   gLedPhaseStartMs = nowMs;
+  // If the host is already synced (re-enable after a toggle-off), advertise now.
+  // On the first enable, onSync() will start advertising once the stack is up.
+  startAdvertising();
   return true;
 }
 
 void stopBle() {
   if (!gActive) return;
-  BLEDevice::stopAdvertising();
-  gBleStream.setConnected(false);
-  gServer = nullptr;
-  gTx = nullptr;
-  gRx = nullptr;
-  gInfo = nullptr;
-  gConnected = false;
   gActive = false;
-  BLEDevice::deinit(false);
+  if (gConnected && gConnHandle != BLE_HS_CONN_HANDLE_NONE) {
+    // 0x13 = Remote User Terminated Connection (HCI reason).
+    (void)ble_gap_terminate(gConnHandle, 0x13);
+  }
+  if (ble_gap_adv_active()) {
+    (void)ble_gap_adv_stop();
+  }
+  gConnected = false;
+  gTxSubscribed = false;
+  gTxIndicate = false;
+  gConnHandle = BLE_HS_CONN_HANDLE_NONE;
+  gStatus.negotiatedMtu = 0;
+  gBleStream.setConnected(false);
   writeBleLeds(false);
 }
-#else
-bool startBle(uint32_t) { return false; }
-void stopBle() {}
-#endif
+#endif  // ENABLE_BLE_CONFIG
 
 void pollButton(uint32_t nowMs, bool allowToggle) {
   const bool rawReleased = digitalRead(FCU_BLE_BOOT_BUTTON_PIN) != LOW;
@@ -371,6 +578,9 @@ Status status() {
   gStatus.requestedEnabled = gRequestedEnabled;
   gStatus.active = gActive;
   gStatus.connected = gConnected;
+#if ENABLE_BLE_CONFIG
+  gStatus.subscribed = gTxSubscribed;
+#endif
   return gStatus;
 }
 
