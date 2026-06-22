@@ -107,6 +107,7 @@ const ble_uuid128_t kInfoUuid = BLE_UUID128_INIT(
 // host start. The CCCD for TX is implicitly at gTxValHandle + 1.
 uint16_t gRxValHandle = 0;
 uint16_t gTxValHandle = 0;
+uint16_t gTxCccdHandle = 0;
 uint16_t gInfoValHandle = 0;
 
 // Connection / subscription state. Written from the NimBLE host task (GAP
@@ -140,10 +141,12 @@ const struct ble_gatt_chr_def kChrs[] = {
         .val_handle = &gRxValHandle,
     },
     {
-        // TX: FCU -> configurator (notify, with indicate offered for Windows)
+        // TX: FCU -> configurator. Keep this NOTIFY-only: Web Bluetooth's
+        // startNotifications() is happiest with notify, and indications permit
+        // only one outstanding packet which breaks multi-chunk replies.
         .uuid = &kTxUuid.u,
         .access_cb = gattAccessCb,
-        .flags = BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_INDICATE,
+        .flags = BLE_GATT_CHR_F_NOTIFY,
         .val_handle = &gTxValHandle,
     },
     {
@@ -164,6 +167,31 @@ const struct ble_gatt_svc_def kGattSvcs[] = {
     },
     {0},
 };
+
+void refreshGattHandles(const char* phase) {
+  uint16_t defHandle = 0;
+  uint16_t valHandle = 0;
+  int rcRx = ble_gatts_find_chr(&kServiceUuid.u, &kRxUuid.u, &defHandle, &valHandle);
+  if (rcRx == 0) {
+    gRxValHandle = valHandle;
+  }
+  int rcTx = ble_gatts_find_chr(&kServiceUuid.u, &kTxUuid.u, &defHandle, &valHandle);
+  if (rcTx == 0) {
+    gTxValHandle = valHandle;
+    gTxCccdHandle = static_cast<uint16_t>(valHandle + 1U);
+  }
+  int rcInfo = ble_gatts_find_chr(&kServiceUuid.u, &kInfoUuid.u, &defHandle, &valHandle);
+  if (rcInfo == 0) {
+    gInfoValHandle = valHandle;
+  }
+  Serial.printf("[BLE] handles %s rx=%u tx=%u tx_cccd=%u info=%u rc=%d/%d/%d\n",
+                phase,
+                static_cast<unsigned>(gRxValHandle),
+                static_cast<unsigned>(gTxValHandle),
+                static_cast<unsigned>(gTxCccdHandle),
+                static_cast<unsigned>(gInfoValHandle),
+                rcRx, rcTx, rcInfo);
+}
 
 class BleConfigStream final : public Stream {
  public:
@@ -411,21 +439,28 @@ int gapEventCb(struct ble_gap_event* event, void* arg) {
       requestAdvertising();
       return 0;
     case BLE_GAP_EVENT_SUBSCRIBE:
-      // The subscribe event reports the characteristic VALUE handle (the CCCD
-      // it backs is at value+1). cur_notify/cur_indicate are the live state.
-      if (event->subscribe.attr_handle == gTxValHandle) {
+      // The event normally reports the characteristic VALUE handle. Accept the
+      // TX CCCD handle too for Arduino/NimBLE builds that surface that handle
+      // during Web Bluetooth subscription setup.
+      if (event->subscribe.attr_handle == gTxValHandle ||
+          event->subscribe.attr_handle == gTxCccdHandle) {
         gTxIndicate = event->subscribe.cur_indicate != 0;
         gTxSubscribed = (event->subscribe.cur_notify != 0) ||
                         (event->subscribe.cur_indicate != 0);
-        Serial.printf("[BLE] subscribe tx notify=%u indicate=%u subscribed=%u\n",
-                      static_cast<unsigned>(event->subscribe.cur_notify != 0),
-                      static_cast<unsigned>(event->subscribe.cur_indicate != 0),
-                      static_cast<unsigned>(gTxSubscribed));
-      } else {
-        Serial.printf("[BLE] subscribe other attr=%u notify=%u indicate=%u\n",
+        Serial.printf("[BLE] subscribe tx attr=%u notify=%u indicate=%u subscribed=%u reason=%u\n",
                       static_cast<unsigned>(event->subscribe.attr_handle),
                       static_cast<unsigned>(event->subscribe.cur_notify != 0),
-                      static_cast<unsigned>(event->subscribe.cur_indicate != 0));
+                      static_cast<unsigned>(event->subscribe.cur_indicate != 0),
+                      static_cast<unsigned>(gTxSubscribed),
+                      static_cast<unsigned>(event->subscribe.reason));
+      } else {
+        Serial.printf("[BLE] subscribe other attr=%u tx=%u tx_cccd=%u notify=%u indicate=%u reason=%u\n",
+                      static_cast<unsigned>(event->subscribe.attr_handle),
+                      static_cast<unsigned>(gTxValHandle),
+                      static_cast<unsigned>(gTxCccdHandle),
+                      static_cast<unsigned>(event->subscribe.cur_notify != 0),
+                      static_cast<unsigned>(event->subscribe.cur_indicate != 0),
+                      static_cast<unsigned>(event->subscribe.reason));
       }
       return 0;
     case BLE_GAP_EVENT_MTU:
@@ -453,6 +488,7 @@ void onSync() {
   gSynced = true;
   Serial.printf("[BLE] host synced addr_type=%u\n",
                 static_cast<unsigned>(gOwnAddrType));
+  refreshGattHandles("sync");
   requestAdvertising();
 }
 
@@ -491,6 +527,7 @@ bool initHost() {
     Serial.printf("[BLE] gatts add failed rc=%d\n", rc);
     return false;
   }
+  refreshGattHandles("add");
   (void)ble_svc_gap_device_name_set(kDeviceName);
   (void)ble_att_set_preferred_mtu(kPreferredMtu);
 
