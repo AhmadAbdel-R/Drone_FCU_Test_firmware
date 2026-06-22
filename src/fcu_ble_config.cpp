@@ -14,6 +14,9 @@
 // ones the wrapper itself pulls in.
 #include <string.h>
 
+// Pull in the same Arduino constructor the BLE wrapper uses so BTDM memory is
+// kept reserved. NimBLE owns controller init; calling btStart() double-inits it.
+#include "esp32-hal-bt-mem.h"
 #include <nimble/nimble_port.h>
 #include <nimble/nimble_port_freertos.h>
 #include <host/ble_hs.h>
