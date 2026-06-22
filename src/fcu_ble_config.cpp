@@ -118,10 +118,15 @@ volatile bool gTxIndicate = false;     // client chose indicate over notify
 volatile bool gSynced = false;         // host<->controller synced, addr ready
 bool gHostInited = false;              // NimBLE host brought up once (sticky)
 uint8_t gOwnAddrType = BLE_OWN_ADDR_PUBLIC;
+volatile bool gAdvertiseRequested = false;
+uint32_t gNextAdvAttemptMs = 0;
 
 int gattAccessCb(uint16_t conn_handle, uint16_t attr_handle,
                  struct ble_gatt_access_ctxt* ctxt, void* arg);
 int gapEventCb(struct ble_gap_event* event, void* arg);
+void requestAdvertising() {
+  gAdvertiseRequested = true;
+}
 
 // GATT table. NimBLE adds the TX CCCD (0x2902) automatically because TX has
 // the notify/indicate flags — we must NOT add one ourselves (that double-CCCD
@@ -280,6 +285,9 @@ int gattAccessCb(uint16_t conn_handle, uint16_t attr_handle,
         uint8_t buf[256];  // bounded by MTU(185) -> max single write 182 bytes
         uint16_t outLen = 0;
         if (ble_hs_mbuf_to_flat(ctxt->om, buf, sizeof(buf), &outLen) == 0) {
+          Serial.printf("[BLE] gatt write rx conn=%u len=%u\n",
+                        static_cast<unsigned>(conn_handle),
+                        static_cast<unsigned>(outLen));
           gBleStream.pushRx(buf, outLen);
         }
         return 0;
@@ -287,10 +295,14 @@ int gattAccessCb(uint16_t conn_handle, uint16_t attr_handle,
       return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
     case BLE_GATT_ACCESS_OP_READ_CHR:
       if (attr_handle == gInfoValHandle) {
+        Serial.printf("[BLE] gatt read info conn=%u\n",
+                      static_cast<unsigned>(conn_handle));
         const int rc = os_mbuf_append(ctxt->om, kInfoValue, strlen(kInfoValue));
         return (rc == 0) ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
       }
       if (attr_handle == gTxValHandle) {
+        Serial.printf("[BLE] gatt read tx-empty conn=%u\n",
+                      static_cast<unsigned>(conn_handle));
         return 0;  // notify/indicate only; a direct read yields an empty value
       }
       return BLE_ATT_ERR_READ_NOT_PERMITTED;
@@ -299,9 +311,9 @@ int gattAccessCb(uint16_t conn_handle, uint16_t attr_handle,
   }
 }
 
-void startAdvertising() {
-  if (!gSynced || !gActive || gConnected) return;
-  if (ble_gap_adv_active()) return;
+bool startAdvertising() {
+  if (!gSynced || !gActive || gConnected) return false;
+  if (ble_gap_adv_active()) return true;
 
   // Main advertisement carries the flags + the 128-bit service UUID so
   // Web Bluetooth can filter on it. The full device name is too large to also
@@ -312,8 +324,10 @@ void startAdvertising() {
   adv_fields.uuids128 = &kServiceUuid;
   adv_fields.num_uuids128 = 1;
   adv_fields.uuids128_is_complete = 1;
-  if (ble_gap_adv_set_fields(&adv_fields) != 0) {
-    return;
+  int rc = ble_gap_adv_set_fields(&adv_fields);
+  if (rc != 0) {
+    Serial.printf("[BLE] adv fields failed rc=%d\n", rc);
+    return false;
   }
 
   struct ble_hs_adv_fields rsp_fields;
@@ -321,7 +335,11 @@ void startAdvertising() {
   rsp_fields.name = reinterpret_cast<const uint8_t*>(kDeviceName);
   rsp_fields.name_len = static_cast<uint8_t>(strlen(kDeviceName));
   rsp_fields.name_is_complete = 1;
-  (void)ble_gap_adv_rsp_set_fields(&rsp_fields);
+  rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
+  if (rc != 0) {
+    Serial.printf("[BLE] scan response failed rc=%d\n", rc);
+    return false;
+  }
 
   struct ble_gap_adv_params adv_params;
   memset(&adv_params, 0, sizeof(adv_params));
@@ -330,8 +348,34 @@ void startAdvertising() {
   adv_params.itvl_min = kAdvMinInterval;
   adv_params.itvl_max = kAdvMaxInterval;
 
-  (void)ble_gap_adv_start(gOwnAddrType, nullptr, BLE_HS_FOREVER, &adv_params,
-                          gapEventCb, nullptr);
+  rc = ble_gap_adv_start(gOwnAddrType, nullptr, BLE_HS_FOREVER, &adv_params,
+                         gapEventCb, nullptr);
+  if (rc != 0) {
+    Serial.printf("[BLE] adv start failed rc=%d synced=%u active=%u connected=%u\n",
+                  rc,
+                  static_cast<unsigned>(gSynced),
+                  static_cast<unsigned>(gActive),
+                  static_cast<unsigned>(gConnected));
+    return false;
+  }
+  Serial.printf("[BLE] advertising started addr_type=%u\n",
+                static_cast<unsigned>(gOwnAddrType));
+  return true;
+}
+
+void serviceAdvertising(uint32_t nowMs) {
+  if (!gAdvertiseRequested) return;
+  if (!gSynced || !gActive || gConnected) return;
+  if (ble_gap_adv_active()) {
+    gAdvertiseRequested = false;
+    return;
+  }
+  if (nowMs < gNextAdvAttemptMs) return;
+  if (startAdvertising()) {
+    gAdvertiseRequested = false;
+  } else {
+    gNextAdvAttemptMs = nowMs + 250U;
+  }
 }
 
 int gapEventCb(struct ble_gap_event* event, void* arg) {
@@ -344,10 +388,15 @@ int gapEventCb(struct ble_gap_event* event, void* arg) {
         gTxIndicate = false;
         gConnected = true;
         gBleStream.setConnected(true);
+        Serial.printf("[BLE] connect ok handle=%u\n",
+                      static_cast<unsigned>(gConnHandle));
       } else {
         // Connection failed to establish; resume advertising.
         gConnHandle = BLE_HS_CONN_HANDLE_NONE;
-        startAdvertising();
+        gConnected = false;
+        Serial.printf("[BLE] connect failed status=%d; advertising retry queued\n",
+                      event->connect.status);
+        requestAdvertising();
       }
       return 0;
     case BLE_GAP_EVENT_DISCONNECT:
@@ -357,7 +406,9 @@ int gapEventCb(struct ble_gap_event* event, void* arg) {
       gConnHandle = BLE_HS_CONN_HANDLE_NONE;
       gStatus.negotiatedMtu = 0;
       gBleStream.setConnected(false);
-      startAdvertising();
+      Serial.printf("[BLE] disconnect reason=%d; advertising retry queued\n",
+                    event->disconnect.reason);
+      requestAdvertising();
       return 0;
     case BLE_GAP_EVENT_SUBSCRIBE:
       // The subscribe event reports the characteristic VALUE handle (the CCCD
@@ -366,13 +417,27 @@ int gapEventCb(struct ble_gap_event* event, void* arg) {
         gTxIndicate = event->subscribe.cur_indicate != 0;
         gTxSubscribed = (event->subscribe.cur_notify != 0) ||
                         (event->subscribe.cur_indicate != 0);
+        Serial.printf("[BLE] subscribe tx notify=%u indicate=%u subscribed=%u\n",
+                      static_cast<unsigned>(event->subscribe.cur_notify != 0),
+                      static_cast<unsigned>(event->subscribe.cur_indicate != 0),
+                      static_cast<unsigned>(gTxSubscribed));
+      } else {
+        Serial.printf("[BLE] subscribe other attr=%u notify=%u indicate=%u\n",
+                      static_cast<unsigned>(event->subscribe.attr_handle),
+                      static_cast<unsigned>(event->subscribe.cur_notify != 0),
+                      static_cast<unsigned>(event->subscribe.cur_indicate != 0));
       }
       return 0;
     case BLE_GAP_EVENT_MTU:
       gStatus.negotiatedMtu = event->mtu.value;
+      Serial.printf("[BLE] mtu conn=%u value=%u\n",
+                    static_cast<unsigned>(event->mtu.conn_handle),
+                    static_cast<unsigned>(event->mtu.value));
       return 0;
     case BLE_GAP_EVENT_ADV_COMPLETE:
-      startAdvertising();
+      Serial.printf("[BLE] advertising complete reason=%d; retry queued\n",
+                    event->adv_complete.reason);
+      requestAdvertising();
       return 0;
     default:
       return 0;
@@ -386,12 +451,14 @@ void onSync() {
     gOwnAddrType = BLE_OWN_ADDR_PUBLIC;
   }
   gSynced = true;
-  startAdvertising();
+  Serial.printf("[BLE] host synced addr_type=%u\n",
+                static_cast<unsigned>(gOwnAddrType));
+  requestAdvertising();
 }
 
 void onReset(int reason) {
-  (void)reason;
   gSynced = false;
+  Serial.printf("[BLE] host reset reason=%d\n", reason);
 }
 
 void hostTask(void* param) {
@@ -401,7 +468,10 @@ void hostTask(void* param) {
 }
 
 bool initHost() {
-  if (nimble_port_init() != 0) {
+  Serial.printf("[BLE] init host start\n");
+  const int initRc = nimble_port_init();
+  if (initRc != 0) {
+    Serial.printf("[BLE] nimble_port_init failed rc=%d\n", initRc);
     return false;
   }
   ble_hs_cfg.reset_cb = onReset;
@@ -411,12 +481,21 @@ bool initHost() {
 
   ble_svc_gap_init();
   ble_svc_gatt_init();
-  if (ble_gatts_count_cfg(kGattSvcs) != 0) return false;
-  if (ble_gatts_add_svcs(kGattSvcs) != 0) return false;
+  int rc = ble_gatts_count_cfg(kGattSvcs);
+  if (rc != 0) {
+    Serial.printf("[BLE] gatts count failed rc=%d\n", rc);
+    return false;
+  }
+  rc = ble_gatts_add_svcs(kGattSvcs);
+  if (rc != 0) {
+    Serial.printf("[BLE] gatts add failed rc=%d\n", rc);
+    return false;
+  }
   (void)ble_svc_gap_device_name_set(kDeviceName);
   (void)ble_att_set_preferred_mtu(kPreferredMtu);
 
   nimble_port_freertos_init(hostTask);
+  Serial.printf("[BLE] init host done\n");
   return true;
 }
 
@@ -433,7 +512,8 @@ bool startBle(uint32_t nowMs) {
   gLedPhaseStartMs = nowMs;
   // If the host is already synced (re-enable after a toggle-off), advertise now.
   // On the first enable, onSync() will start advertising once the stack is up.
-  startAdvertising();
+  Serial.printf("[BLE] enabled\n");
+  requestAdvertising();
   return true;
 }
 
@@ -454,6 +534,7 @@ void stopBle() {
   gStatus.negotiatedMtu = 0;
   gBleStream.setConnected(false);
   writeBleLeds(false);
+  Serial.printf("[BLE] disabled\n");
 }
 #endif  // ENABLE_BLE_CONFIG
 
@@ -543,6 +624,7 @@ void service(uint32_t nowMs, bool allowToggle) {
   } else if (!gRequestedEnabled && gActive) {
     stopBle();
   }
+  serviceAdvertising(nowMs);
   if (gActive) {
     fcu_configurator::service(gBleStream, nowMs, "ble", true);
   }
