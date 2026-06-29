@@ -166,7 +166,6 @@
 #include "mag_calibration.h"
 #include "external_mag.h"
 #include "led_blinker.h"
-#include "fcu_ble_config.h"
 
 // Compile-time gate for the new GNC stack. Defaults DISABLED.
 // ENABLE_EXPERIMENTAL_EKF        = 1 → EKF runs in shadow (estimate published,
@@ -204,11 +203,9 @@
 #include "autonomy_uart.h"
 #include "esc_uart_telemetry.h"     // KISS TLM-wire parser (UART2, FCU_ESC_TELEM)
 #include "failsafe_manager.h"
-#include "fcu_configurator.h"
 #include "flight_state_machine.h"
 
-// PID webserver (compile-out via ENABLE_PID_WEBSERVER=0). The USB
-// configurator reuses the same backend callbacks when ENABLE_USB_CONFIG=1.
+// PID webserver (compile-out via ENABLE_PID_WEBSERVER=0).
 #include "pid_webserver.h"
 
 // Compile-time feature flags for the new autonomy controllers. Defaults
@@ -330,10 +327,27 @@
 #define FCU_ENABLE_DEBUG_TELEMETRY 1
 #endif
 #ifndef FCU_TASK_WDT_TIMEOUT_MS
-#define FCU_TASK_WDT_TIMEOUT_MS 3000U
+// 5 s (was 3 s) — margin for transient core-1 load spikes (notch FFT, WiFi/HTTP
+// bring-up in the pidweb env) so a momentarily slow loopTask iteration doesn't
+// false-trip the panic. The real starvation fixes are flightLoopPace() (the
+// flight loop always yields a tick on overrun instead of free-running) and
+// loop() feeding its watchdog at the top/mid, not only at the bottom; this
+// timeout is belt-and-suspenders.
+#define FCU_TASK_WDT_TIMEOUT_MS 5000U
 #endif
 #ifndef FCU_FLIGHT_OVERRUN_WARN_US
 #define FCU_FLIGHT_OVERRUN_WARN_US 2500U
+#endif
+// Manual altitude-hold switch (ToF). 1-based CRSF channel for a 2-position
+// switch that engages "hold the height I'm at now"; 0 (the default) disables
+// the feature entirely — zero behaviour change. Enable per-env with e.g.
+//   -D FCU_ALT_HOLD_AUX_CHANNEL=8
+#ifndef FCU_ALT_HOLD_AUX_CHANNEL
+#define FCU_ALT_HOLD_AUX_CHANNEL 0
+#endif
+// Full-stick throttle climb/descend rate (m/s) while in manual altitude hold.
+#ifndef FCU_ALT_HOLD_CLIMB_RATE_MPS
+#define FCU_ALT_HOLD_CLIMB_RATE_MPS 1.0f
 #endif
 #ifndef FCU_RADIO_OVERRUN_WARN_US
 #define FCU_RADIO_OVERRUN_WARN_US 6000U
@@ -521,6 +535,12 @@
 #endif
 #ifndef FCU_ATT_ACCEL_MAX_G
 #define FCU_ATT_ACCEL_MAX_G 1.15f
+#endif
+#ifndef FCU_YAW_HOLD_STICK_DEADBAND_PCT
+#define FCU_YAW_HOLD_STICK_DEADBAND_PCT 3.0f
+#endif
+#ifndef FCU_YAW_HOLD_MAX_RATE_DPS
+#define FCU_YAW_HOLD_MAX_RATE_DPS 120.0f
 #endif
 #ifndef FCU_GYRO_BIAS_CAL_SAMPLES
 #define FCU_GYRO_BIAS_CAL_SAMPLES 300U
@@ -1100,6 +1120,8 @@ static constexpr float EXTMAG_HEADING_JUMP_DEG = FCU_EXTMAG_HEADING_JUMP_DEG;
 static constexpr uint8_t EXTMAG_HEADING_JUMP_MAX_REJECT = FCU_EXTMAG_HEADING_JUMP_MAX_REJECT;
 static constexpr float ATT_ACCEL_MIN_G = FCU_ATT_ACCEL_MIN_G;
 static constexpr float ATT_ACCEL_MAX_G = FCU_ATT_ACCEL_MAX_G;
+static constexpr float YAW_HOLD_STICK_DEADBAND_PCT = FCU_YAW_HOLD_STICK_DEADBAND_PCT;
+static constexpr float YAW_HOLD_MAX_RATE_DPS = FCU_YAW_HOLD_MAX_RATE_DPS;
 static constexpr uint16_t GYRO_BIAS_CAL_SAMPLES = FCU_GYRO_BIAS_CAL_SAMPLES;
 
 // DShot motor pins. Output arrays use verified motor-number order:
@@ -1150,6 +1172,8 @@ static constexpr float MIX_PITCH_FRONT_BIAS_DEFAULT =
     : FCU_MIX_PITCH_FRONT_BIAS;
 static constexpr float MIX_PITCH_FRONT_BIAS_MIN = 1.0f;
 static constexpr float MIX_PITCH_FRONT_BIAS_MAX = 2.0f;
+static constexpr float MOTOR_THRUST_TRIM_MIN = 0.90f;
+static constexpr float MOTOR_THRUST_TRIM_MAX = 1.10f;
 
 // -----------------------------
 // Bus speeds (requested caps)
@@ -1713,28 +1737,12 @@ static constexpr uint32_t ZERO_SEND_PERIOD_US = 2000;    // 500 Hz zero-frame ou
 static constexpr uint32_t ZERO_LOG_PERIOD_MS = 250;      // concise bench logs
 static constexpr uint32_t HEALTH_LOG_PERIOD_MS = 5000;   // stack high-water + heap snapshot
 #ifndef FCU_PERIODIC_LOOP_LOGS
-#if ENABLE_USB_CONFIG && !FCU_ENABLE_USB_SERIAL_LOGGING && !FCU_WIFI_STACK_ENABLED
-#define FCU_PERIODIC_LOOP_LOGS 0
-#else
 #define FCU_PERIODIC_LOOP_LOGS 1
-#endif
 #endif
 static constexpr bool PERIODIC_LOOP_LOGS_ENABLED = (FCU_PERIODIC_LOOP_LOGS != 0);
 static constexpr uint32_t ESC_STARTUP_SETTLE_MS = 3000;  // hold DSHOT zero after attach/arm
 static constexpr uint16_t PIDWEB_MOTOR_TEST_RAW = 300;
 static constexpr uint32_t PIDWEB_MOTOR_TEST_MS = 300;
-#ifndef FCU_CONFIG_MOTOR_TEST_MAX_RAW
-#define FCU_CONFIG_MOTOR_TEST_MAX_RAW 600U
-#endif
-#ifndef FCU_CONFIG_MOTOR_TEST_MAX_TIMEOUT_MS
-#define FCU_CONFIG_MOTOR_TEST_MAX_TIMEOUT_MS 750U
-#endif
-#ifndef FCU_CONFIG_MOTOR_TEST_SESSION_TIMEOUT_MS
-#define FCU_CONFIG_MOTOR_TEST_SESSION_TIMEOUT_MS 3000U
-#endif
-static constexpr uint16_t CONFIG_MOTOR_TEST_MAX_RAW = FCU_CONFIG_MOTOR_TEST_MAX_RAW;
-static constexpr uint32_t CONFIG_MOTOR_TEST_MAX_TIMEOUT_MS = FCU_CONFIG_MOTOR_TEST_MAX_TIMEOUT_MS;
-static constexpr uint32_t CONFIG_MOTOR_TEST_SESSION_TIMEOUT_MS = FCU_CONFIG_MOTOR_TEST_SESSION_TIMEOUT_MS;
 static constexpr uint32_t TASK_WDT_TIMEOUT_MS = FCU_TASK_WDT_TIMEOUT_MS;
 static constexpr uint32_t FLIGHT_OVERRUN_WARN_US = FCU_FLIGHT_OVERRUN_WARN_US;
 static constexpr uint32_t RADIO_OVERRUN_WARN_US = FCU_RADIO_OVERRUN_WARN_US;
@@ -1816,22 +1824,6 @@ struct MotorSpinRuntime {
   uint32_t startedMs = 0;
   uint32_t completedCount = 0;
 };
-
-#if ENABLE_USB_CONFIG
-struct ConfiguratorMotorTestRuntime {
-  bool sessionArmed = false;
-  bool active = false;
-  uint8_t motorMask = 0;       // bit0=M1 ... bit3=M4
-  uint16_t raw = 0;
-  uint32_t startedMs = 0;
-  uint32_t lastCommandMs = 0;
-  uint32_t outputDeadlineMs = 0;
-  uint32_t sessionDeadlineMs = 0;
-  uint32_t completedCount = 0;
-  uint32_t abortCount = 0;
-  uint8_t lastAbortReason = 0;
-};
-#endif
 
 struct ControlLinkState {
   bool linkActive = false;
@@ -2205,9 +2197,6 @@ GyroBiasState gGyroBias;
 GyroCalRuntime gGyroCal;
 LevelCalRuntime gLevelCal;
 MotorSpinRuntime gMotorSpin;
-#if ENABLE_USB_CONFIG
-ConfiguratorMotorTestRuntime gConfigMotorTest;
-#endif
 
 // Live persistent level correction + manual trim (degrees), applied ONCE per
 // flight tick in updateControlLoop as
@@ -2252,10 +2241,6 @@ std::atomic<bool> gFailsafeBypass{ALL_FAILSAFES_DISABLED};
 
 static inline bool failsafesBypassed() {
   return gFailsafeBypass.load(std::memory_order_relaxed);
-}
-
-bool saveBleBootEnabled(bool enabled) {
-  return gPidNvs.saveBleBootEnabled(enabled);
 }
 
 // New autonomy controllers. All four are unconditionally compiled in so the
@@ -2381,7 +2366,11 @@ std::atomic<bool> gMagCalActive{false};
 // meaningful with no external chip. gActiveMagSource is published by the flight
 // task (readImuSample) for telemetry; gMagYawCorrGain defaults to 0 = SHADOW.
 std::atomic<bool>    gMagExtEnabled{true};
-std::atomic<bool>    gMagOnboardEnabled{true};
+// External-mag-only policy (see selectActiveMagSource): the onboard ICM-20948
+// AK09916 is never used for heading/yaw, so it defaults OFF and preferExternal
+// is moot. Kept as globals only so the existing mag-config telemetry/UI still
+// reports them honestly (onboard = disabled).
+std::atomic<bool>    gMagOnboardEnabled{false};
 std::atomic<bool>    gMagPreferExternal{true};
 std::atomic<float>   gMagYawCorrGain{FCU_MAG_YAW_CORR_GAIN_DEFAULT};
 std::atomic<uint8_t> gActiveMagSource{MAG_SOURCE_NONE};
@@ -2474,7 +2463,7 @@ std::atomic<bool> gNotchCfgDirty{false};
 // Flight task only appends samples; the FFT runs in loop(). Always compiled so
 // raw-gyro spectra are available even with the dynamic notch disabled.
 NotchAnalyzer gNotchAnalyzer;
-#if ENABLE_PID_WEBSERVER || ENABLE_USB_CONFIG
+#if ENABLE_PID_WEBSERVER
 // PID-web diagnostic recorder. Kept out of normal flight builds so the large
 // fixed capture buffer does not consume flight-image RAM.
 DiagCapture gDiagCapture;
@@ -2499,6 +2488,7 @@ portMUX_TYPE gFailsafeMux = portMUX_INITIALIZER_UNLOCKED;
 // matches FCU_MIX_PITCH_FRONT_BIAS (compile-time); setup() overrides from NVS
 // when a saved value is present.
 std::atomic<float> gMixPitchFrontBias{MIX_PITCH_FRONT_BIAS_DEFAULT};
+std::atomic<float> gMotorThrustTrim[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 
 // Magnetometer heading trim (deg): a constant offset ADDED to the computed
 // compass heading (after MAG_DECLINATION_DEG) so the small residual left by a
@@ -2510,6 +2500,12 @@ std::atomic<float> gMagTrimDeg{0.0f};
 inline float clampMixPitchFrontBias(float v) {
   if (v < MIX_PITCH_FRONT_BIAS_MIN) return MIX_PITCH_FRONT_BIAS_MIN;
   if (v > MIX_PITCH_FRONT_BIAS_MAX) return MIX_PITCH_FRONT_BIAS_MAX;
+  return v;
+}
+
+inline float clampMotorThrustTrim(float v) {
+  if (v < MOTOR_THRUST_TRIM_MIN) return MOTOR_THRUST_TRIM_MIN;
+  if (v > MOTOR_THRUST_TRIM_MAX) return MOTOR_THRUST_TRIM_MAX;
   return v;
 }
 
@@ -2895,11 +2891,6 @@ void initNrfStatusLeds() {
 }
 
 void updateNrfStatusLeds() {
-#if ENABLE_BLE_CONFIG
-  if (fcu_ble_config::ledOverrideActive()) {
-    return;
-  }
-#endif
   // Don't fight the nav LED state machine — if the user mapped the nav LED
   // onto the historical CTRL-radio pin (the default since iBUS replaced the
   // CTRL nRF), skip writing it here. The blinker owns that pin.
@@ -3333,19 +3324,22 @@ bool computeMagHeadingDeg(const ImuSample& sample, float rollDeg, float pitchDeg
 
 // Pick which magnetometer feeds the heading/fusion path this tick and overwrite
 // the sample's mag vector accordingly. On entry out.* holds the ONBOARD result.
-// External wins when it is enabled + connected + healthy and (preferred OR the
-// onboard source is unusable). Publishes gActiveMagSource for telemetry. When
-// neither source is usable, out.magValid is forced false (⇒ pure gyro yaw).
+// External is selected only when it is enabled + connected + healthy. Publishes
+// gActiveMagSource for telemetry. When it is unusable, out.magValid is forced
+// false (⇒ pure gyro yaw); there is deliberately no onboard fallback.
+// EXTERNAL-MAG-ONLY POLICY: the IMU's internal AK09916 is never used for
+// heading/yaw — it sits inside the powered airframe's magnetic noise. Only the
+// external MMC5603 may feed the heading/fusion path; when it is unusable we fall
+// back to pure gyro-integrated yaw (out.magValid = false). The onboard mag
+// vector that readImuSample() leaves in out.* on entry is always discarded here,
+// so MAG_SOURCE_ONBOARD is never published.
 void selectActiveMagSource(ImuSample& out) {
-  const bool onboardEnabled = gMagOnboardEnabled.load(std::memory_order_relaxed);
-  const bool onboardUsable = out.magValid && onboardEnabled;
   uint8_t src = MAG_SOURCE_NONE;
 #if FCU_ENABLE_EXTERNAL_MAG
   const bool extUsable = gMagExtEnabled.load(std::memory_order_relaxed) &&
                          gExtMag.connected.load(std::memory_order_relaxed) &&
                          gExtMag.healthy.load(std::memory_order_relaxed);
-  const bool preferExt = gMagPreferExternal.load(std::memory_order_relaxed);
-  if (extUsable && (preferExt || !onboardUsable)) {
+  if (extUsable) {
     out.mx_uT = gExtMag.mx.load(std::memory_order_relaxed);
     out.my_uT = gExtMag.my.load(std::memory_order_relaxed);
     out.mz_uT = gExtMag.mz.load(std::memory_order_relaxed);
@@ -3354,10 +3348,16 @@ void selectActiveMagSource(ImuSample& out) {
     src = MAG_SOURCE_EXTERNAL;
   } else
 #endif
-  if (onboardUsable) {
-    src = MAG_SOURCE_ONBOARD;   // keep the onboard out.* as-is
-  } else {
-    out.magValid = false;       // neither source usable this tick
+  {
+    // Do not leak the rejected onboard AK09916 vector into logs/telemetry. The
+    // external-mag diagnostic snapshot remains available separately via
+    // gExtMag, including its rejected field value and reason.
+    out.mx_uT = 0.0f;
+    out.my_uT = 0.0f;
+    out.mz_uT = 0.0f;
+    out.magHeadingDeg = 0.0f;
+    out.magFieldUt = 0.0f;
+    out.magValid = false;  // onboard AK09916 is never trusted for heading/yaw
     src = MAG_SOURCE_NONE;
   }
   gActiveMagSource.store(src, std::memory_order_relaxed);
@@ -3487,15 +3487,12 @@ bool anyMotorOutputActive(const std::array<uint16_t, 4>& raw);
 // must not run beside spinning props now ALSO requires the actual commanded
 // motor outputs to be zero.
 
-#if ENABLE_PID_WEBSERVER || ENABLE_USB_CONFIG
+#if ENABLE_PID_WEBSERVER
 bool requestGyroCalibration() {
   uint8_t throttle = 0;
   bool failsafe = false;
   bool motorSpinBusy = false;
   bool motorsActive = false;
-#if ENABLE_USB_CONFIG
-  bool configMotorBusy = false;
-#endif
   portENTER_CRITICAL(&gControlMux);
   throttle = gState.control.appliedThrottlePercent;
   failsafe = gState.control.failsafeActive;
@@ -3503,15 +3500,9 @@ bool requestGyroCalibration() {
   portENTER_CRITICAL(&gFlightMux);
   motorSpinBusy = (gMotorSpin.requestedMotor != 0U) || (gMotorSpin.activeMotor != 0U);
   motorsActive = anyMotorOutputActive(gState.motorRaw);
-#if ENABLE_USB_CONFIG
-  configMotorBusy = gConfigMotorTest.sessionArmed || gConfigMotorTest.active;
-#endif
   portEXIT_CRITICAL(&gFlightMux);
 
   if (throttle != 0U || failsafe || motorSpinBusy || motorsActive ||
-#if ENABLE_USB_CONFIG
-      configMotorBusy ||
-#endif
       gFlightStatePublished.load(std::memory_order_relaxed) != flight_state::State::IDLE) {
     return false;
   }
@@ -3538,9 +3529,6 @@ bool requestLevelCalibration() {
   bool failsafe = false;
   bool motorSpinBusy = false;
   bool motorsActive = false;
-#if ENABLE_USB_CONFIG
-  bool configMotorBusy = false;
-#endif
   portENTER_CRITICAL(&gControlMux);
   throttle = gState.control.appliedThrottlePercent;
   failsafe = gState.control.failsafeActive;
@@ -3548,15 +3536,9 @@ bool requestLevelCalibration() {
   portENTER_CRITICAL(&gFlightMux);
   motorSpinBusy = (gMotorSpin.requestedMotor != 0U) || (gMotorSpin.activeMotor != 0U);
   motorsActive = anyMotorOutputActive(gState.motorRaw);
-#if ENABLE_USB_CONFIG
-  configMotorBusy = gConfigMotorTest.sessionArmed || gConfigMotorTest.active;
-#endif
   portEXIT_CRITICAL(&gFlightMux);
 
   if (throttle != 0U || failsafe || motorSpinBusy || motorsActive ||
-#if ENABLE_USB_CONFIG
-      configMotorBusy ||
-#endif
       gFlightStatePublished.load(std::memory_order_relaxed) != flight_state::State::IDLE) {
     return false;
   }
@@ -3575,120 +3557,6 @@ bool requestLevelCalibration() {
   return accepted;
 }
 
-#if ENABLE_USB_CONFIG
-bool configuratorMotorTestSafe(uint32_t nowMs, bool requireMotorsIdle) {
-  uint8_t throttle = 0;
-  bool failsafe = false;
-  portENTER_CRITICAL(&gControlMux);
-  throttle = gState.control.appliedThrottlePercent;
-  failsafe = gState.control.failsafeActive;
-  portEXIT_CRITICAL(&gControlMux);
-
-  bool motorsActive = false;
-  bool oneShotBusy = false;
-  bool calibrationBusy = false;
-  portENTER_CRITICAL(&gFlightMux);
-  motorsActive = anyMotorOutputActive(gState.motorRaw);
-  oneShotBusy = (gMotorSpin.requestedMotor != 0U) || (gMotorSpin.activeMotor != 0U);
-  calibrationBusy = gGyroCal.active || gGyroCal.requested ||
-                    gLevelCal.active || gLevelCal.requested;
-  portEXIT_CRITICAL(&gFlightMux);
-
-  return gState.escReady &&
-         !escStartupSettleActive(nowMs) &&
-         throttle == 0U &&
-         !failsafe &&
-         !oneShotBusy &&
-         !calibrationBusy &&
-         gFlightStatePublished.load(std::memory_order_relaxed) == flight_state::State::IDLE &&
-         (!requireMotorsIdle || !motorsActive);
-}
-
-bool configuratorMotorTestArm() {
-  const uint32_t nowMs = millis();
-  if (!configuratorMotorTestSafe(nowMs, true)) {
-    return false;
-  }
-
-  portENTER_CRITICAL(&gFlightMux);
-  gConfigMotorTest.sessionArmed = true;
-  gConfigMotorTest.active = false;
-  gConfigMotorTest.motorMask = 0;
-  gConfigMotorTest.raw = 0;
-  gConfigMotorTest.startedMs = nowMs;
-  gConfigMotorTest.lastCommandMs = nowMs;
-  gConfigMotorTest.outputDeadlineMs = nowMs;
-  gConfigMotorTest.sessionDeadlineMs = nowMs + CONFIG_MOTOR_TEST_SESSION_TIMEOUT_MS;
-  portEXIT_CRITICAL(&gFlightMux);
-
-  forceMotorStop("config_motor_test_arm");
-  fcu_log::logf(fcu_log::Level::Warn,
-                "[MOTOR_TEST] USB deadman session armed max_raw=%u session_timeout=%lums\n",
-                static_cast<unsigned>(CONFIG_MOTOR_TEST_MAX_RAW),
-                static_cast<unsigned long>(CONFIG_MOTOR_TEST_SESSION_TIMEOUT_MS));
-  return true;
-}
-
-bool configuratorMotorTestSet(uint8_t motorMask, uint16_t raw, uint16_t timeoutMs) {
-  const uint32_t nowMs = millis();
-  if ((motorMask & 0x0FU) == 0U || (motorMask & 0xF0U) != 0U ||
-      raw > CONFIG_MOTOR_TEST_MAX_RAW || timeoutMs == 0U ||
-      timeoutMs > CONFIG_MOTOR_TEST_MAX_TIMEOUT_MS) {
-    return false;
-  }
-  if (!configuratorMotorTestSafe(nowMs, false)) {
-    return false;
-  }
-
-  bool accepted = false;
-  bool justStarted = false;
-  portENTER_CRITICAL(&gFlightMux);
-  if (gConfigMotorTest.sessionArmed) {
-    justStarted = !gConfigMotorTest.active;
-    gConfigMotorTest.active = true;
-    gConfigMotorTest.motorMask = static_cast<uint8_t>(motorMask & 0x0FU);
-    gConfigMotorTest.raw = raw;
-    if (justStarted) {
-      gConfigMotorTest.startedMs = nowMs;
-    }
-    gConfigMotorTest.lastCommandMs = nowMs;
-    gConfigMotorTest.outputDeadlineMs = nowMs + timeoutMs;
-    gConfigMotorTest.sessionDeadlineMs = nowMs + CONFIG_MOTOR_TEST_SESSION_TIMEOUT_MS;
-    accepted = true;
-  }
-  portEXIT_CRITICAL(&gFlightMux);
-
-  if (accepted && justStarted) {
-    fcu_log::logf(fcu_log::Level::Warn,
-                  "[MOTOR_TEST] USB deadman output start mask=0x%X raw=%u timeout=%ums\n",
-                  static_cast<unsigned>(motorMask & 0x0FU),
-                  static_cast<unsigned>(raw),
-                  static_cast<unsigned>(timeoutMs));
-  }
-  return accepted;
-}
-
-bool configuratorMotorTestStop() {
-  bool wasActive = false;
-  portENTER_CRITICAL(&gFlightMux);
-  wasActive = gConfigMotorTest.sessionArmed || gConfigMotorTest.active;
-  gConfigMotorTest.sessionArmed = false;
-  gConfigMotorTest.active = false;
-  gConfigMotorTest.motorMask = 0;
-  gConfigMotorTest.raw = 0;
-  if (wasActive) {
-    gConfigMotorTest.completedCount++;
-  }
-  portEXIT_CRITICAL(&gFlightMux);
-
-  if (wasActive) {
-    forceMotorStop("config_motor_test_stop");
-    fcu_log::logf(fcu_log::Level::Info, "[MOTOR_TEST] USB deadman session stopped\n");
-  }
-  return true;
-}
-#endif
-
 bool requestMotorSpin(uint8_t oneBasedMotor) {
   if (oneBasedMotor < 1U || oneBasedMotor > 4U || escStartupSettleActive(millis())) {
     return false;
@@ -3702,20 +3570,11 @@ bool requestMotorSpin(uint8_t oneBasedMotor) {
   portEXIT_CRITICAL(&gControlMux);
 
   bool motorsActive = false;
-#if ENABLE_USB_CONFIG
-  bool configuratorBusy = false;
-#endif
   portENTER_CRITICAL(&gFlightMux);
   motorsActive = anyMotorOutputActive(gState.motorRaw);
-#if ENABLE_USB_CONFIG
-  configuratorBusy = gConfigMotorTest.sessionArmed || gConfigMotorTest.active;
-#endif
   portEXIT_CRITICAL(&gFlightMux);
 
   if (throttle != 0U || failsafe || motorsActive ||
-#if ENABLE_USB_CONFIG
-      configuratorBusy ||
-#endif
       gFlightStatePublished.load(std::memory_order_relaxed) != flight_state::State::IDLE) {
     return false;
   }
@@ -4153,13 +4012,11 @@ void updateAttitudeFromImu(const ImuSample& sample, AttitudeSample& attitude, fl
   // ---- Slow, low-gain yaw drift correction --------------------------------
   // Yaw stays gyro-integrated (the rate PID closes on gz directly); the mag only
   // nudges the integrated angle toward the compass heading, slowly (MAG_YAW_TAU_S)
-  // and scaled by the runtime gain. corrGain == 0 ⇒ pure gyro (SHADOW). The
-  // onboard source ALSO honours the legacy MAG_YAW_FUSION_ENABLED compile gate
-  // (distrusted on this airframe); the external source is gated by gain only.
+  // and scaled by the runtime gain. corrGain == 0 ⇒ pure gyro (SHADOW).
+  // The external source is gated by gain only. The onboard source is never
+  // selected on this airframe.
   const uint8_t activeSrc = gActiveMagSource.load(std::memory_order_relaxed);
-  const bool sourceAllowsFusion =
-      (activeSrc == MAG_SOURCE_EXTERNAL) ||
-      (activeSrc == MAG_SOURCE_ONBOARD && MAG_YAW_FUSION_ENABLED);
+  const bool sourceAllowsFusion = (activeSrc == MAG_SOURCE_EXTERNAL);
   const float corrGain = constrain(gMagYawCorrGain.load(std::memory_order_relaxed), 0.0f, 1.0f);
   if (attitude.magTrusted && sourceAllowsFusion && corrGain > 0.0f) {
     const float magAlpha = MAG_YAW_TAU_S / (MAG_YAW_TAU_S + dtSeconds);
@@ -4547,13 +4404,10 @@ void applyExtMagCalToLive(const fcu_nvs::FcuPidNvs::ExtMagCalibration& m) {
   gExtCal.valid.store(m.valid, std::memory_order_relaxed);
 }
 
-// Decide which sensor a calibration capture should target: the active source,
-// else external if it is connected, else onboard.
+// Calibration is external-only too. If the MMC5603 is absent, the capture gets
+// no samples and fails explicitly instead of silently calibrating the AK09916.
 bool magCaptureTargetIsExternal() {
-  const uint8_t src = gActiveMagSource.load(std::memory_order_relaxed);
-  if (src == MAG_SOURCE_EXTERNAL) return true;
-  if (src == MAG_SOURCE_ONBOARD) return false;
-  return gExtMag.connected.load(std::memory_order_relaxed);
+  return true;
 }
 #endif  // FCU_ENABLE_EXTERNAL_MAG
 
@@ -6280,6 +6134,8 @@ void resetPidOutputs(const char* reason) {
   gState.pid.rollRateSetpointDps = 0.0f;
   gState.pid.pitchRateSetpointDps = 0.0f;
   gState.pid.yawRateSetpointDps = 0.0f;
+  gState.pid.angleYawSetpointDeg = 0.0f;
+  gState.pid.yawHoldActive = false;
   gState.pid.active = false;
   // Saturation/idle flags are only refreshed by mixer-reaching ticks; clear
   // them here so (a) a disarm/failsafe gap can never leave a stale
@@ -6321,7 +6177,7 @@ uint8_t mixerSatFlagsByte() {
   return f;
 }
 
-#if ENABLE_PID_WEBSERVER || ENABLE_USB_CONFIG
+#if ENABLE_PID_WEBSERVER
 enum class PendingSystemAction : uint8_t {
   None = 0,
   Reboot,
@@ -6341,14 +6197,8 @@ bool pidWebWriteSafe() {
 
   bool motorSpinBusy = false;
   bool motorsActive = false;
-#if ENABLE_USB_CONFIG
-  bool configMotorBusy = false;
-#endif
   portENTER_CRITICAL(&gFlightMux);
   motorSpinBusy = (gMotorSpin.requestedMotor != 0U) || (gMotorSpin.activeMotor != 0U);
-#if ENABLE_USB_CONFIG
-  configMotorBusy = gConfigMotorTest.sessionArmed || gConfigMotorTest.active;
-#endif
   // Armed idle spins the props with appliedThrottlePercent == 0 — the throttle
   // check alone no longer proves the motors are quiet. (Armed-idle audit fix.)
   motorsActive = anyMotorOutputActive(gState.motorRaw);
@@ -6357,9 +6207,6 @@ bool pidWebWriteSafe() {
   bool safe = throttle == 0U && !failsafe && !motorsActive &&
               gFlightStatePublished.load(std::memory_order_relaxed) == flight_state::State::IDLE &&
               !motorSpinBusy;
-#if ENABLE_USB_CONFIG
-  safe = safe && !configMotorBusy;
-#endif
   return safe;
 }
 
@@ -6602,6 +6449,44 @@ bool pidWebSaveMixBiasToNvs() {
   return ok;
 }
 
+void pidWebGetMotorThrustTrims(float out[4]) {
+  if (!out) return;
+  for (uint8_t i = 0; i < 4; ++i) {
+    out[i] = gMotorThrustTrim[i].load(std::memory_order_relaxed);
+  }
+}
+
+bool pidWebSetMotorThrustTrims(const float values[4]) {
+  if (!pidWebWriteSafe() || !values) return false;
+  for (uint8_t i = 0; i < 4; ++i) {
+    if (!(isfinite(values[i]) &&
+          values[i] >= MOTOR_THRUST_TRIM_MIN &&
+          values[i] <= MOTOR_THRUST_TRIM_MAX)) {
+      return false;
+    }
+  }
+  for (uint8_t i = 0; i < 4; ++i) {
+    gMotorThrustTrim[i].store(clampMotorThrustTrim(values[i]), std::memory_order_relaxed);
+  }
+  Serial.printf("[PIDWEB] motor thrust trims -> %.3f/%.3f/%.3f/%.3f (RAM)\n",
+                static_cast<double>(values[0]), static_cast<double>(values[1]),
+                static_cast<double>(values[2]), static_cast<double>(values[3]));
+  return true;
+}
+
+bool pidWebSaveMotorThrustTrimsToNvs() {
+  if (!pidWebWriteSafe() || !gPidNvs.ready()) return false;
+  float values[4];
+  pidWebGetMotorThrustTrims(values);
+  const bool ok = gPidNvs.saveMotorThrustTrims(values);
+  if (ok) {
+    Serial.printf("[PIDWEB] motor thrust trims %.3f/%.3f/%.3f/%.3f persisted to NVS\n",
+                  static_cast<double>(values[0]), static_cast<double>(values[1]),
+                  static_cast<double>(values[2]), static_cast<double>(values[3]));
+  }
+  return ok;
+}
+
 // ---- Magnetometer heading trim (deg) — webserver /api/settings -------------
 void pidWebGetMagTrim(float& out) {
   out = gMagTrimDeg.load(std::memory_order_relaxed);
@@ -6829,6 +6714,8 @@ void pidWebGetDash(pid_webserver::DashTelemetry& d) {
   d.corrPitchDeg = gState.pid.correctedPitchDeg;
   d.targetRollDeg = gState.pid.angleRollSetpointDeg;
   d.targetPitchDeg = gState.pid.anglePitchSetpointDeg;
+  d.targetYawDeg = gState.pid.angleYawSetpointDeg;
+  d.yawHoldActive = gState.pid.yawHoldActive;
   d.targetYawRateDps = gState.pid.yawRateSetpointDps;
   d.rollErrDeg = gState.pid.angleRollSetpointDeg - gState.pid.correctedRollDeg;
   d.pitchErrDeg = gState.pid.anglePitchSetpointDeg - gState.pid.correctedPitchDeg;
@@ -6898,8 +6785,39 @@ void pidWebGetDash(pid_webserver::DashTelemetry& d) {
   d.gyroBiasDps[1] = gGyroBias.gy_dps;
   d.gyroBiasDps[2] = gGyroBias.gz_dps;
   d.gyroBiasValid = gGyroBias.valid;
-  d.magCalValid = gCal.mag_valid.load(std::memory_order_relaxed);
+  d.extMagCompiled = (FCU_ENABLE_EXTERNAL_MAG != 0);
+  d.activeMagSource = gActiveMagSource.load(std::memory_order_relaxed);
+  d.magYawCorrGain = gMagYawCorrGain.load(std::memory_order_relaxed);
+  d.magHeadingTrimDeg = gMagTrimDeg.load(std::memory_order_relaxed);
+  d.magDeclinationDeg = MAG_DECLINATION_DEG;
+  d.magExtEnabled = gMagExtEnabled.load(std::memory_order_relaxed);
+  d.magOnboardEnabled = false;
+  d.magPreferExternal = true;
+#if FCU_ENABLE_EXTERNAL_MAG
+  {
+    const bool headingRejected = gExtMag.headingRejected.load(std::memory_order_relaxed);
+    d.extMagConnected = gExtMag.connected.load(std::memory_order_relaxed);
+    d.extMagValid = d.extMagConnected &&
+                    gExtMag.healthy.load(std::memory_order_relaxed) &&
+                    !headingRejected;
+    d.extMagCalValid = gExtCal.valid.load(std::memory_order_relaxed);
+    d.extMagHeadingDeg = gExtMag.headingDeg.load(std::memory_order_relaxed);
+    d.extMagFieldUt = gExtMag.field.load(std::memory_order_relaxed);
+    d.extMagVecUt[0] = gExtMag.mx.load(std::memory_order_relaxed);
+    d.extMagVecUt[1] = gExtMag.my.load(std::memory_order_relaxed);
+    d.extMagVecUt[2] = gExtMag.mz.load(std::memory_order_relaxed);
+    d.extMagRejectReason = headingRejected
+        ? EXTMAG_REJECT_HEADING_JUMP
+        : gExtMag.rejectReason.load(std::memory_order_relaxed);
+    d.magCalValid = (d.activeMagSource == MAG_SOURCE_EXTERNAL) && d.extMagCalValid;
+  }
+#else
+  d.magCalValid = false;
+#endif
   d.mixBias = gMixPitchFrontBias.load(std::memory_order_relaxed);
+  for (uint8_t i = 0; i < 4; ++i) {
+    d.motorTrim[i] = gMotorThrustTrim[i].load(std::memory_order_relaxed);
+  }
   d.levelLoaded = gLevelCorr.loaded.load(std::memory_order_relaxed);
   d.levelCalState = lvlActive ? 1 : (lvlErr != LEVELCAL_ERR_NONE ? 3 : (lvlOk ? 2 : 0));
   d.levelCalErr = lvlErr;
@@ -7082,7 +7000,7 @@ bool pidWebFinishMagCalibration() {
   return magCaptureFinish();         // finishes whichever capture is active
 }
 
-#if ENABLE_PID_WEBSERVER || ENABLE_USB_CONFIG
+#if ENABLE_PID_WEBSERVER
 // ---- Magnetometer source selection + yaw-correction gain (Mag tab) ----------
 void pidWebGetMagConfig(pid_webserver::MagConfigSnapshot& c) {
   c.extCompiled = (FCU_ENABLE_EXTERNAL_MAG != 0);
@@ -7096,9 +7014,12 @@ bool pidWebSetMagConfig(bool extEnabled, bool onboardEnabled, bool preferExterna
                         float yawCorrGain) {
   if (!pidWebWriteSafe()) return false;
   if (!isfinite(yawCorrGain)) return false;
-  gMagExtEnabled.store(extEnabled, std::memory_order_relaxed);
-  gMagOnboardEnabled.store(onboardEnabled, std::memory_order_relaxed);
-  gMagPreferExternal.store(preferExternal, std::memory_order_relaxed);
+  (void)extEnabled;
+  (void)onboardEnabled;
+  (void)preferExternal;
+  gMagExtEnabled.store(true, std::memory_order_relaxed);
+  gMagOnboardEnabled.store(false, std::memory_order_relaxed);
+  gMagPreferExternal.store(true, std::memory_order_relaxed);
   gMagYawCorrGain.store(constrain(yawCorrGain, 0.0f, 1.0f), std::memory_order_relaxed);
   return true;
 }
@@ -7106,13 +7027,13 @@ bool pidWebSetMagConfig(bool extEnabled, bool onboardEnabled, bool preferExterna
 bool pidWebSaveMagConfigToNvs() {
   if (!pidWebWriteSafe()) return false;
   fcu_nvs::FcuPidNvs::MagConfig c;
-  c.extEnabled = gMagExtEnabled.load(std::memory_order_relaxed);
-  c.onboardEnabled = gMagOnboardEnabled.load(std::memory_order_relaxed);
-  c.preferExternal = gMagPreferExternal.load(std::memory_order_relaxed);
+  c.extEnabled = true;
+  c.onboardEnabled = false;
+  c.preferExternal = true;
   c.yawCorrGain = gMagYawCorrGain.load(std::memory_order_relaxed);
   return gPidNvs.ready() && gPidNvs.saveMagConfig(c);
 }
-#endif  // ENABLE_PID_WEBSERVER || ENABLE_USB_CONFIG
+#endif  // ENABLE_PID_WEBSERVER
 
 // ===== Vibration / FFT / notch (dashboard backend) ==========================
 void pidWebGetNotchInfo(pid_webserver::NotchInfo& n) {
@@ -7511,11 +7432,7 @@ void publishPidWebSafety() {
   portENTER_CRITICAL(&gFlightMux);
   benchActionBusy = gGyroCal.active || gGyroCal.requested ||
                     (gMotorSpin.requestedMotor != 0U) ||
-                    (gMotorSpin.activeMotor != 0U)
-#if ENABLE_USB_CONFIG
-                    || gConfigMotorTest.sessionArmed || gConfigMotorTest.active
-#endif
-                    ;
+                    (gMotorSpin.activeMotor != 0U);
   portEXIT_CRITICAL(&gFlightMux);
   pid_webserver::publishSafety(throttle == 0U,
                                (gFlightStatePublished.load(std::memory_order_relaxed) != flight_state::State::IDLE) ||
@@ -7534,6 +7451,9 @@ pid_webserver::Callbacks buildConfiguratorCallbacks() {
   cbs.getMixPitchFrontBias = pidWebGetMixBias;
   cbs.setMixPitchFrontBias = pidWebSetMixBias;
   cbs.saveMixPitchFrontBiasToNvs = pidWebSaveMixBiasToNvs;
+  cbs.getMotorThrustTrims = pidWebGetMotorThrustTrims;
+  cbs.setMotorThrustTrims = pidWebSetMotorThrustTrims;
+  cbs.saveMotorThrustTrimsToNvs = pidWebSaveMotorThrustTrimsToNvs;
   cbs.getMagTrimDeg = pidWebGetMagTrim;
   cbs.setMagTrimDeg = pidWebSetMagTrim;
   cbs.saveMagTrimDegToNvs = pidWebSaveMagTrimToNvs;
@@ -7557,6 +7477,9 @@ pid_webserver::Callbacks buildConfiguratorCallbacks() {
   cbs.clearAccelOffset = pidWebClearAccelOffset;
   cbs.startMagCalibration = pidWebStartMagCalibration;
   cbs.finishMagCalibration = pidWebFinishMagCalibration;
+  cbs.getMagConfig = pidWebGetMagConfig;
+  cbs.setMagConfig = pidWebSetMagConfig;
+  cbs.saveMagConfigToNvs = pidWebSaveMagConfigToNvs;
   // Vibration / FFT / notch.
   cbs.getNotchInfo = pidWebGetNotchInfo;
   cbs.startNotchAnalysis = pidWebStartNotch;
@@ -7730,7 +7653,7 @@ void forceMotorStop(const char* reason) {
   }
 }
 
-#if ENABLE_PID_WEBSERVER || ENABLE_USB_CONFIG
+#if ENABLE_PID_WEBSERVER
 bool servicePidWebMotorSpin(uint32_t nowMs) {
   uint8_t motor = 0;
   uint32_t startedMs = 0;
@@ -7794,64 +7717,6 @@ bool servicePidWebMotorSpin(uint32_t nowMs) {
   return true;
 }
 
-#if ENABLE_USB_CONFIG
-bool serviceConfiguratorMotorTest(uint32_t nowMs) {
-  bool sessionArmed = false;
-  bool active = false;
-  uint8_t motorMask = 0;
-  uint16_t rawValue = 0;
-  uint32_t outputDeadline = 0;
-  uint32_t sessionDeadline = 0;
-
-  portENTER_CRITICAL(&gFlightMux);
-  sessionArmed = gConfigMotorTest.sessionArmed;
-  active = gConfigMotorTest.active;
-  motorMask = gConfigMotorTest.motorMask;
-  rawValue = gConfigMotorTest.raw;
-  outputDeadline = gConfigMotorTest.outputDeadlineMs;
-  sessionDeadline = gConfigMotorTest.sessionDeadlineMs;
-  portEXIT_CRITICAL(&gFlightMux);
-
-  if (!sessionArmed) {
-    return false;
-  }
-
-  const bool sessionTimedOut = static_cast<int32_t>(nowMs - sessionDeadline) >= 0;
-  const bool outputTimedOut = active && static_cast<int32_t>(nowMs - outputDeadline) >= 0;
-  const bool unsafe = !configuratorMotorTestSafe(nowMs, false);
-  if (sessionTimedOut || outputTimedOut || unsafe) {
-    portENTER_CRITICAL(&gFlightMux);
-    gConfigMotorTest.sessionArmed = false;
-    gConfigMotorTest.active = false;
-    gConfigMotorTest.motorMask = 0;
-    gConfigMotorTest.raw = 0;
-    gConfigMotorTest.abortCount++;
-    gConfigMotorTest.lastAbortReason = sessionTimedOut ? 1U : (outputTimedOut ? 2U : 3U);
-    portEXIT_CRITICAL(&gFlightMux);
-    forceMotorStop(sessionTimedOut ? "config_motor_test_session_timeout" :
-                   (outputTimedOut ? "config_motor_test_output_timeout" :
-                    "config_motor_test_unsafe"));
-    fcu_log::logf(fcu_log::Level::Warn,
-                  "[MOTOR_TEST] USB deadman stopped reason=%s\n",
-                  sessionTimedOut ? "session_timeout" :
-                  (outputTimedOut ? "output_timeout" : "unsafe"));
-    return true;
-  }
-
-  if (!active) {
-    return true;
-  }
-
-  std::array<uint16_t, 4> raw = {0, 0, 0, 0};
-  for (uint8_t i = 0; i < 4; ++i) {
-    if ((motorMask & (1U << i)) != 0U) {
-      raw[i] = rawValue;
-    }
-  }
-  applyMotorOutputs(raw);
-  return true;
-}
-#endif
 #endif
 
 const char* failsafeReasonText(uint8_t reason) {
@@ -8895,18 +8760,77 @@ void serviceCrsfTelemetry(uint32_t nowMs, bool linkUp) {
 // final button/state mappings yet"). Wire CH5 and any later free aux switches
 // into arm / flight-mode / RTH / failsafe-clear transitions HERE so the policy
 // lives in exactly one place.
+// ---- Manual altitude hold (switch-engaged ToF height lock) ------------------
+// Set on the CRSF task by the aux-switch watcher below; read by the flight loop
+// (serviceManualAltHold). Default-off until FCU_ALT_HOLD_AUX_CHANNEL is set.
+std::atomic<bool> gAltHoldSwitchOn{false};
+
+#if FCU_ENABLE_ALTITUDE_HOLD
+static constexpr int   ALT_HOLD_STICK_DEADBAND_PCT = 8;   // throttle %, around captured hover
+static constexpr float ALT_HOLD_MIN_M = 0.2f;             // floor: don't hold below this
+static constexpr float ALT_HOLD_MAX_M = 4.0f;             // VL53L1X usable ceiling
+struct ManualAltHold { bool engaged = false; float targetM = 0.0f; uint8_t hoverPct = 0; };
+ManualAltHold gManualAlt;  // flight-task only — no lock needed
+
+// Manual (switch-driven) altitude hold. Returns true while engaged, with
+// throttleOut set to the captured hover-base throttle and gManualAlt.targetM
+// holding the target altitude for the gAltCtrl block (which adds its ±bias on
+// top). Conservative + ToF-gated: engages only from a valid ToF reading and
+// disengages the instant the switch drops or ToF goes invalid (never fights a
+// dead sensor). The throttle stick, deflected past a deadband from the engage
+// point, commands climb/descend.
+static bool serviceManualAltHold(uint8_t stickThrottlePct, const AltitudeState& alt,
+                                 float dtSeconds, uint8_t& throttleOut) {
+  if (!gAltHoldSwitchOn.load(std::memory_order_relaxed) || !alt.measurementValid) {
+    if (gManualAlt.engaged) {
+      fcu_log::logf(fcu_log::Level::Warn, "[ALTHOLD] DISENGAGE -> manual throttle\n");
+    }
+    gManualAlt.engaged = false;
+    return false;
+  }
+  const float curM = static_cast<float>(alt.measuredMm) * 0.001f;
+  if (!gManualAlt.engaged) {
+    gManualAlt.engaged = true;
+    gManualAlt.targetM = curM;
+    gManualAlt.hoverPct = stickThrottlePct;
+    fcu_log::logf(fcu_log::Level::Warn, "[ALTHOLD] ENGAGE alt=%.2fm hover=%u%%\n",
+                  static_cast<double>(curM), static_cast<unsigned>(stickThrottlePct));
+  }
+  const int defl = static_cast<int>(stickThrottlePct) - static_cast<int>(gManualAlt.hoverPct);
+  if (defl > ALT_HOLD_STICK_DEADBAND_PCT) {
+    gManualAlt.targetM += FCU_ALT_HOLD_CLIMB_RATE_MPS *
+                          (static_cast<float>(defl - ALT_HOLD_STICK_DEADBAND_PCT) / 50.0f) * dtSeconds;
+  } else if (defl < -ALT_HOLD_STICK_DEADBAND_PCT) {
+    gManualAlt.targetM += FCU_ALT_HOLD_CLIMB_RATE_MPS *
+                          (static_cast<float>(defl + ALT_HOLD_STICK_DEADBAND_PCT) / 50.0f) * dtSeconds;
+  }
+  gManualAlt.targetM = constrain(gManualAlt.targetM, ALT_HOLD_MIN_M, ALT_HOLD_MAX_M);
+  throttleOut = gManualAlt.hoverPct;
+  return true;
+}
+#endif  // FCU_ENABLE_ALTITUDE_HOLD
+
+// Translate aux switches into flight state. Currently: a 2-position switch on
+// FCU_ALT_HOLD_AUX_CHANNEL (1-based; 0 = feature disabled) requests manual
+// altitude hold, with hysteresis so channel noise near the threshold can't
+// chatter engage/disengage. Runs on the CRSF task; the flight loop owns the
+// actual throttle takeover. POS_HOLD / RTH stay unmapped — they need a GPS fix
+// and their own validation before they're wired to a switch.
 void updateFlightModeFromAuxChannels(uint32_t nowMs) {
   (void)nowMs;
-  // TODO(elrs-state-mapping): translate aux switches into flight state. Sketch:
-  //   const uint16_t ch8 = gCrsf.channelMicros(7);            // example free 3-pos mode switch
-  //   const flight_modes::FlightMode m = flight_modes::decodeModeSwitch(ch8);
-  //   gActiveFlightMode.store(static_cast<uint8_t>(m), std::memory_order_relaxed);
-  //   // CH9+ : RTH trigger, failsafe-clear, autonomy-enable, ALT/POS-hold.
-  //   //   (the iBUS layout used CH7=RTH / CH8=clear; on ELRS CH6/CH7 are the
-  //   //    camera gimbal, so map these onto free channels instead.)
-  //   // Use the CrsfBridgeState latches for hysteresis; log transitions once.
-  // Until implemented the craft stays MANUAL and no autonomy controller engages
-  // — the safe bring-up default.
+#if FCU_ALT_HOLD_AUX_CHANNEL > 0
+  const uint16_t us = gCrsf.channelMicros(FCU_ALT_HOLD_AUX_CHANNEL - 1);
+  const bool was = gAltHoldSwitchOn.load(std::memory_order_relaxed);
+  bool now = was;
+  if (us >= 1700) now = true;
+  else if (us <= 1300) now = false;  // includes us==0 (no data) -> safe OFF; 1301-1699 holds
+  if (now != was) {
+    gAltHoldSwitchOn.store(now, std::memory_order_relaxed);
+    fcu_log::logf(fcu_log::Level::Warn, "[ALTHOLD] switch %s ch%u=%uus\n",
+                  now ? "ON" : "OFF", static_cast<unsigned>(FCU_ALT_HOLD_AUX_CHANNEL),
+                  static_cast<unsigned>(us));
+  }
+#endif
 }
 
 // [CRSF BRIDGE] — declared in include/crsf_control.h
@@ -9739,10 +9663,10 @@ static void emitEkfShadowLog(uint32_t nowMs) {
 // [FLIGHT CONTROL] — declared in include/flight_control.h
 void updateControlLoop(uint32_t nowMs) {
   const uint32_t nowUs = micros();
-  if (gState.pid.lastUpdateUs != 0U && (nowUs - gState.pid.lastUpdateUs) < CONTROL_LOOP_PERIOD_US) {
-    return;
-  }
-
+  // flightTask is already scheduled with vTaskDelayUntil() at the 2 ms
+  // CONTROL_LOOP_PERIOD. A second strict microsecond gate here caused normal
+  // RTOS wakes a few microseconds before 2000 us to be rejected until the next
+  // task tick, producing the measured ~300-330 Hz PID cadence.
   const uint32_t rawElapsedUs = (gState.pid.lastUpdateUs == 0U)
       ? CONTROL_LOOP_PERIOD_US
       : (nowUs - gState.pid.lastUpdateUs);
@@ -9832,7 +9756,9 @@ void updateControlLoop(uint32_t nowMs) {
       // gState.attitude; mirror the active-source heading back onto the sample /
       // imuSample so the EKF mag update and telemetry read a real heading.
       sample.magHeadingDeg = gState.attitude.magHeadingDeg;
+      sample.magValid = gState.attitude.magTrusted;
       gState.imuSample.magHeadingDeg = gState.attitude.magHeadingDeg;
+      gState.imuSample.magValid = gState.attitude.magTrusted;
       portEXIT_CRITICAL(&gFlightMux);
       // Persistent-level calibration averages the fresh attitude estimate while
       // verifying the frame is stationary. No-op unless a capture is active.
@@ -9855,8 +9781,8 @@ void updateControlLoop(uint32_t nowMs) {
             sample.ay_g * gnc::kGravityMs2,
             sample.az_g * gnc::kGravityMs2};
         gEkf.predictIMU(gyroRadS, accelMs2, micros(), nowMs);
-        // Magnetometer is delivered with each IMU read on the ICM-20948 —
-        // fuse opportunistically when the heading is flagged valid.
+        // The selected external-mag heading is mirrored onto the IMU-rate
+        // sample; fuse opportunistically only when it passed every trust gate.
         if (sample.magValid) {
           (void)gEkf.updateMagnetometer(sample.magHeadingDeg * (gnc::kPi / 180.0f),
                                          nowMs);
@@ -10142,6 +10068,15 @@ void updateControlLoop(uint32_t nowMs) {
                      atk.state == control_protocol::kAutoTakeoffAltHold);
   } else if (allowFlight) {
     effectiveThrottle = static_cast<uint8_t>(constrain(static_cast<int>(packet.throttlePercent), 0, 100));
+#if FCU_ENABLE_ALTITUDE_HOLD
+    // Manual ToF altitude hold (switch-engaged). Captures current height +
+    // throttle on engage; the throttle stick then climbs/descends around it.
+    // Gated on a valid ToF reading; disengages instantly if ToF drops. Dormant
+    // unless FCU_ALT_HOLD_AUX_CHANNEL is set (default 0 = off).
+    if (serviceManualAltHold(packet.throttlePercent, altitudeSnap, dtSeconds, effectiveThrottle)) {
+      altHoldActive = true;  // routes the gAltCtrl block below to gManualAlt.targetM
+    }
+#endif
   }
 
   if (failsafe && failsafeReasonSnap == control_protocol::kFailsafeControlLinkTimeout &&
@@ -10156,7 +10091,7 @@ void updateControlLoop(uint32_t nowMs) {
 #if FCU_ENABLE_ALTITUDE_HOLD
   // Altitude controller: only run when ATK requests altitude hold AND ToF is valid.
   if (altHoldActive && altitudeSnap.measurementValid) {
-    gAltCtrl.setTarget(atk.targetMeters);
+    gAltCtrl.setTarget(gManualAlt.engaged ? gManualAlt.targetM : atk.targetMeters);
     AltitudeController::Output altOut =
         gAltCtrl.update(static_cast<float>(altitudeSnap.measuredMm) * 0.001f, dtSeconds);
     const int biasedThrottle = static_cast<int>(effectiveThrottle) +
@@ -10296,9 +10231,19 @@ void updateControlLoop(uint32_t nowMs) {
 
   const float rollAngleSetpointDeg = (effStickX / 100.0f) * MAX_ANGLE_SETPOINT_DEG;
   const float pitchAngleSetpointDeg = (effStickY / 100.0f) * MAX_ANGLE_SETPOINT_DEG;
-  const float yawRateSetpointDps =
+  const float manualYawRateSetpointDps =
       constrain((effYawStick / 100.0f) * MAX_YAW_RATE_SETPOINT_DPS,
                 -MAX_YAW_RATE_SETPOINT_DPS, MAX_YAW_RATE_SETPOINT_DPS);
+  const bool yawStickCentered = fabsf(effYawStick) <= YAW_HOLD_STICK_DEADBAND_PCT;
+  bool yawHeadingUsable = false;
+#if FCU_ENABLE_EXTERNAL_MAG
+  yawHeadingUsable =
+      attitudeSnap.magTrusted &&
+      gActiveMagSource.load(std::memory_order_relaxed) == MAG_SOURCE_EXTERNAL &&
+      gExtCal.valid.load(std::memory_order_relaxed) &&
+      fabsf(gMagTrimDeg.load(std::memory_order_relaxed)) <= 45.0f &&
+      gMagYawCorrGain.load(std::memory_order_relaxed) > 0.0f;
+#endif
 
   // ---- Integrator gating (P2/P3 anti-windup) --------------------------------
   // Freeze — hold, never reset — the rate-PID integrators when:
@@ -10341,6 +10286,22 @@ void updateControlLoop(uint32_t nowMs) {
   const float pitchRateSetpointDps =
       constrain((pitchAngleSetpointDeg - correctedPitchDeg) * gState.pid.anglePitchGain,
                 -MAX_ANGLE_RATE_SETPOINT_DPS, MAX_ANGLE_RATE_SETPOINT_DPS);
+  float yawRateSetpointDps = manualYawRateSetpointDps;
+  if (allowFlight && yawStickCentered && yawHeadingUsable && gState.pid.angleYawGain > 0.0f) {
+    if (!gState.pid.yawHoldActive) {
+      gState.pid.angleYawSetpointDeg = attitudeSnap.yawDeg;
+    }
+    yawRateSetpointDps = constrain(
+        shortestAngleErrorDeg(gState.pid.angleYawSetpointDeg, attitudeSnap.yawDeg) *
+            gState.pid.angleYawGain,
+        -YAW_HOLD_MAX_RATE_DPS, YAW_HOLD_MAX_RATE_DPS);
+    gState.pid.yawHoldActive = true;
+  } else {
+    // Rate mode, invalid/uncalibrated mag, or disabled Angle Yaw P: continuously
+    // follow the current estimate so re-entering hold never snaps backward.
+    gState.pid.angleYawSetpointDeg = attitudeSnap.yawDeg;
+    gState.pid.yawHoldActive = false;
+  }
   rollT = gState.pid.roll.update(rollRateSetpointDps, imuSampleSnap.gx_dps, dtSeconds,
                                  allowIntegration);
   pitchT = gState.pid.pitch.update(pitchRateSetpointDps, imuSampleSnap.gy_dps, dtSeconds,
@@ -10498,12 +10459,32 @@ void updateControlLoop(uint32_t nowMs) {
     base = floorRaw;  // never below the armed idle floor
   }
   bool minSat = false;
-  float mixPreClamp[4];  // pre-floor values for [TUNE_DBG]
+  float mixPreClamp[4];  // trim-adjusted, pre-floor values for [TUNE_DBG]
   std::array<uint16_t, 4> mixed;
+  float trimAdjustedMax = -INFINITY;
   for (size_t i = 0; i < 4; ++i) {
     const float v = base + corr[i] * corrScale;
-    mixPreClamp[i] = v;
-    float clamped = v;
+    const float trim = armedIdleActive
+        ? 1.0f
+        : gMotorThrustTrim[i].load(std::memory_order_relaxed);
+    // Scale only the active command span above the DShot floor. This preserves
+    // equal armed-idle output and does not multiply the protocol's idle offset.
+    const float adjusted = floorRaw + (v - floorRaw) * trim;
+    mixPreClamp[i] = adjusted;
+    if (adjusted > trimAdjustedMax) trimAdjustedMax = adjusted;
+  }
+  // A positive trim can push one motor over the ceiling after the normal
+  // correction desaturation. Shift all motors down together so the requested
+  // trim-created moment is preserved instead of clipping one motor alone.
+  if (trimAdjustedMax > ceilRaw) {
+    const float shift = trimAdjustedMax - ceilRaw;
+    for (size_t i = 0; i < 4; ++i) {
+      mixPreClamp[i] -= shift;
+    }
+    maxSat = true;
+  }
+  for (size_t i = 0; i < 4; ++i) {
+    float clamped = mixPreClamp[i];
     if (clamped < floorRaw) {
       clamped = floorRaw;  // armed floor: props keep spinning, flag the clip
       minSat = true;
@@ -11202,6 +11183,22 @@ void emitFlightStateLine(uint32_t nowMs) {
       static_cast<unsigned long>(gState.pid.resetCount));
 }
 
+// Pace the flight loop to FLIGHT_TASK_PERIOD_MS. xTaskDelayUntil() sleeps until
+// the next period boundary and returns pdTRUE; but if the previous iteration
+// overran the period, the wake deadline is already in the past and it returns
+// pdFALSE *without sleeping at all*. Left unchecked that lets the flight task
+// (priority 24, core 1) free-run back-to-back and starve the priority-1 Arduino
+// loopTask on the same core until loopTask's task-watchdog subscription trips
+// (the "loopTask (CPU 1) did not reset" panic). On overrun we resync the phase
+// and force a one-tick yield so loopTask is guaranteed CPU to service
+// WiFi/log/pidweb and feed its watchdog.
+static inline void flightLoopPace(TickType_t& lastWake, TickType_t period) {
+  if (xTaskDelayUntil(&lastWake, period) == pdFALSE) {
+    lastWake = xTaskGetTickCount();
+    vTaskDelay(1);
+  }
+}
+
 void flightTask(void* /*arg*/) {
   subscribeCurrentTaskToWatchdog("flight");
   TickType_t lastWake = xTaskGetTickCount();
@@ -11216,7 +11213,7 @@ void flightTask(void* /*arg*/) {
     if (esc_passthrough::isActive()) {
       updateTaskHealth(gHealth.flight, iterStartUs, millis(), FLIGHT_OVERRUN_WARN_US);
       feedTaskWatchdog();
-      vTaskDelayUntil(&lastWake, period);
+      flightLoopPace(lastWake, period);
       continue;
     }
 
@@ -11227,26 +11224,18 @@ void flightTask(void* /*arg*/) {
       gMotor3.update();
     }
     serviceEscStartupSettle(nowMs);
-#if ENABLE_USB_CONFIG
-    if (serviceConfiguratorMotorTest(nowMs)) {
-      updateTaskHealth(gHealth.flight, iterStartUs, millis(), FLIGHT_OVERRUN_WARN_US);
-      feedTaskWatchdog();
-      vTaskDelayUntil(&lastWake, period);
-      continue;
-    }
-#endif
-#if ENABLE_PID_WEBSERVER || ENABLE_USB_CONFIG
+#if ENABLE_PID_WEBSERVER
     if (servicePidWebMotorSpin(nowMs)) {
       updateTaskHealth(gHealth.flight, iterStartUs, millis(), FLIGHT_OVERRUN_WARN_US);
       feedTaskWatchdog();
-      vTaskDelayUntil(&lastWake, period);
+      flightLoopPace(lastWake, period);
       continue;
     }
 #endif
     applyFailsafeIfNeeded(nowMs);
     updateControlLoop(nowMs);
     emitFlightStateLine(nowMs);
-#if ENABLE_PID_WEBSERVER || ENABLE_USB_CONFIG
+#if ENABLE_PID_WEBSERVER
     recordPidWebDiagCaptureTick(nowMs);
 #endif
 
@@ -11268,7 +11257,7 @@ void flightTask(void* /*arg*/) {
 
     updateTaskHealth(gHealth.flight, iterStartUs, millis(), FLIGHT_OVERRUN_WARN_US);
     feedTaskWatchdog();
-    vTaskDelayUntil(&lastWake, period);
+    flightLoopPace(lastWake, period);
   }
 }
 
@@ -11316,11 +11305,14 @@ void sensorTask(void* /*arg*/) {
   for (;;) {
     const uint32_t iterStartUs = micros();
     const uint32_t nowMs = millis();
-#if ENABLE_PID_WEBSERVER || ENABLE_USB_CONFIG
+#if ENABLE_PID_WEBSERVER
     serviceSensorRescan(nowMs);
 #endif
     pollTof(nowMs);
     pollBmp(nowMs);
+#if FCU_ENABLE_EXTERNAL_MAG
+    pollExternalMag(nowMs);  // external MMC5603 (shares the BMP Wire bus)
+#endif
     pollGps(nowMs);
     pollPiAutonomy(nowMs);
 #if FCU_ESC_TELEM
@@ -11333,14 +11325,11 @@ void sensorTask(void* /*arg*/) {
     // setPattern() is cheap when the pattern hasn't changed. Bursts queued
     // by GPS events still overlay this — they finish, then we resume the
     // pattern set here.
-#if ENABLE_BLE_CONFIG
-    if (!fcu_ble_config::ledOverrideActive())
-#endif
     {
       gNavLed.setPattern(computeNavLedPattern());
       gNavLed.tick(nowMs);
     }
-#if ENABLE_PID_WEBSERVER || ENABLE_USB_CONFIG
+#if ENABLE_PID_WEBSERVER
     publishPidWebSafety();
 #endif
     updateTaskHealth(gHealth.sensors, iterStartUs, millis(), SENSOR_OVERRUN_WARN_US);
@@ -11517,11 +11506,56 @@ void setup() {
     Serial.printf("[NVS] mix pitch_front_bias=%.3f (default %.3f)\n",
                   static_cast<double>(savedBias),
                   static_cast<double>(MIX_PITCH_FRONT_BIAS_DEFAULT));
+    float savedMotorTrims[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    gPidNvs.loadMotorThrustTrims(savedMotorTrims);
+    for (uint8_t i = 0; i < 4; ++i) {
+      gMotorThrustTrim[i].store(clampMotorThrustTrim(savedMotorTrims[i]),
+                                std::memory_order_relaxed);
+    }
+    Serial.printf("[NVS] motor thrust trims=%.3f/%.3f/%.3f/%.3f\n",
+                  static_cast<double>(savedMotorTrims[0]),
+                  static_cast<double>(savedMotorTrims[1]),
+                  static_cast<double>(savedMotorTrims[2]),
+                  static_cast<double>(savedMotorTrims[3]));
     // Magnetometer heading trim (key "magTrim"). Missing => 0 (no trim).
     // Applied in computeMagHeadingDeg after declination.
     gMagTrimDeg.store(gPidNvs.loadMagTrimDeg(0.0f), std::memory_order_relaxed);
     Serial.printf("[NVS] mag heading trim=%.1f deg\n",
                   static_cast<double>(gMagTrimDeg.load(std::memory_order_relaxed)));
+#if FCU_ENABLE_EXTERNAL_MAG
+    {
+      const auto extCal = gPidNvs.loadExtMagCalibration();
+      applyExtMagCalToLive(extCal);
+      Serial.printf("[NVS] external mag cal valid=%u age=%u boots hard=%+.2f/%+.2f/%+.2f uT "
+                    "scale=%.3f/%.3f/%.3f\n",
+                    static_cast<unsigned>(extCal.valid),
+                    static_cast<unsigned>(extCal.boot_age),
+                    static_cast<double>(extCal.hard_x),
+                    static_cast<double>(extCal.hard_y),
+                    static_cast<double>(extCal.hard_z),
+                    static_cast<double>(extCal.scale_x),
+                    static_cast<double>(extCal.scale_y),
+                    static_cast<double>(extCal.scale_z));
+    }
+#endif
+    {
+      fcu_nvs::FcuPidNvs::MagConfig defaults;
+      defaults.extEnabled = true;
+      defaults.onboardEnabled = false;
+      defaults.preferExternal = true;
+      defaults.yawCorrGain = FCU_MAG_YAW_CORR_GAIN_DEFAULT;
+      const auto magCfg = gPidNvs.loadMagConfig(defaults);
+      // This airframe is external-mag-only by policy. Preserve only the
+      // operator-tested yaw-correction gain; stale NVS source booleans cannot
+      // re-enable the onboard AK09916 or disable the I2C MMC5603.
+      gMagExtEnabled.store(true, std::memory_order_relaxed);
+      gMagOnboardEnabled.store(false, std::memory_order_relaxed);
+      gMagPreferExternal.store(true, std::memory_order_relaxed);
+      gMagYawCorrGain.store(constrain(magCfg.yawCorrGain, 0.0f, 1.0f),
+                            std::memory_order_relaxed);
+      Serial.printf("[NVS] mag policy external=1 onboard=0 gain=%.3f (external-only)\n",
+                    static_cast<double>(gMagYawCorrGain.load(std::memory_order_relaxed)));
+    }
 
     // ---- Autonomy-controller NVS-backed gains -----------------------------
     // Default values live in each controller's Config struct; loadXxxGains()
@@ -11582,6 +11616,9 @@ void setup() {
     }
 #endif
   } else {
+#if FCU_ENABLE_EXTERNAL_MAG
+    applyExtMagCalToLive(fcu_nvs::FcuPidNvs::ExtMagCalibration{});
+#endif
     Serial.println("[NVS] Preferences begin failed; PID will use compile-time defaults");
   }
   configurePidFromPacket(gState.control.lastPacket);
@@ -11761,6 +11798,31 @@ void setup() {
   gState.bmpReady = gState.i2cReady && initBmp(gState.bmpChipId, gState.bmpAddr);
   serviceBootMotorZeroHeartbeat();
   feedTaskWatchdog();
+#if FCU_ENABLE_EXTERNAL_MAG
+  {
+    uint8_t extAddr = 0;
+    uint8_t extChip = 0;
+    const bool extMagOk = gState.i2cReady && initExternalMag(extAddr, extChip);
+    gExtMag.ready.store(extMagOk, std::memory_order_relaxed);
+    gExtMag.connected.store(false, std::memory_order_relaxed);
+    gExtMag.healthy.store(false, std::memory_order_relaxed);
+    gExtMag.addr.store(extAddr, std::memory_order_relaxed);
+    gExtMag.chipId.store(extChip, std::memory_order_relaxed);
+    gExtMag.rejectReason.store(extMagOk ? EXTMAG_REJECT_STALE
+                                       : EXTMAG_REJECT_NOT_PRESENT,
+                               std::memory_order_relaxed);
+    Serial.printf("[EXTMAG] init=%u bus=I2C addr=0x%02X chip=0x%02X policy=external-only "
+                  "field_gate=%.0f..%.0fuT yaw_gain=%.3f\n",
+                  static_cast<unsigned>(extMagOk),
+                  static_cast<unsigned>(extAddr),
+                  static_cast<unsigned>(extChip),
+                  static_cast<double>(EXTMAG_FIELD_MIN_UT),
+                  static_cast<double>(EXTMAG_FIELD_MAX_UT),
+                  static_cast<double>(gMagYawCorrGain.load(std::memory_order_relaxed)));
+  }
+  serviceBootMotorZeroHeartbeat();
+  feedTaskWatchdog();
+#endif
 
   // [CALIBRATION] Run boot stationary calibration AFTER IMU + BMP are up but
   // BEFORE tasks spawn. Updates gCal in-place; persists fresh values to NVS.
@@ -11910,9 +11972,7 @@ void setup() {
   Serial.printf("[FCU] failsafe starts active; control link drives throttle, telemetry %s\n",
                 TELEMETRY_RADIO_ENABLED ? (gState.telemRadioReady ? "ready" : "init pending")
                                         : "disabled (build flag)");
-#if !(ENABLE_USB_CONFIG && !FCU_ENABLE_USB_SERIAL_LOGGING)
   Serial.flush();
-#endif
   serviceBootMotorZeroHeartbeat();
   Serial.println("[FCU] spawning RTOS tasks");
 
@@ -11956,9 +12016,7 @@ void setup() {
                   static_cast<int>(ibusTaskOk),
                   static_cast<int>(crsfTaskOk));
     forceMotorStop("fatal_task_create");
-#if !(ENABLE_USB_CONFIG && !FCU_ENABLE_USB_SERIAL_LOGGING)
     Serial.flush();
-#endif
     delay(100);
     ESP.restart();
   }
@@ -11982,33 +12040,6 @@ void setup() {
 
 #if ENABLE_PID_WEBSERVER
   initPidWebserver();
-#endif
-
-#if ENABLE_USB_CONFIG
-  {
-    pid_webserver::Callbacks cbs = buildConfiguratorCallbacks();
-    fcu_configurator::init(cbs, "esp32-s3-mini-configurator");
-    fcu_configurator::SystemCallbacks sysCbs;
-    sysCbs.safeToMutate = pidWebWriteSafe;
-    sysCbs.rescanSensors = requestSensorRescan;
-    sysCbs.reboot = requestSystemReboot;
-    sysCbs.enterBootloader = requestSystemBootloader;
-    fcu_configurator::setSystemCallbacks(sysCbs);
-    fcu_configurator::MotorTestCallbacks motorCbs;
-    motorCbs.arm = configuratorMotorTestArm;
-    motorCbs.set = configuratorMotorTestSet;
-    motorCbs.stop = configuratorMotorTestStop;
-    fcu_configurator::setMotorTestCallbacks(motorCbs);
-  }
-#endif
-#if ENABLE_BLE_CONFIG
-  const bool bleBootStored = gPidNvs.hasBleBootEnabled();
-  const bool bleBootEnabled = gPidNvs.loadBleBootEnabled(BLE_DEFAULT_ENABLED != 0);
-  fcu_ble_config::init(millis(), bleBootEnabled, saveBleBootEnabled);
-  Serial.printf("[BLE] config compiled=1 boot_request=%u default=%u source=%s\n",
-                static_cast<unsigned>(bleBootEnabled),
-                static_cast<unsigned>(BLE_DEFAULT_ENABLED != 0),
-                bleBootStored ? "nvs" : "default");
 #endif
 
 #if FCU_WIFI_STACK_ENABLED
@@ -12037,6 +12068,13 @@ void setup() {
 void loop() {
   const uint32_t iterStartUs = micros();
   const uint32_t nowMs = millis();
+  // Pet loopTask's watchdog at the TOP of every iteration, before the heavy body
+  // (pidweb/wifi/log-drain/notch FFT). loopTask is priority 1 on core 1 and only
+  // runs in the slack left by the higher-priority flight/radio tasks; feeding
+  // only at the bottom lets the TWDT trip when the body is starved or slow even
+  // though loop() is alive and progressing. Feed here + after the FFT + at the
+  // bottom to bound the worst-case gap between feeds.
+  feedTaskWatchdog();
   // USB-CDC ESC passthrough CLI + dry-run pump + inactivity timeout. loop() is
   // the designated low-priority I/O context. No-op unless ENABLE_ESC_PASSTHROUGH=1.
   esc_passthrough::pollCli(Serial, nowMs);
@@ -12048,20 +12086,12 @@ void loop() {
 #if ENABLE_PID_WEBSERVER
   pid_webserver::service(nowMs);
 #endif
-#if ENABLE_USB_CONFIG
-  fcu_configurator::service(Serial, nowMs);
-#endif
-#if ENABLE_BLE_CONFIG
-  fcu_ble_config::service(nowMs, pidWebWriteSafe());
-#endif
   fcu_log::drain(nowMs);
-#if ENABLE_USB_CONFIG
-  serviceSystemAction(nowMs);
-#endif
   // FFT for the dashboard notch analysis runs HERE (loop = lowest priority),
   // never on the flight task. One pass after the capture buffer fills.
   if (gNotchAnalyzer.needsAnalyze()) {
     gNotchAnalyzer.analyze();
+    feedTaskWatchdog();  // FFT pass is the heaviest single chunk in loop()
   }
   const bool loopLogDue = PERIODIC_LOOP_LOGS_ENABLED &&
                           !esc_passthrough::isActive() &&
@@ -12156,6 +12186,24 @@ void loop() {
                   static_cast<unsigned>(sensorSnap.gpsHasFix),
                   static_cast<unsigned>(sensorSnap.gpsSatellites),
                   pidPitch, pidRoll, pidYaw);
+#if FCU_ENABLE_EXTERNAL_MAG
+    const bool extHeadingRejected = gExtMag.headingRejected.load(std::memory_order_relaxed);
+    const uint8_t extReject = extHeadingRejected
+        ? EXTMAG_REJECT_HEADING_JUMP
+        : gExtMag.rejectReason.load(std::memory_order_relaxed);
+    fcu_log::logf(fcu_log::Level::Info,
+                  "[MAG] src=%s ext_ready=%u conn=%u healthy=%u cal=%u field=%.1fuT "
+                  "heading=%.1f reject=%s yaw_gain=%.3f\n",
+                  magSourceName(gActiveMagSource.load(std::memory_order_relaxed)),
+                  static_cast<unsigned>(gExtMag.ready.load(std::memory_order_relaxed)),
+                  static_cast<unsigned>(gExtMag.connected.load(std::memory_order_relaxed)),
+                  static_cast<unsigned>(gExtMag.healthy.load(std::memory_order_relaxed)),
+                  static_cast<unsigned>(gExtCal.valid.load(std::memory_order_relaxed)),
+                  static_cast<double>(gExtMag.field.load(std::memory_order_relaxed)),
+                  static_cast<double>(gExtMag.headingDeg.load(std::memory_order_relaxed)),
+                  extMagRejectName(extReject),
+                  static_cast<double>(gMagYawCorrGain.load(std::memory_order_relaxed)));
+#endif
 
     // Latency / packet-flow instrumentation. Reads:
     //   pkt_rate    = RX control packets per second (1 Hz rolling window)

@@ -26,6 +26,12 @@ namespace pid_webserver {
 namespace {
 
 constexpr const char* kTag = "PIDWEB";
+// SoftAP fixed IP: the FCU broadcasts its OWN WiFi network instead of joining
+// one, and serves the tuner at http://<this-ip>/. Gateway == this IP, /24 mask.
+// Override via build_flags (e.g. -DFCU_PID_AP_IP="10,0,0,1") if desired.
+#ifndef FCU_PID_AP_IP
+#define FCU_PID_AP_IP 192, 168, 4, 1
+#endif
 #ifndef FCU_PID_WIFI_RECONNECT_BACKOFF_MS
 #define FCU_PID_WIFI_RECONNECT_BACKOFF_MS 3000U
 #endif
@@ -45,12 +51,9 @@ std::atomic<bool> gSafeToWrite{false};
 std::atomic<bool> gRunning{false};
 const char* gSsid = "";
 const char* gPassword = "";
-uint32_t gConnectTimeoutMs = 10000U;
-uint32_t gNextReconnectMs = 0;
-uint32_t gReconnectDeadlineMs = 0;
+uint32_t gNextReconnectMs = 0;  // backoff gate before re-asserting a downed AP
 uint32_t gLastHealthLogMs = 0;
 uint32_t gLastIp = 0;
-bool gReconnectInProgress = false;
 
 // Shared-secret token required on every mutating request via the X-Auth-Token
 // header. Set once before start(); only read thereafter, so a plain buffer is
@@ -384,6 +387,28 @@ bool parseJsonFloat(const char* body, const char* key, float& out) {
   return true;
 }
 
+bool parseJsonFloat4(const char* body, const char* key, float out[4]) {
+  if (!body || !key || !out) return false;
+  char needle[24];
+  const int n = snprintf(needle, sizeof(needle), "\"%s\"", key);
+  if (n < 0 || n >= static_cast<int>(sizeof(needle))) return false;
+  const char* p = strstr(body, needle);
+  if (!p) return false;
+  p = strchr(p + n, '[');
+  if (!p) return false;
+  ++p;
+  for (uint8_t i = 0; i < 4; ++i) {
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == ',') ++p;
+    char* end = nullptr;
+    const float v = strtof(p, &end);
+    if (end == p || !isfinite(v)) return false;
+    out[i] = v;
+    p = end;
+  }
+  while (*p == ' ' || *p == '\t' || *p == '\n') ++p;
+  return *p == ']';
+}
+
 // Minimalist JSON-array parser for {"gains":[12 ints]}. Doesn't handle
 // arbitrary JSON; just enough to extract the gains. Returns true on success.
 bool parseGainsArray(const char* body, int16_t out[12]) {
@@ -459,10 +484,11 @@ int formatDashJson(char* out, size_t cap, const DashTelemetry& d,
       (unsigned long)d.freeHeap, (unsigned long)d.minFreeHeap, (unsigned long)d.flightOverruns,
       (unsigned long)d.flightMaxUs, wsClients, webHz, d.flightMode);
   j.f(",\"att\":{\"rr\":%.2f,\"rp\":%.2f,\"ry\":%.2f,\"cr\":%.2f,\"cp\":%.2f,"
-      "\"tr\":%.2f,\"tp\":%.2f,\"tyr\":%.1f,\"er\":%.2f,\"ep\":%.2f,\"at\":%d}",
+      "\"tr\":%.2f,\"tp\":%.2f,\"ty\":%.2f,\"yh\":%d,\"tyr\":%.1f,"
+      "\"er\":%.2f,\"ep\":%.2f,\"at\":%d}",
       jf(d.rawRollDeg), jf(d.rawPitchDeg), jf(d.rawYawDeg), jf(d.corrRollDeg), jf(d.corrPitchDeg),
-      jf(d.targetRollDeg), jf(d.targetPitchDeg), jf(d.targetYawRateDps), jf(d.rollErrDeg),
-      jf(d.pitchErrDeg), d.accelTrusted ? 1 : 0);
+      jf(d.targetRollDeg), jf(d.targetPitchDeg), jf(d.targetYawDeg), d.yawHoldActive ? 1 : 0,
+      jf(d.targetYawRateDps), jf(d.rollErrDeg), jf(d.pitchErrDeg), d.accelTrusted ? 1 : 0);
   j.f(",\"imu\":{\"a\":[%.4f,%.4f,%.4f],\"ao\":[%.4f,%.4f,%.4f],\"av\":%d,\"am\":%.4f,"
       "\"g\":[%.3f,%.3f,%.3f],\"gb\":[%.3f,%.3f,%.3f],\"gbv\":%d,\"rdy\":%d}",
       jf(d.accelG[0]), jf(d.accelG[1]), jf(d.accelG[2]), jf(d.accelOffG[0]), jf(d.accelOffG[1]),
@@ -484,10 +510,12 @@ int formatDashJson(char* out, size_t cap, const DashTelemetry& d,
       d.satMin ? 1 : 0, d.satMax ? 1 : 0, d.satScaled ? 1 : 0,
       d.pidSat[0] ? 1 : 0, d.pidSat[1] ? 1 : 0, d.pidSat[2] ? 1 : 0);
   j.f(",\"mix\":{\"base\":%.1f,\"r\":%.2f,\"pf\":%.2f,\"pr\":%.2f,\"y\":%.2f,"
-      "\"unc\":[%.1f,%.1f,%.1f,%.1f],\"m\":[%u,%u,%u,%u],\"bias\":%.3f}",
+      "\"unc\":[%.1f,%.1f,%.1f,%.1f],\"m\":[%u,%u,%u,%u],\"bias\":%.3f,"
+      "\"trim\":[%.3f,%.3f,%.3f,%.3f]}",
       jf(d.mixBase), jf(d.mixRoll), jf(d.mixPitchFront), jf(d.mixPitchRear), jf(d.mixYaw),
       jf(d.mixUnclamped[0]), jf(d.mixUnclamped[1]), jf(d.mixUnclamped[2]), jf(d.mixUnclamped[3]),
-      d.motorRaw[0], d.motorRaw[1], d.motorRaw[2], d.motorRaw[3], jf(d.mixBias));
+      d.motorRaw[0], d.motorRaw[1], d.motorRaw[2], d.motorRaw[3], jf(d.mixBias),
+      jf(d.motorTrim[0]), jf(d.motorTrim[1]), jf(d.motorTrim[2]), jf(d.motorTrim[3]));
   j.f(",\"rc\":{\"comp\":%d,\"up\":%d,\"fs\":%d,\"lq\":%u,\"rssi\":%d,\"fr\":%u,\"age\":%lu,"
       "\"loss\":%u,\"pps\":%u,\"ch\":[%u,%u,%u,%u,%u,%u,%u,%u]}",
       d.crsfCompiled ? 1 : 0, d.rcLinkUp ? 1 : 0, d.rcFailsafe ? 1 : 0, d.rcLq, d.rcRssiDbm,
@@ -498,7 +526,11 @@ int formatDashJson(char* out, size_t cap, const DashTelemetry& d,
       "\"tof\":{\"comp\":%d,\"r\":%d,\"rng\":%d,\"mm\":%u,\"age\":%lu},"
       "\"gps\":{\"comp\":%d,\"r\":%d,\"fix\":%d,\"sats\":%u,\"q\":%u,\"lat\":%ld,\"lon\":%ld,\"age\":%lu,"
       "\"gsv\":%d,\"cv\":%d,\"vv\":%d,\"sp\":%u,\"spd\":%.2f,\"cog\":%u,\"vn\":%.2f,\"ve\":%.2f,\"rmc\":%lu},"
-      "\"mag\":{\"v\":%d,\"hdg\":%.1f,\"f\":%.1f,\"cal\":%d},\"ekf\":%d,"
+      "\"mag\":{\"v\":%d,\"hdg\":%.1f,\"f\":%.1f,\"cal\":%d,\"src\":%u,\"gain\":%.3f,"
+      "\"trim\":%.1f,\"dec\":%.1f,"
+      "\"ext\":{\"comp\":%d,\"conn\":%d,\"v\":%d,\"cal\":%d,\"hdg\":%.1f,\"f\":%.1f,"
+      "\"xyz\":[%.2f,%.2f,%.2f],\"rej\":%u},"
+      "\"cfg\":{\"ext\":%d,\"ob\":%d,\"pref\":%d}},\"ekf\":%d,"
       "\"ekfd\":{\"av\":%d,\"pv\":%d,\"vv\":%d,\"gv\":%d,\"mv\":%d,\"if\":%d,\"yaw\":%.1f,"
       "\"v\":[%.2f,%.2f,%.2f],\"p\":[%.1f,%.1f,%.1f],\"gi\":[%.1f,%.1f,%.1f],"
       "\"mi\":%.1f,\"gps\":[%lu,%lu],\"mag\":[%lu,%lu],\"drop\":%lu}}",
@@ -510,6 +542,12 @@ int formatDashJson(char* out, size_t cap, const DashTelemetry& d,
       d.gpsGroundSpeedKmh10, jf(d.gpsGroundSpeedMs), d.gpsCourseCentiDeg,
       jf(d.gpsVelNorthMs), jf(d.gpsVelEastMs), (unsigned long)d.gpsRmcAgeMs,
       d.magValid ? 1 : 0, jf(d.magHeadingDeg), jf(d.magFieldUt), d.magCalValid ? 1 : 0,
+      d.activeMagSource, jf(d.magYawCorrGain), jf(d.magHeadingTrimDeg), jf(d.magDeclinationDeg),
+      d.extMagCompiled ? 1 : 0, d.extMagConnected ? 1 : 0, d.extMagValid ? 1 : 0,
+      d.extMagCalValid ? 1 : 0, jf(d.extMagHeadingDeg), jf(d.extMagFieldUt),
+      jf(d.extMagVecUt[0]), jf(d.extMagVecUt[1]), jf(d.extMagVecUt[2]),
+      d.extMagRejectReason, d.magExtEnabled ? 1 : 0, d.magOnboardEnabled ? 1 : 0,
+      d.magPreferExternal ? 1 : 0,
       d.ekfReady ? 1 : 0,
       d.ekfAttValid ? 1 : 0, d.ekfPosValid ? 1 : 0, d.ekfVelValid ? 1 : 0,
       d.ekfGpsValid ? 1 : 0, d.ekfMagValid ? 1 : 0, d.ekfInnovationFault ? 1 : 0,
@@ -563,7 +601,7 @@ esp_err_t handleWs(httpd_req_t* req) {
 }
 
 void telemetryTask(void*) {
-  static char buf[3400];  // own buffer (handler uses a separate one)
+  static char buf[3700];  // own buffer (handler uses a separate one)
   uint32_t lastRateMs = millis();
   uint16_t frames = 0;
   for (;;) {
@@ -682,35 +720,63 @@ esp_err_t handleSpinMotor(httpd_req_t* req) {
 esp_err_t handleGetMix(httpd_req_t* req) {
   if (!gCb.getMixPitchFrontBias) return sendError(req, 500, "no_callback");
   float bias = 1.0f;
+  float trims[4] = {1.0f, 1.0f, 1.0f, 1.0f};
   gCb.getMixPitchFrontBias(bias);
-  char body[64];
+  if (gCb.getMotorThrustTrims) gCb.getMotorThrustTrims(trims);
+  char body[128];
   int n = snprintf(body, sizeof(body),
-      "{\"bias\":%.3f,\"safe\":%s}",
+      "{\"bias\":%.3f,\"trims\":[%.3f,%.3f,%.3f,%.3f],\"safe\":%s}",
       static_cast<double>(bias),
+      static_cast<double>(trims[0]), static_cast<double>(trims[1]),
+      static_cast<double>(trims[2]), static_cast<double>(trims[3]),
       gSafeToWrite.load() ? "true" : "false");
   if (n < 0 || n >= (int)sizeof(body)) return sendError(req, 500, "fmt");
   return sendJson(req, body);
 }
 
 esp_err_t handlePutMix(httpd_req_t* req) {
-  if (!gCb.setMixPitchFrontBias) return sendError(req, 500, "no_callback");
+  if (!gCb.setMixPitchFrontBias || !gCb.setMotorThrustTrims) {
+    return sendError(req, 500, "no_callback");
+  }
   if (!authorized(req)) return sendError(req, 401, "unauthorized");
   if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
-  char body[96];
+  char body[192];
   int n = recvBody(req, body, sizeof(body));
   if (n < 0) return sendError(req, 400, "bad_body");
+
   float bias = 0.0f;
-  if (!parseJsonFloat(body, "bias", bias)) return sendError(req, 400, "bad_json");
-  if (!(bias >= 1.0f && bias <= 2.0f)) return sendError(req, 400, "out_of_range");
-  if (!gCb.setMixPitchFrontBias(bias)) return sendError(req, 409, "apply_refused");
+  float trims[4] = {};
+  const bool hasBias = parseJsonFloat(body, "bias", bias);
+  const bool hasTrims = parseJsonFloat4(body, "trims", trims);
+  if (!hasBias && !hasTrims) return sendError(req, 400, "bad_json");
+  if (hasBias && !(bias >= 1.0f && bias <= 2.0f)) {
+    return sendError(req, 400, "bias_out_of_range");
+  }
+  if (hasTrims) {
+    for (float trim : trims) {
+      if (!(trim >= 0.90f && trim <= 1.10f)) {
+        return sendError(req, 400, "trim_out_of_range");
+      }
+    }
+  }
+  if (hasBias && !gCb.setMixPitchFrontBias(bias)) {
+    return sendError(req, 409, "apply_refused");
+  }
+  if (hasTrims && !gCb.setMotorThrustTrims(trims)) {
+    return sendError(req, 409, "apply_refused");
+  }
   return sendJson(req, "{\"ok\":true}");
 }
 
 esp_err_t handleSaveMix(httpd_req_t* req) {
-  if (!gCb.saveMixPitchFrontBiasToNvs) return sendError(req, 500, "no_callback");
+  if (!gCb.saveMixPitchFrontBiasToNvs || !gCb.saveMotorThrustTrimsToNvs) {
+    return sendError(req, 500, "no_callback");
+  }
   if (!authorized(req)) return sendError(req, 401, "unauthorized");
   if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
-  if (!gCb.saveMixPitchFrontBiasToNvs()) return sendError(req, 500, "nvs_write_failed");
+  const bool biasOk = gCb.saveMixPitchFrontBiasToNvs();
+  const bool trimsOk = gCb.saveMotorThrustTrimsToNvs();
+  if (!biasOk || !trimsOk) return sendError(req, 500, "nvs_write_failed");
   return sendJson(req, "{\"ok\":true,\"persisted\":true}");
 }
 
@@ -800,7 +866,7 @@ esp_err_t handleGetHealth(httpd_req_t* req) {
 // static buffer so it can't race the telemetry task's buffer.
 esp_err_t handleGetDash(httpd_req_t* req) {
   if (!gCb.getDashTelemetry) return sendError(req, 500, "no_callback");
-  static char dashBuf[3400];
+  static char dashBuf[3700];
   DashTelemetry t;
   gCb.getDashTelemetry(t);
   const int n = formatDashJson(dashBuf, sizeof(dashBuf), t,
@@ -888,6 +954,41 @@ esp_err_t handlePostSettings(httpd_req_t* req) {
   if (!gCb.setMagTrimDeg(trim)) return sendError(req, 409, "apply_refused");
   if (gCb.saveMagTrimDegToNvs) gCb.saveMagTrimDegToNvs();  // POST == Save (persist)
   return sendJson(req, "{\"ok\":true,\"persisted\":true}");
+}
+
+// ---- External-mag yaw correction ------------------------------------------
+// Source selection is fixed external-only by the FCU. PID-web exposes only the
+// slow correction gain: 0 = shadow, 1 = full configured pull (still tau-limited).
+esp_err_t handleGetMagConfig(httpd_req_t* req) {
+  if (!gCb.getMagConfig) return sendError(req, 500, "no_callback");
+  MagConfigSnapshot c;
+  gCb.getMagConfig(c);
+  char body[180];
+  int n = snprintf(body, sizeof(body),
+      "{\"extCompiled\":%s,\"extEnabled\":%s,\"onboardEnabled\":%s,"
+      "\"preferExternal\":%s,\"gain\":%.3f,\"safe\":%s}",
+      c.extCompiled ? "true" : "false", c.extEnabled ? "true" : "false",
+      c.onboardEnabled ? "true" : "false", c.preferExternal ? "true" : "false",
+      static_cast<double>(c.yawCorrGain), gSafeToWrite.load() ? "true" : "false");
+  if (n < 0 || n >= (int)sizeof(body)) return sendError(req, 500, "fmt");
+  return sendJson(req, body);
+}
+
+esp_err_t handlePutMagConfig(httpd_req_t* req) {
+  if (!gCb.setMagConfig) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
+  char body[80];
+  if (recvBody(req, body, sizeof(body)) < 0) return sendError(req, 400, "bad_body");
+  float gain = 0.0f;
+  if (!parseJsonFloat(body, "gain", gain)) return sendError(req, 400, "bad_json");
+  if (!(gain >= 0.0f && gain <= 1.0f)) return sendError(req, 400, "out_of_range");
+  if (!gCb.setMagConfig(true, false, true, gain)) return sendError(req, 409, "apply_refused");
+  return sendJson(req, "{\"ok\":true,\"source\":\"external\"}");
+}
+
+esp_err_t handleSaveMagConfig(httpd_req_t* req) {
+  return doBoolAction(req, gCb.saveMagConfigToNvs, "{\"ok\":true,\"persisted\":true}");
 }
 
 // POST /api/calibrate?mag=1 -> {"status":"started"} (alias for the existing
@@ -1151,25 +1252,36 @@ void stopHttpServer(const char* reason) {
   }
 }
 
-bool waitForWifi(const char* ssid, const char* pass, uint32_t timeoutMs) {
+// Bring up the FCU's own access point (SoftAP) at the fixed FCU_PID_AP_IP.
+// Returns true once the AP is broadcasting. WPA2 requires an 8..63 char
+// passphrase; a shorter/empty pass falls back to an OPEN network so the AP
+// still comes up rather than silently failing.
+bool startSoftAp(const char* ssid, const char* pass) {
   WiFi.persistent(false);
-  WiFi.mode(WIFI_STA);
+  WiFi.mode(WIFI_AP);
   WiFi.setSleep(false);  // disable sleep so HTTP latency is low
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(ssid, pass);
-  const uint32_t start = millis();
-  Serial.printf("[%s] connecting to SSID '%s' (timeout %lums)\n",
-                kTag, ssid, (unsigned long)timeoutMs);
-  while (WiFi.status() != WL_CONNECTED) {
-    if (millis() - start > timeoutMs) {
-      Serial.printf("[%s] WiFi connect timeout\n", kTag);
-      return false;
-    }
-    (void)esp_task_wdt_reset();
-    delay(100);
+
+  const IPAddress apIp(FCU_PID_AP_IP);
+  const IPAddress gateway(FCU_PID_AP_IP);
+  const IPAddress subnet(255, 255, 255, 0);
+  if (!WiFi.softAPConfig(apIp, gateway, subnet)) {
+    Serial.printf("[%s] softAPConfig(%s) failed\n", kTag, apIp.toString().c_str());
+    return false;
   }
-  Serial.printf("[%s] WiFi up: ip=%s rssi=%d dBm\n", kTag,
-                WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
+
+  const bool secured = (pass != nullptr) && (strlen(pass) >= 8);
+  if (!secured && pass != nullptr && pass[0] != '\0') {
+    Serial.printf("[%s] WARNING: AP password is <8 chars; WPA2 needs 8+. "
+                  "Starting an OPEN network instead.\n", kTag);
+  }
+  const bool ok = secured ? WiFi.softAP(ssid, pass) : WiFi.softAP(ssid);
+  if (!ok) {
+    Serial.printf("[%s] softAP('%s') failed to start\n", kTag, ssid);
+    return false;
+  }
+
+  Serial.printf("[%s] SoftAP '%s' up (%s): http://%s/\n", kTag, ssid,
+                secured ? "WPA2" : "OPEN", WiFi.softAPIP().toString().c_str());
   return true;
 }
 
@@ -1177,8 +1289,8 @@ bool startHttpServer() {
   if (gRunning.load(std::memory_order_relaxed)) {
     return true;
   }
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.printf("[%s] http start refused: WiFi status=%d\n", kTag, static_cast<int>(WiFi.status()));
+  if (WiFi.softAPIP() == IPAddress(static_cast<uint32_t>(0))) {
+    Serial.printf("[%s] http start refused: SoftAP not up\n", kTag);
     return false;
   }
 
@@ -1232,6 +1344,9 @@ bool startHttpServer() {
   registerUri(gServer, "/api/mag/finish",      HTTP_POST, handleMagFinish);
   registerUri(gServer, "/api/settings",        HTTP_GET,  handleGetSettings);
   registerUri(gServer, "/api/settings",        HTTP_POST, handlePostSettings);
+  registerUri(gServer, "/api/mag/config",      HTTP_GET,  handleGetMagConfig);
+  registerUri(gServer, "/api/mag/config",      HTTP_PUT,  handlePutMagConfig);
+  registerUri(gServer, "/api/mag/config/save", HTTP_POST, handleSaveMagConfig);
   registerUri(gServer, "/api/calibrate",       HTTP_POST, handleCalibrate);
   // ---- Vibration / FFT / notch ----
   registerUri(gServer, "/api/notch",           HTTP_GET,  handleGetNotch);
@@ -1306,13 +1421,13 @@ bool start(const char* ssid, const char* password, uint32_t connectTimeoutMs) {
   }
   gSsid = (ssid != nullptr) ? ssid : "";
   gPassword = (password != nullptr) ? password : "";
-  gConnectTimeoutMs = connectTimeoutMs;
+  (void)connectTimeoutMs;  // SoftAP comes up immediately; no connect timeout
   if (ssid == nullptr || ssid[0] == '\0') {
     Serial.printf("[%s] start refused: SSID empty\n", kTag);
     return false;
   }
 
-  if (!waitForWifi(ssid, password, connectTimeoutMs)) {
+  if (!startSoftAp(ssid, password)) {
     gNextReconnectMs = millis();
     return false;
   }
@@ -1327,55 +1442,41 @@ void service(uint32_t nowMs) {
     return;
   }
 
-  const wl_status_t status = WiFi.status();
-  if (status == WL_CONNECTED) {
-    gReconnectInProgress = false;
-    const uint32_t ip = static_cast<uint32_t>(WiFi.localIP());
-    if (ip != 0U && ip != gLastIp) {
-      gLastIp = ip;
-      Serial.printf("[%s] WiFi IP active: http://%s/ rssi=%d dBm\n",
-                    kTag, WiFi.localIP().toString().c_str(), static_cast<int>(WiFi.RSSI()));
+  // SoftAP mode: the AP is hosted locally and does not "drop" like a station
+  // link, so there is no reconnect loop. If the AP is somehow down (e.g. WiFi
+  // was torn down elsewhere), bring it back up; otherwise just keep the HTTP
+  // server running and emit a periodic health line with the client count.
+  const uint32_t apIp = static_cast<uint32_t>(WiFi.softAPIP());
+  if (apIp == 0U) {
+    if (gRunning.load(std::memory_order_relaxed) || gServer != nullptr) {
+      stopHttpServer("ap_down");
     }
-    if (!gRunning.load(std::memory_order_relaxed)) {
-      (void)startHttpServer();
-    }
-    if ((nowMs - gLastHealthLogMs) >= FCU_PID_WIFI_HEALTH_LOG_MS) {
-      gLastHealthLogMs = nowMs;
-      Serial.printf("[%s] WiFi health ip=%s rssi=%d dBm http=%u\n",
-                    kTag, WiFi.localIP().toString().c_str(), static_cast<int>(WiFi.RSSI()),
-                    static_cast<unsigned>(gRunning.load(std::memory_order_relaxed)));
-    }
-    return;
-  }
-
-  if (gRunning.load(std::memory_order_relaxed) || gServer != nullptr) {
-    stopHttpServer("wifi_lost");
-  }
-  gLastIp = 0;
-  if (gReconnectInProgress) {
-    if (static_cast<int32_t>(nowMs - gReconnectDeadlineMs) < 0) {
+    gLastIp = 0;
+    if (static_cast<int32_t>(nowMs - gNextReconnectMs) < 0) {
       return;
     }
-    gReconnectInProgress = false;
     gNextReconnectMs = nowMs + FCU_PID_WIFI_RECONNECT_BACKOFF_MS;
-    Serial.printf("[%s] WiFi reconnect timeout status=%d; retry in %lums\n",
-                  kTag, static_cast<int>(status),
-                  static_cast<unsigned long>(FCU_PID_WIFI_RECONNECT_BACKOFF_MS));
-    return;
+    Serial.printf("[%s] SoftAP down; restarting '%s'\n", kTag, gSsid);
+    if (!startSoftAp(gSsid, gPassword)) {
+      return;
+    }
   }
-  if (static_cast<int32_t>(nowMs - gNextReconnectMs) < 0) {
-    return;
+
+  if (apIp != 0U && apIp != gLastIp) {
+    gLastIp = apIp;
+    Serial.printf("[%s] SoftAP active: http://%s/\n",
+                  kTag, WiFi.softAPIP().toString().c_str());
   }
-  Serial.printf("[%s] WiFi down status=%d; reconnecting to '%s'\n",
-                kTag, static_cast<int>(status), gSsid);
-  WiFi.persistent(false);
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.setAutoReconnect(true);
-  WiFi.disconnect(false);
-  WiFi.begin(gSsid, gPassword);
-  gReconnectInProgress = true;
-  gReconnectDeadlineMs = nowMs + gConnectTimeoutMs;
+  if (!gRunning.load(std::memory_order_relaxed)) {
+    (void)startHttpServer();
+  }
+  if ((nowMs - gLastHealthLogMs) >= FCU_PID_WIFI_HEALTH_LOG_MS) {
+    gLastHealthLogMs = nowMs;
+    Serial.printf("[%s] SoftAP health ip=%s clients=%d http=%u\n",
+                  kTag, WiFi.softAPIP().toString().c_str(),
+                  static_cast<int>(WiFi.softAPgetStationNum()),
+                  static_cast<unsigned>(gRunning.load(std::memory_order_relaxed)));
+  }
 }
 
 }  // namespace pid_webserver

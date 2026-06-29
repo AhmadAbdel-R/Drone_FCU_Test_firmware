@@ -107,6 +107,8 @@ struct PidRuntime {
   // telemetry only — never fed back into control.
   float angleRollSetpointDeg = 0.0f;   // outer-loop target angle from sticks
   float anglePitchSetpointDeg = 0.0f;
+  float angleYawSetpointDeg = 0.0f;    // captured heading while yaw stick is centered
+  bool yawHoldActive = false;          // calibrated external-mag heading hold
   float correctedRollDeg = 0.0f;
   float correctedPitchDeg = 0.0f;
   float levelRollOffsetDeg = 0.0f;   // persistent level correction applied this tick

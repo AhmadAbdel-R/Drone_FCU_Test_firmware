@@ -152,6 +152,8 @@ struct DashTelemetry {
   float rawRollDeg = 0.0f, rawPitchDeg = 0.0f, rawYawDeg = 0.0f;
   float corrRollDeg = 0.0f, corrPitchDeg = 0.0f;     // raw - levelOffset - trim
   float targetRollDeg = 0.0f, targetPitchDeg = 0.0f; // angle setpoints from sticks
+  float targetYawDeg = 0.0f;                         // captured heading-hold target
+  bool yawHoldActive = false;
   float targetYawRateDps = 0.0f;
   float rollErrDeg = 0.0f, pitchErrDeg = 0.0f;       // angle error the outer loop sees
   bool accelTrusted = false;
@@ -188,6 +190,7 @@ struct DashTelemetry {
   float mixUnclamped[4] = {0, 0, 0, 0};   // pre-floor/clamp
   uint16_t motorRaw[4] = {0, 0, 0, 0};    // clamped DShot command actually sent
   float mixBias = 1.0f;                   // pitch front bias
+  float motorTrim[4] = {1, 1, 1, 1};      // per-motor thrust-span gain
 
   // ---- Radio / control link ----
   bool rcLinkUp = false;
@@ -219,12 +222,15 @@ struct DashTelemetry {
   uint32_t gpsRmcAgeMs = 0xFFFFFFFF;
   bool magValid = false, magCalValid = false;
   float magHeadingDeg = 0.0f, magFieldUt = 0.0f;   // ACTIVE source heading/field
+  float magHeadingTrimDeg = 0.0f;                   // saved user correction
+  float magDeclinationDeg = 0.0f;                   // compiled magnetic declination
   // External MMC5603 magnetometer + active-source selection.
   bool extMagCompiled = false;       // FCU_ENABLE_EXTERNAL_MAG
   bool extMagConnected = false;      // producing fresh I2C samples
   bool extMagValid = false;          // passed the field-range gate
   bool extMagCalValid = false;       // a saved external cal is applied
   float extMagHeadingDeg = 0.0f, extMagFieldUt = 0.0f;
+  float extMagVecUt[3] = {0, 0, 0};  // corrected body-frame X/Y/Z (forward/right/down)
   uint8_t extMagRejectReason = 0;    // EXTMAG_REJECT_* (why ext mag is ignored)
   uint8_t activeMagSource = 0;       // MAG_SOURCE_* (none/onboard/external)
   float magYawCorrGain = 0.0f;       // 0 = shadow (mag has no yaw authority)
@@ -352,6 +358,10 @@ struct Callbacks {
   bool (*setMixPitchFrontBias)(float value) = nullptr;
   // Persist current live bias to NVS. Returns true on success.
   bool (*saveMixPitchFrontBiasToNvs)() = nullptr;
+  // ---- Per-motor thrust trims (M1..M4, bounded to [0.90, 1.10]) ------------
+  void (*getMotorThrustTrims)(float out[4]) = nullptr;
+  bool (*setMotorThrustTrims)(const float values[4]) = nullptr;
+  bool (*saveMotorThrustTrimsToNvs)() = nullptr;
   bool (*setFailsafeBypass)(bool bypass) = nullptr;
   bool (*saveFailsafeBypassToNvs)() = nullptr;
   // Fill out live telemetry.

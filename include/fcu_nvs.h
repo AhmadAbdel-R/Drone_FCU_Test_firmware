@@ -140,6 +140,41 @@ class FcuPidNvs {
     return prefs_.putShort("mix_pfb", milli) > 0;
   }
 
+  // Per-motor thrust-span trims. A value of 1.000 leaves the mixer unchanged;
+  // the flight mixer applies the gain only to command above the armed floor.
+  // Keep the range narrow: these are last-mile motor/airframe compensation,
+  // not a replacement for level calibration, motor ordering, or PID tuning.
+  void loadMotorThrustTrims(float out[4], float defaultValue = 1.0f) {
+    static constexpr const char* kKeys[4] = {"mtr1", "mtr2", "mtr3", "mtr4"};
+    if (!out) return;
+    for (uint8_t i = 0; i < 4; ++i) {
+      float v = defaultValue;
+      if (ready_) {
+        const int16_t defMilli = static_cast<int16_t>(defaultValue * 1000.0f + 0.5f);
+        const int16_t milli = prefs_.getShort(kKeys[i], defMilli);
+        v = static_cast<float>(milli) / 1000.0f;
+      }
+      out[i] = (isfinite(v) && v >= 0.90f && v <= 1.10f) ? v : defaultValue;
+    }
+  }
+
+  bool saveMotorThrustTrims(const float values[4]) {
+    static constexpr const char* kKeys[4] = {"mtr1", "mtr2", "mtr3", "mtr4"};
+    if (!ready_ || !values) return false;
+    for (uint8_t i = 0; i < 4; ++i) {
+      if (!(isfinite(values[i]) && values[i] >= 0.90f && values[i] <= 1.10f)) {
+        return false;
+      }
+    }
+    bool ok = true;
+    for (uint8_t i = 0; i < 4; ++i) {
+      const int16_t milli = static_cast<int16_t>(values[i] * 1000.0f + 0.5f);
+      ok = (prefs_.putShort(kKeys[i], milli) > 0) && ok;
+      ok = (prefs_.getShort(kKeys[i], INT16_MIN) == milli) && ok;
+    }
+    return ok;
+  }
+
   // ---- Magnetometer heading trim (degrees) ---------------------------------
   // Constant offset ADDED to the computed compass heading (after declination)
   // to zero out the small residual that remains after a good hard-iron cal.
@@ -165,23 +200,6 @@ class FcuPidNvs {
   bool saveFailsafeBypass(bool bypass) {
     if (!ready_) return false;
     return prefs_.putUChar("fsByp", bypass ? 1 : 0) > 0;
-  }
-
-  // ---- BLE configurator boot gate ------------------------------------------
-  // BLE remains compile-gated by ENABLE_BLE_CONFIG. This key only remembers
-  // whether the BLE configurator should be requested on boot when compiled in.
-  bool loadBleBootEnabled(bool defaultEnabled) const {
-    if (!ready_) return defaultEnabled;
-    return const_cast<Preferences&>(prefs_).getUChar("bleBoot", defaultEnabled ? 1 : 0) != 0;
-  }
-
-  bool hasBleBootEnabled() const {
-    return ready_ && const_cast<Preferences&>(prefs_).isKey("bleBoot");
-  }
-
-  bool saveBleBootEnabled(bool enabled) {
-    if (!ready_) return false;
-    return prefs_.putUChar("bleBoot", enabled ? 1 : 0) > 0;
   }
 
   // ---- Autonomy-controller gain persistence --------------------------------
@@ -457,7 +475,7 @@ class FcuPidNvs {
   // the operator raises the gain from the web UI after bench validation.
   struct MagConfig {
     bool extEnabled = true;
-    bool onboardEnabled = true;
+    bool onboardEnabled = false;
     bool preferExternal = true;
     float yawCorrGain = 0.0f;   // [0,1]; multiplies the slow complementary pull
   };

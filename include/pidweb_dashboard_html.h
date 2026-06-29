@@ -145,13 +145,48 @@ canvas{display:block;width:100%;background:#0a0d12;border-radius:8px;border:1px 
  <!-- ===== OVERVIEW ===== -->
  <section class="tab active" id="t_overview">
   <div class="grid wide">
-   <div class="card span2"><h3>Attitude <span class="small dim" id="ov_attmode">solid=corrected &middot; ghost=raw &middot; wire=target</span></h3>
-    <canvas id="drone3d" height="300"></canvas>
+   <div class="card span2"><h3>Attitude <span class="tag" id="ov_leveltag">--</span> <span class="small dim" id="ov_attmode">solid=corrected &middot; ghost=raw &middot; wire=target</span></h3>
+    <canvas id="drone3d" height="350"></canvas>
+    <div class="btns" style="margin-top:8px;align-items:center">
+     <button class="btn sm pri" id="view_iso" onclick="setAttView('iso')">Pilot 3D</button>
+     <button class="btn sm" id="view_top" onclick="setAttView('top')">Top</button>
+     <button class="btn sm" id="view_front" onclick="setAttView('front')">Front</button>
+     <button class="btn sm" id="view_right" onclick="setAttView('right')">Right</button>
+     <button class="btn sm" onclick="resetYawDriftRef()">Zero yaw drift</button>
+     <span class="small dim" id="ov_viewnote">world grid is fixed; aircraft moves</span>
+    </div>
     <div class="statgrid" style="margin-top:10px">
      <div class="stat"><div class="l">Roll (corr)</div><div class="n" id="ov_roll">--</div></div>
      <div class="stat"><div class="l">Pitch (corr)</div><div class="n" id="ov_pitch">--</div></div>
-     <div class="stat"><div class="l">Yaw</div><div class="n" id="ov_yaw">--</div></div>
+     <div class="stat"><div class="l">Gyro yaw</div><div class="n" id="ov_yaw">--</div></div>
+     <div class="stat"><div class="l">Mag heading</div><div class="n" id="ov_magyaw">--</div></div>
+     <div class="stat"><div class="l">Yaw drift / ref</div><div class="n" id="ov_drift">--</div></div>
      <div class="stat"><div class="l">Throttle</div><div class="n" id="ov_thr">--</div></div>
+    </div>
+   </div>
+   <div class="card"><h3>Heading <span class="small dim">external mag</span></h3>
+    <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+     <svg width="132" height="132" viewBox="0 0 160 160">
+      <circle id="ov_ring" cx="80" cy="80" r="72" fill="none" stroke="#5d6678" stroke-width="6"></circle>
+      <g fill="#8a94a6" font-size="12" text-anchor="middle">
+       <text x="80" y="20">N</text><text x="80" y="151">S</text><text x="149" y="84">E</text><text x="11" y="84">W</text>
+      </g>
+      <g id="ov_needle" style="transform-box:fill-box;transform-origin:center;transition:transform .12s linear,opacity .2s">
+       <polygon points="80,18 87,84 80,98 73,84" fill="#ff5252"></polygon>
+       <polygon points="80,142 87,84 80,70 73,84" fill="#8a94a6"></polygon>
+      </g>
+      <circle cx="80" cy="80" r="4" fill="#e7ebf2"></circle>
+     </svg>
+     <div style="min-width:120px">
+      <div id="ov_hdg" style="font-size:24px">--&deg;</div>
+      <div id="ov_hdgcard" class="dim small">no fix</div>
+      <div class="dim small" style="margin-top:8px">Field (µT)</div>
+      <div style="height:10px;border-radius:6px;background:#0b0e13;overflow:hidden;margin-top:2px">
+       <div id="ov_fieldbar" style="height:100%;width:0;background:#33d17a;transition:width .2s,background .2s"></div>
+      </div>
+      <div id="ov_field" class="dim small">-- µT</div>
+      <div id="ov_magxyz" class="mono small" style="margin-top:7px;line-height:1.5">X --<br>Y --<br>Z --</div>
+     </div>
     </div>
    </div>
    <div class="card"><h3>System health</h3><div id="ov_health"></div></div>
@@ -210,6 +245,17 @@ canvas{display:block;width:100%;background:#0a0d12;border-radius:8px;border:1px 
 
  <!-- ===== PID TUNING ===== -->
  <section class="tab" id="t_pid">
+  <div class="card span2" id="yawcard" style="margin-bottom:12px">
+   <h3>Yaw &amp; Heading stability <span class="tag" id="yh_status">--</span></h3>
+   <div class="note">Everything that locks your heading, in one place. Heading-hold engages only when all four gates are green <b>and</b> the yaw stick is centered. Edits apply live while disarmed; press Save to persist to NVS.</div>
+   <div class="statgrid" id="yh_gates" style="margin:8px 0"></div>
+   <div id="yawknobs"></div>
+   <div class="btns" style="margin-top:8px">
+    <button class="btn pri" onclick="saveYaw()">Save yaw tuning &rarr; NVS</button>
+    <button class="btn" onclick="loadPid();loadMagGainCard()">Reload</button>
+   </div>
+   <div class="note">Rate Yaw P/I = how hard it resists rotation (the foundation). Angle Yaw P = how firmly it returns to the locked heading. Mag gain = slow compass drift-correction (0 = gyro only). If the compass-cal gate is red, run the mag calibration first.</div>
+  </div>
   <div class="grid wide" id="pidgroups"></div>
   <div class="card" style="margin-top:12px"><h3>Apply / persist</h3>
    <div class="btns">
@@ -239,9 +285,21 @@ canvas{display:block;width:100%;background:#0a0d12;border-radius:8px;border:1px 
    <div class="card"><h3>Layout (top-down)</h3><canvas id="mix_canvas" height="320"></canvas>
     <div class="note">M1 FR (CW) &middot; M2 RR (CCW) &middot; M3 FL (CCW) &middot; M4 RL (CW). Ring fill = output above idle.</div></div>
    <div class="card span2"><h3>Mixer contributions</h3>
-    <table><thead><tr><th>Motor</th><th>Base</th><th>Roll</th><th>Pitch</th><th>Yaw</th><th>Unclamped</th><th>DShot</th></tr></thead>
+    <table><thead><tr><th>Motor</th><th>Base</th><th>Roll</th><th>Pitch</th><th>Yaw</th><th>Trim</th><th>Unclamped</th><th>DShot</th></tr></thead>
      <tbody id="mix_tbody"></tbody></table>
     <div id="mix_expl" class="warnbox ok" style="margin-top:10px">--</div>
+   </div>
+   <div class="card span2"><h3>Per-motor thrust trim <span class="tag warn">advanced</span></h3>
+    <div class="note">Multiplicative gain on each motor's command <b>above idle</b>. Range 0.900–1.100; 1.000 is off. Armed-idle remains equal. Use only after motor order/direction and level calibration are correct.</div>
+    <div class="grid" style="margin-top:10px">
+     <div class="row"><label>M1 front-right</label><input id="mix_trim_0" type="number" min="0.9" max="1.1" step="0.005" oninput="motorTrimEdit(0,this.value)"><div class="v" id="mix_trim_now_0">--</div></div>
+     <div class="row"><label>M2 rear-right</label><input id="mix_trim_1" type="number" min="0.9" max="1.1" step="0.005" oninput="motorTrimEdit(1,this.value)"><div class="v" id="mix_trim_now_1">--</div></div>
+     <div class="row"><label>M3 front-left</label><input id="mix_trim_2" type="number" min="0.9" max="1.1" step="0.005" oninput="motorTrimEdit(2,this.value)"><div class="v" id="mix_trim_now_2">--</div></div>
+     <div class="row"><label>M4 rear-left</label><input id="mix_trim_3" type="number" min="0.9" max="1.1" step="0.005" oninput="motorTrimEdit(3,this.value)"><div class="v" id="mix_trim_now_3">--</div></div>
+    </div>
+    <div class="btns"><button class="btn" onclick="applyMotorTrims()">Apply (RAM)</button><button class="btn pri" onclick="saveMotorTrims()">Save NVS</button><button class="btn danger" onclick="resetMotorTrims()">Reset 1.000</button></div>
+    <div id="mix_trim_status" class="note">Right-hand values are the live values confirmed by the FCU.</div>
+    <div class="note">Change one side by 0.010–0.020 at a time. Values beyond ±5% indicate a mechanical, CG, prop, ESC, or calibration problem that should be fixed physically.</div>
    </div>
   </div>
  </section>
@@ -370,12 +428,12 @@ canvas{display:block;width:100%;background:#0a0d12;border-radius:8px;border:1px 
     <div id="cfg_accel"></div>
     <div class="btns" style="margin-top:8px"><button class="btn" onclick="act('/api/imu/calibrate','Gyro bias calibration requested')">Calibrate gyro bias</button><button class="btn" onclick="act('/api/accel/save','Accel offset saved')">Save accel offset</button><button class="btn danger" onclick="act('/api/accel/clear','Accel offset cleared')">Clear accel offset</button></div>
    </div>
-   <div class="card"><h3>Magnetometer calibration</h3>
-    <div class="note">Capture hard-iron and coarse scale from a full all-axis rotation. Stored in NVS when finished.</div>
+   <div class="card"><h3>External magnetometer calibration</h3>
+    <div class="note">Capture hard-iron and coarse scale for the I2C MMC5603 from a full all-axis rotation. Stored in NVS when finished.</div>
     <div class="btns" style="margin-top:8px"><button class="btn" onclick="act('/api/mag/start','Mag capture started')">Start mag capture</button><button class="btn pri" onclick="act('/api/mag/finish','Mag calibration saved')">Finish &amp; save</button></div>
    </div>
    <div class="card"><h3>Compass &amp; heading trim</h3>
-    <div class="note">Live heading. Trim corrects the small residual after a good mag cal (and applies declination). <b>Save</b> persists to NVS; writes need disarmed.</div>
+    <div class="note">Live heading from the <b>external</b> magnetometer (the onboard IMU mag is never used for heading/yaw). Trim corrects the small residual after a good mag cal (and applies declination). <b>Save</b> persists to NVS; writes need disarmed.</div>
     <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-top:6px">
      <svg id="mag_dial" width="160" height="160" viewBox="0 0 160 160">
       <circle id="mag_ring" cx="80" cy="80" r="72" fill="none" stroke="#5d6678" stroke-width="6"></circle>
@@ -403,7 +461,19 @@ canvas{display:block;width:100%;background:#0a0d12;border-radius:8px;border:1px 
      <input type="range" id="mag_trim" min="-360" max="360" step="1" value="0" style="flex:1" oninput="document.getElementById('mag_trimn').value=this.value">
      <input type="number" id="mag_trimn" min="-360" max="360" step="1" value="0" style="width:64px" oninput="document.getElementById('mag_trim').value=this.value">
     </div>
-    <div class="btns" style="margin-top:8px"><button class="btn pri" onclick="saveMagTrim()">Save trim NVS</button><button class="btn" onclick="act('/api/calibrate?mag=1','Spin craft on all axes for 30 s...')">Start mag cal</button></div>
+    <div class="btns" style="margin-top:8px"><button class="btn pri" onclick="saveMagTrim()">Save trim NVS</button><button class="btn danger" onclick="resetMagTrim()">Reset trim to 0&deg;</button><button class="btn" onclick="act('/api/calibrate?mag=1','Spin craft on all axes for 30 s...')">Start mag cal</button></div>
+   </div>
+   <div class="card"><h3>External-mag yaw correction</h3>
+    <div class="note">Corrects long-term <b>yaw estimate drift</b> using the MMC5603. The gyro remains the fast yaw-rate PID sensor. Heading hold activates only when external-mag calibration is valid, correction gain is above zero, Angle Yaw P is above zero, and the yaw stick is centered.</div>
+    <div id="cfg_magfusion" style="margin:8px 0"></div>
+    <div class="row"><label>Correction gain</label><input type="range" id="mag_gain" min="0" max="1" step="0.05" value="0" oninput="document.getElementById('mag_gainn').value=this.value"><input type="number" id="mag_gainn" min="0" max="1" step="0.05" value="0" style="width:70px" oninput="document.getElementById('mag_gain').value=this.value"></div>
+    <div class="btns" style="margin-top:8px">
+     <button class="btn" onclick="setMagGain(0)">Shadow 0.00</button>
+     <button class="btn" onclick="setMagGain(0.10)">Low 0.10</button>
+     <button class="btn" onclick="setMagGain(0.25)">Medium 0.25</button>
+     <button class="btn" onclick="applyMagGain()">Apply (RAM)</button>
+     <button class="btn pri" onclick="saveMagGain()">Save NVS</button>
+    </div>
    </div>
    <div class="card"><h3>Failsafes</h3>
     <div id="cfg_failsafe"></div>
@@ -483,6 +553,7 @@ setInterval(async()=>{if(Date.now()-lastMsgT>1500){try{const r=await fetch('/api
 )DASH"
 R"DASH(
 // ---------- warnings engine ----------
+let accelOffSince=0;
 function computeWarnings(m){
  const w=[];const st=m.sys,a=m.att,im=m.imu,lv=m.lvl,pid=m.pid,sen=m.sen,rc=m.rc;
  const stationary=!st.armed && st.thr===0;
@@ -491,12 +562,20 @@ function computeWarnings(m){
  if(rc.comp && rc.up && rc.lq<50 && rc.lq>0)w.push(['warn','Low RC link quality: '+rc.lq+'%']);
  if(rc.comp && rc.fs)w.push(['warn','Receiver reports failsafe (LQ 0)']);
  if(st.loop>0 && st.loop<400)w.push(['warn','Loop rate low: '+st.loop+' Hz']);
- if(st.ovr>0)w.push(['warn','Flight loop overruns: '+st.ovr]);
+ if(st.loop>0 && st.loop<400 && st.ovr>0)w.push(['warn','Flight loop overruns since boot: '+st.ovr]);
  if(!im.rdy)w.push(['err','IMU not ready']);
- if(im.rdy && (im.am<0.85||im.am>1.15))w.push(['warn','Accel magnitude off: '+f(im.am,3)+' g']);
+ const accelOff=im.rdy&&(im.am<0.85||im.am>1.15);
+ const gyroQuiet=im.rdy&&Math.max(Math.abs(im.g[0]),Math.abs(im.g[1]),Math.abs(im.g[2]))<3;
+ if(!st.armed&&gyroQuiet&&accelOff){
+  if(!accelOffSince)accelOffSince=Date.now();
+  if(Date.now()-accelOffSince>750)w.push(['warn','Accel magnitude persistently off while stationary: '+f(im.am,3)+' g']);
+ }else accelOffSince=0;
  if(im.gbv){const gb=Math.max(Math.abs(im.gb[0]),Math.abs(im.gb[1]),Math.abs(im.gb[2]));
   if(gb>5)w.push(['warn','Large gyro bias: '+f(gb,2)+' °/s']);}
  if(!lv.ld)w.push(['warn','No saved level calibration loaded — run Calibrate Level']);
+ if(st.armed&&!a.at)w.push(['warn','Accel correction temporarily gated by flight acceleration/vibration']);
+ if(Math.abs(pid.r[1])>100)w.push(['err','Roll integrator wound up: I='+f(pid.r[1],1)+' - disarm to reset']);
+ if(Math.abs(pid.p[1])>100)w.push(['err','Pitch integrator wound up: I='+f(pid.p[1],1)+' - disarm to reset']);
  if(stationary && (Math.abs(a.cr)>2||Math.abs(a.cp)>2))
   w.push(['err','Corrected attitude not level while still: roll '+f(a.cr,1)+'° pitch '+f(a.cp,1)+'° — calibrate level']);
  // motor spread before throttle
@@ -504,9 +583,13 @@ function computeWarnings(m){
   if(sp>4 && Math.max(...mm)>0)w.push(['warn','Motors unequal at zero throttle (spread '+sp+')']);}
  if(pid.smax)w.push(['warn','Mixer upper saturation']);
  if(pid.ssc)w.push(['warn','Mixer correction scaled (severe)']);
+ if(m.mix.trim&&m.mix.trim.some(v=>Math.abs(v-1)>0.0501))w.push(['warn','Motor thrust trim exceeds 5% — inspect mechanics/CG']);
  if(sen.baro.r&&sen.baro.age>2000)w.push(['warn','Baro stale ('+ageTxt(sen.baro.age)+')']);
  if(sen.gps.comp&&sen.gps.r&&!sen.gps.fix)w.push(['warn','GPS connected, no fix']);
  if(sen.tof.comp&&sen.tof.r&&sen.tof.age>1500)w.push(['warn','ToF stale']);
+ if(sen.mag&&sen.mag.gain>0&&sen.mag.v!==1)w.push(['warn','External-mag yaw correction enabled but compass is invalid']);
+ if(sen.mag&&sen.mag.ext&&sen.mag.ext.v===1&&!sen.mag.ext.cal)w.push(['warn','External magnetometer is not calibrated — compass will not match reliably']);
+ if(sen.mag&&Math.abs(+sen.mag.trim||0)>45)w.push(['err','Large saved compass trim: '+f(sen.mag.trim,1)+'° — reset trim and calibrate the external mag']);
  if(st.blow)w.push(['warn','Battery low: '+f(st.bv,2)+' V']);
  if(st.fsb)w.push(['err','Failsafe bypass is active']);
  return w;
@@ -531,10 +614,11 @@ function render(m){
  // overview
  document.getElementById('ov_roll').textContent=f(m.att.cr,1)+'°';
  document.getElementById('ov_pitch').textContent=f(m.att.cp,1)+'°';
- document.getElementById('ov_yaw').textContent=f(m.att.ry,1)+'°';
+ document.getElementById('ov_yaw').textContent=f(m.att.ry,1)+'°'+(m.att.yh?' HOLD':'');
+ updateYawDrift(m);
  document.getElementById('ov_thr').textContent=st.thr+'%';
  renderHealth(m);renderWarn(warns);renderOvRc(m);renderOvServo(m);
- drawDrone(m);drawMix(document.getElementById('ov_mix'),m,true);
+ setDroneTarget(m.att,m.sen&&m.sen.mag);renderOvHeading(m);drawMix(document.getElementById('ov_mix'),m,true);
  // active tab content
  if(activeTab==='attitude')renderAttitude(m);
  else if(activeTab==='diag')renderDiag(m);
@@ -559,74 +643,159 @@ function renderOvRc(m){const rc=m.rc,el=document.getElementById('ov_rc');
 function renderOvServo(m){const s=m.srv,el=document.getElementById('ov_servo');
  if(!s.att){el.innerHTML='<div class="dim small">Pan/tilt not attached.</div>';return;}
  el.innerHTML=kv('Pan',s.pan+' µs')+kv('Tilt',s.tilt+' µs');}
+// overview compass — external mag heading (mirrors the Config-tab dial; the
+// onboard IMU mag is never selected, see firmware selectActiveMagSource).
+let ovMagAcc=0;
+function renderOvHeading(m){
+ const g=m.sen&&m.sen.mag;if(!g)return;
+ const e=g.ext||{},ok=g.v===1&&g.src===2,hdg=+(e.hdg??g.hdg)||0,fld=+(e.f??g.f)||0,c=magColour(fld);
+ const xyz=Array.isArray(e.xyz)?e.xyz:[0,0,0];
+ ovMagAcc+=((hdg-ovMagAcc)%360+540)%360-180;
+ const nd=document.getElementById('ov_needle');if(nd){nd.style.transform='rotate('+ovMagAcc+'deg)';nd.style.opacity=ok?'1':'0.22';}
+ const ht=document.getElementById('ov_hdg');if(ht)ht.textContent=ok?hdg.toFixed(0)+'° '+compassPoint(hdg):'--°';
+ const ms=document.getElementById('ov_hdgcard');if(ms){ms.textContent=ok?'external · valid':('external · '+magRejectName(e.rej));ms.style.color=ok?'':'#ffb020';}
+ const rg=document.getElementById('ov_ring');if(rg)rg.setAttribute('stroke',ok?c:'#5d6678');
+ const bar=document.getElementById('ov_fieldbar');if(bar){bar.style.width=Math.max(0,Math.min(100,fld/120*100))+'%';bar.style.background=c;}
+ const ft=document.getElementById('ov_field');if(ft)ft.textContent=f(fld,1)+' µT';
+ const xt=document.getElementById('ov_magxyz');if(xt)xt.innerHTML=
+  '<span style="color:#ff5252">X/FWD '+f(xyz[0],1)+'</span><br><span style="color:#33d17a">Y/RIGHT '+f(xyz[1],1)+'</span><br><span style="color:#3fa9ff">Z/DOWN '+f(xyz[2],1)+'</span>';
+}
 )DASH"
 R"DASH(
-// ---------- 3D drone (hand-rolled canvas) ----------
-// Body frame FRD: x=forward, y=right, z=down. Euler: +roll=right-wing-down,
-// +pitch=nose-up, +yaw=nose-right (firmware convention). We rotate model points
-// body->world (NED), convert to a graphics frame (x=right,y=up,z=fwd), apply a
-// fixed 3/4 camera, and project orthographically.
-let show={solid:true,ghost:true,wire:true};
+// ---------- 3D attitude viewer ----------
+// Fixed world frame: N/E horizontal, D down. The grid and cyan level ring never
+// rotate; only the aircraft does. This makes a level error visually obvious.
+let show={solid:true,ghost:true,wire:true},ATT_VIEW='iso';
+let yawDriftRef=null,yawDriftNow=null,lastMagHeading=null,lastYawHeading=null;
+let _tiltTrail=[],_trailMs=0;
 function matMul(a,b){const r=[0,0,0,0,0,0,0,0,0];for(let i=0;i<3;i++)for(let j=0;j<3;j++){let s=0;
  for(let k=0;k<3;k++)s+=a[i*3+k]*b[k*3+j];r[i*3+j]=s;}return r;}
 function mv(a,v){return [a[0]*v[0]+a[1]*v[1]+a[2]*v[2],a[3]*v[0]+a[4]*v[1]+a[5]*v[2],a[6]*v[0]+a[7]*v[1]+a[8]*v[2]];}
+function add3(a,b){return [a[0]+b[0],a[1]+b[1],a[2]+b[2]];}
 function Rx(t){const c=Math.cos(t),s=Math.sin(t);return [1,0,0,0,c,-s,0,s,c];}
 function Ry(t){const c=Math.cos(t),s=Math.sin(t);return [c,0,s,0,1,0,-s,0,c];}
 function Rz(t){const c=Math.cos(t),s=Math.sin(t);return [c,-s,0,s,c,0,0,0,1];}
-const D2R=Math.PI/180;
-// fixed camera: look from front-above-right
-const CAM=matMul(Rx(-62*D2R),Ry(28*D2R));
-// body->NED, 3-2-1 (yaw·pitch·roll). Verified per-axis: +roll right-wing-down,
-// +pitch nose-up, +yaw nose-right all map to the visually-correct screen motion.
+const D2R=Math.PI/180,CAM_ISO=matMul(Rx(-62*D2R),Ry(28*D2R)),MODEL_O=[0,0,-0.62];
+function wrap180d(v){return ((v+180)%360+360)%360-180;}
 function attMat(roll,pitch,yaw){return matMul(Rz(yaw*D2R),matMul(Ry(pitch*D2R),Rx(roll*D2R)));}
+function setAttView(v){
+ ATT_VIEW=v;
+ ['iso','top','front','right'].forEach(x=>{const b=document.getElementById('view_'+x);if(b)b.classList.toggle('pri',x===v);});
+ const notes={iso:'fixed world grid · chase/isometric camera',top:'top view · yaw and north/east',front:'front view · roll against horizon',right:'right view · pitch against horizon'};
+ const n=document.getElementById('ov_viewnote');if(n)n.textContent=notes[v]||'';
+ if(_attDisp)drawDrone({att:_attDisp});
+}
 function proj(p,cx,cy,sc){
- // p in NED (x=N,y=E,z=D). graphics: gx=E=y, gy=-D=-z(up), gz=N=x
- const g=[p[1],-p[2],p[0]];const c=mv(CAM,g);
- return [cx+c[0]*sc, cy-c[1]*sc, c[2]];
+ if(ATT_VIEW==='top')return [cx+p[1]*sc,cy-p[0]*sc,-p[2]];
+ if(ATT_VIEW==='front')return [cx+p[1]*sc,cy+p[2]*sc,p[0]];
+ if(ATT_VIEW==='right')return [cx+p[0]*sc,cy+p[2]*sc,-p[1]];
+ const g=[p[1],-p[2],p[0]],c=mv(CAM_ISO,g);return [cx+c[0]*sc,cy-c[1]*sc,c[2]];
 }
-function droneModel(){
- // arms to motors (FRD): FR(+x,+y) FL(+x,-y) RR(-x,+y) RL(-x,-y)
- const L=1.0;const m={
-  M1:[ L, L,0],M3:[ L,-L,0],M2:[-L, L,0],M4:[-L,-L,0]
- };return m;
+function bodyWorld(R,v){return add3(MODEL_O,mv(R,v));}
+function canvasCtx(cv){
+ const W=Math.max(320,cv.clientWidth|0),H=+(cv.getAttribute('height')||350),d=Math.min(window.devicePixelRatio||1,2);
+ if(cv.width!==Math.round(W*d)||cv.height!==Math.round(H*d)){cv.width=Math.round(W*d);cv.height=Math.round(H*d);}
+ const ctx=cv.getContext('2d');ctx.setTransform(d,0,0,d,0,0);ctx.clearRect(0,0,W,H);return {ctx,W,H};
 }
+function path3(ctx,pts,cx,cy,sc,close){
+ if(!pts.length)return;const a=proj(pts[0],cx,cy,sc);ctx.beginPath();ctx.moveTo(a[0],a[1]);
+ for(let i=1;i<pts.length;i++){const p=proj(pts[i],cx,cy,sc);ctx.lineTo(p[0],p[1]);}if(close)ctx.closePath();
+}
+function circle3(ctx,center,r,R,cx,cy,sc){
+ const q=[];for(let i=0;i<=40;i++){const t=i/40*Math.PI*2,local=[center[0]+Math.cos(t)*r,center[1]+Math.sin(t)*r,center[2]];
+  q.push(R?bodyWorld(R,local):add3(MODEL_O,local));}path3(ctx,q,cx,cy,sc,false);
+}
+function drawWorld(ctx,cx,cy,sc,tilt){
+ // Ground plane below the model.
+ const z=.68,s=3.2,step=.8,corners=[[-s,-s,z],[s,-s,z],[s,s,z],[-s,s,z]];
+ path3(ctx,corners,cx,cy,sc,true);ctx.fillStyle='#0c1620';ctx.fill();ctx.strokeStyle='#1c3344';ctx.lineWidth=1;ctx.stroke();
+ ctx.strokeStyle='#173044';ctx.lineWidth=.8;
+ for(let v=-s;v<=s+.01;v+=step){path3(ctx,[[-s,v,z],[s,v,z]],cx,cy,sc);ctx.stroke();path3(ctx,[[v,-s,z],[v,s,z]],cx,cy,sc);ctx.stroke();}
+ // World-level reference ring through the aircraft centre.
+ const ring=[];for(let i=0;i<=64;i++){const t=i/64*Math.PI*2;ring.push([MODEL_O[0]+Math.cos(t)*1.72,MODEL_O[1]+Math.sin(t)*1.72,MODEL_O[2]]);}
+ path3(ctx,ring,cx,cy,sc);ctx.setLineDash([6,4]);ctx.strokeStyle=tilt<.5?'#33d17a':(tilt<2?'#ffb020':'#ff5252');ctx.lineWidth=1.6;ctx.stroke();ctx.setLineDash([]);
+ const axes=[[[0,0,z],[2.8,0,z],'#66d9ef','N'],[[0,0,z],[0,2.8,z],'#ffd166','E']];
+ ctx.font='bold 11px sans-serif';
+ for(const[a,b,col,n]of axes){path3(ctx,[a,b],cx,cy,sc);ctx.strokeStyle=col;ctx.lineWidth=2;ctx.stroke();const p=proj(b,cx,cy,sc);ctx.fillStyle=col;ctx.fillText(n,p[0]+4,p[1]-3);}
+}
+function droneModel(){const L=1.0;return {M1:[L,L,0],M3:[L,-L,0],M2:[-L,L,0],M4:[-L,-L,0]};}
 function drawFrame(ctx,R,cx,cy,sc,style){
- const m=droneModel();const motors=[['M1',m.M1,'#ff5252'],['M2',m.M2,'#ffb020'],['M3',m.M3,'#33d17a'],['M4',m.M4,'#3fa9ff']];
- // arms from center
+ const m=droneModel(),motors=[['M1',m.M1,'#ff5252'],['M2',m.M2,'#ffb020'],['M3',m.M3,'#33d17a'],['M4',m.M4,'#3fa9ff']];
+ const bc=proj(bodyWorld(R,[0,0,0]),cx,cy,sc);
  ctx.lineWidth=style.lw;ctx.strokeStyle=style.arm;
- for(const[,pos]of motors){const a=proj(mv(R,[0,0,0]),cx,cy,sc);const b=proj(mv(R,pos),cx,cy,sc);
-  ctx.beginPath();ctx.moveTo(a[0],a[1]);ctx.lineTo(b[0],b[1]);ctx.stroke();}
- // body
- const bc=proj(mv(R,[0,0,0]),cx,cy,sc);
- ctx.fillStyle=style.body;ctx.beginPath();ctx.arc(bc[0],bc[1],sc*0.22,0,7);ctx.fill();
- // front marker (nose +x)
- const nose=proj(mv(R,[1.5,0,0]),cx,cy,sc);
- ctx.strokeStyle=style.nose;ctx.lineWidth=style.lw+1;ctx.beginPath();ctx.moveTo(bc[0],bc[1]);ctx.lineTo(nose[0],nose[1]);ctx.stroke();
- // motors + prop discs + labels
- for(const[name,pos,col]of motors){const p=proj(mv(R,pos),cx,cy,sc);
-  ctx.strokeStyle=style.solid?col:style.arm;ctx.lineWidth=style.lw;
-  ctx.beginPath();ctx.arc(p[0],p[1],sc*0.42,0,7);ctx.stroke();
-  if(style.solid){ctx.fillStyle=col+'22';ctx.fill();ctx.fillStyle=col;ctx.font='bold 11px sans-serif';ctx.fillText(name,p[0]-7,p[1]+4);}
- }
+ for(const[,pos]of motors){const p=proj(bodyWorld(R,pos),cx,cy,sc);ctx.beginPath();ctx.moveTo(bc[0],bc[1]);ctx.lineTo(p[0],p[1]);ctx.stroke();}
+ // Directional body plate: pointed nose makes yaw readable without relying on axes.
+ const plate=[[.70,0,0],[.05,.38,0],[-.48,.30,0],[-.48,-.30,0],[.05,-.38,0]].map(v=>bodyWorld(R,v));
+ path3(ctx,plate,cx,cy,sc,true);ctx.fillStyle=style.body;ctx.fill();ctx.strokeStyle=style.nose;ctx.lineWidth=style.lw;ctx.stroke();
+ for(const[name,pos,col]of motors){circle3(ctx,pos,.40,R,cx,cy,sc);ctx.strokeStyle=style.solid?col:style.arm;ctx.lineWidth=style.lw;ctx.stroke();
+  if(style.solid){const p=proj(bodyWorld(R,pos),cx,cy,sc);ctx.fillStyle=col;ctx.font='bold 11px sans-serif';ctx.fillText(name,p[0]-7,p[1]+4);}}
 }
 function drawAxes(ctx,R,cx,cy,sc){
- const o=proj(mv(R,[0,0,0]),cx,cy,sc);
- const ax=[[[2.2,0,0],'#ff5252','X'],[[0,2.2,0],'#33d17a','Y'],[[0,0,1.6],'#3fa9ff','Z']];
- ctx.font='10px sans-serif';
- for(const[v,c,n]of ax){const p=proj(mv(R,v),cx,cy,sc);
-  ctx.strokeStyle=c;ctx.lineWidth=1.5;ctx.beginPath();ctx.moveTo(o[0],o[1]);ctx.lineTo(p[0],p[1]);ctx.stroke();
-  ctx.fillStyle=c;ctx.fillText(n,p[0]+2,p[1]);}
+ const o=proj(bodyWorld(R,[0,0,0]),cx,cy,sc),ax=[[[1.85,0,0],'#ff5252','FWD'],[[0,1.85,0],'#33d17a','RIGHT'],[[0,0,1.35],'#3fa9ff','DOWN']];
+ ctx.font='bold 10px sans-serif';
+ for(const[v,c,n]of ax){const p=proj(bodyWorld(R,v),cx,cy,sc);ctx.strokeStyle=c;ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(o[0],o[1]);ctx.lineTo(p[0],p[1]);ctx.stroke();ctx.fillStyle=c;ctx.fillText(n,p[0]+4,p[1]-2);}
+}
+function drawArrow2(ctx,a,b,col,label,dashed){
+ ctx.save();ctx.strokeStyle=col;ctx.fillStyle=col;ctx.lineWidth=2.5;if(dashed)ctx.setLineDash([5,4]);
+ ctx.beginPath();ctx.moveTo(a[0],a[1]);ctx.lineTo(b[0],b[1]);ctx.stroke();ctx.setLineDash([]);
+ const ang=Math.atan2(b[1]-a[1],b[0]-a[0]),sz=8;ctx.beginPath();ctx.moveTo(b[0],b[1]);
+ ctx.lineTo(b[0]-sz*Math.cos(ang-.45),b[1]-sz*Math.sin(ang-.45));ctx.lineTo(b[0]-sz*Math.cos(ang+.45),b[1]-sz*Math.sin(ang+.45));ctx.closePath();ctx.fill();
+ if(label){ctx.font='bold 10px sans-serif';ctx.fillText(label,b[0]+5,b[1]-5);}ctx.restore();
+}
+function drawMagVector(ctx,R,mag,cx,cy,sc){
+ if(!mag||!mag.valid||!Array.isArray(mag.xyz))return;
+ const v=mag.xyz.map(Number),norm=Math.hypot(v[0],v[1],v[2]);if(!(norm>1))return;
+ const unit=[v[0]/norm,v[1]/norm,v[2]/norm],world=mv(R,unit),o3=MODEL_O,end3=add3(o3,[world[0]*2.05,world[1]*2.05,world[2]*2.05]);
+ const o=proj(o3,cx,cy,sc),end=proj(end3,cx,cy,sc);drawArrow2(ctx,o,end,'#e879f9','MAG XYZ',false);
+ const h=Math.hypot(world[0],world[1]);if(h>.05){const hp=add3(o3,[world[0]/h*1.72,world[1]/h*1.72,0]);drawArrow2(ctx,o,proj(hp,cx,cy,sc),'#f0abfc','HORIZONTAL',true);}
+}
+function drawLevelInset(ctx,W,a){
+ const x=W-58,y=57,r=38,max=10;ctx.fillStyle='#0b111aDD';ctx.beginPath();ctx.arc(x,y,r+8,0,7);ctx.fill();
+ ctx.strokeStyle='#445267';ctx.lineWidth=1;ctx.beginPath();ctx.arc(x,y,r,0,7);ctx.moveTo(x-r,y);ctx.lineTo(x+r,y);ctx.moveTo(x,y-r);ctx.lineTo(x,y+r);ctx.stroke();
+ ctx.strokeStyle='#24354a';for(const q of [r*.5]){ctx.beginPath();ctx.arc(x,y,q,0,7);ctx.stroke();}
+ if(_tiltTrail.length>1){ctx.strokeStyle='#5d8fbf88';ctx.lineWidth=1;ctx.beginPath();_tiltTrail.forEach((p,i)=>{const px=x+Math.max(-1,Math.min(1,p[0]/max))*r,py=y-Math.max(-1,Math.min(1,p[1]/max))*r;i?ctx.lineTo(px,py):ctx.moveTo(px,py);});ctx.stroke();}
+ const dx=Math.max(-1,Math.min(1,a.cr/max))*r,dy=-Math.max(-1,Math.min(1,a.cp/max))*r,tilt=Math.hypot(a.cr,a.cp);
+ ctx.fillStyle=tilt<.5?'#33d17a':(tilt<2?'#ffb020':'#ff5252');ctx.beginPath();ctx.arc(x+dx,y+dy,5,0,7);ctx.fill();
+ ctx.fillStyle='#aeb8c8';ctx.font='10px sans-serif';ctx.fillText('LEVEL ±10°',x-30,y+r+16);
 }
 function drawDrone(m){
- const cv=document.getElementById('drone3d');if(!cv)return;const ctx=cv.getContext('2d');
- const W=cv.width=cv.clientWidth,H=cv.height;ctx.clearRect(0,0,W,H);
- const cx=W/2,cy=H/2+10,sc=Math.min(W,H)/5.2;
- // target (wireframe), raw (ghost), corrected (solid) drawn back-to-front
- if(show.wire){const Rt=attMat(m.att.tr,m.att.tp,m.att.ry);drawFrame(ctx,Rt,cx,cy,sc,{lw:1,arm:'#7c5cff66',body:'#7c5cff22',nose:'#7c5cff88',solid:false});}
- if(show.ghost){const Rr=attMat(m.att.rr,m.att.rp,m.att.ry);drawFrame(ctx,Rr,cx,cy,sc,{lw:1.5,arm:'#8a94a655',body:'#8a94a633',nose:'#8a94a6aa',solid:false});}
- if(show.solid){const Rc=attMat(m.att.cr,m.att.cp,m.att.ry);drawFrame(ctx,Rc,cx,cy,sc,{lw:3,arm:'#cdd6e6',body:'#1c2434',nose:'#ffffff',solid:true});drawAxes(ctx,Rc,cx,cy,sc);}
- // legend
- ctx.font='11px sans-serif';ctx.fillStyle='#8a94a6';ctx.fillText('X fwd (red) · Y right (grn) · Z down (blu)',8,H-8);
+ const cv=document.getElementById('drone3d');if(!cv)return;const z=canvasCtx(cv),ctx=z.ctx,W=z.W,H=z.H;
+ const cx=W/2,cy=H/2-2,sc=Math.min(W,H)/(ATT_VIEW==='iso'?6.1:6.5),a=m.att,tilt=Math.hypot(a.cr,a.cp);
+ drawWorld(ctx,cx,cy,sc,tilt);
+ if(show.wire){const Rt=attMat(a.tr,a.tp,a.yh?a.ty:a.ry);drawFrame(ctx,Rt,cx,cy,sc,{lw:1,arm:'#a06cff66',body:'#7c5cff18',nose:'#a06cff99',solid:false});}
+ if(show.ghost){const Rr=attMat(a.rr,a.rp,a.ry);drawFrame(ctx,Rr,cx,cy,sc,{lw:1.3,arm:'#8a94a655',body:'#8a94a622',nose:'#8a94a6aa',solid:false});}
+ if(show.solid){const Rc=attMat(a.cr,a.cp,a.ry);drawFrame(ctx,Rc,cx,cy,sc,{lw:2.8,arm:'#d6deea',body:'#26344a',nose:'#ffffff',solid:true});drawAxes(ctx,Rc,cx,cy,sc);drawMagVector(ctx,Rc,_magDisp,cx,cy,sc);}
+ drawLevelInset(ctx,W,a);
+ ctx.font='11px sans-serif';ctx.fillStyle='#8a94a6';ctx.fillText('WORLD: N cyan · E amber · level ring fixed',8,H-24);
+ ctx.fillText('BODY: FWD red · RIGHT green · DOWN blue',8,H-8);
+}
+function updateYawDrift(m){
+ const g=m.sen&&m.sen.mag,e=g&&g.ext||{},ok=g&&g.v===1&&g.src===2&&e.v===1;
+ const mh=ok?+(e.hdg??g.hdg):null,y=+m.att.ry||0;lastMagHeading=mh;lastYawHeading=y;
+ if(ok){const delta=wrap180d(mh-y);if(yawDriftRef===null)yawDriftRef=delta;yawDriftNow=wrap180d(delta-yawDriftRef);}
+ else yawDriftNow=null;
+ const me=document.getElementById('ov_magyaw'),de=document.getElementById('ov_drift');
+ if(me)me.textContent=ok?f(mh,1)+'° '+compassPoint(mh):'--';if(de)de.textContent=yawDriftNow==null?'--':((yawDriftNow>=0?'+':'')+f(yawDriftNow,1)+'°');
+ const tilt=Math.hypot(+m.att.cr||0,+m.att.cp||0),tag=document.getElementById('ov_leveltag');
+ if(tag){tag.className='tag '+(tilt<.5?'ok':(tilt<2?'warn':'err'));tag.textContent=tilt<.5?'LEVEL':('TILT '+f(tilt,1)+'°');}
+}
+function resetYawDriftRef(){
+ if(lastMagHeading==null||lastYawHeading==null){toast('External mag is not valid',true);return;}
+ yawDriftRef=wrap180d(lastMagHeading-lastYawHeading);yawDriftNow=0;toast('Yaw drift reference zeroed');
+}
+// Smooth telemetry at display refresh rate and retain a short roll/pitch trail.
+let _attTgt=null,_attDisp=null,_attRAF=0,_magDisp=null;
+function setDroneTarget(a,mag){
+ if(!a)return;_attTgt={cr:+a.cr||0,cp:+a.cp||0,ry:+a.ry||0,rr:+a.rr||0,rp:+a.rp||0,tr:+a.tr||0,tp:+a.tp||0,ty:+a.ty||0,yh:a.yh===1};
+ const e=mag&&mag.ext||{};_magDisp={valid:mag&&mag.v===1&&mag.src===2&&e.v===1,xyz:Array.isArray(e.xyz)?e.xyz.slice(0,3):null};
+ const now=Date.now();if(now-_trailMs>180){_trailMs=now;_tiltTrail.push([_attTgt.cr,_attTgt.cp]);if(_tiltTrail.length>70)_tiltTrail.shift();}
+ if(!_attDisp)_attDisp=Object.assign({},_attTgt);if(!_attRAF)_attRAF=requestAnimationFrame(_attStep);
+}
+function _attStep(){
+ _attRAF=0;if(!_attTgt||!_attDisp)return;const K=.26;let moving=false;
+ for(const k of ['cr','cp','rr','rp','tr','tp']){const d=_attTgt[k]-_attDisp[k];_attDisp[k]+=d*K;if(Math.abs(d)>.03)moving=true;}
+ const dy=wrap180d(_attTgt.ry-_attDisp.ry);_attDisp.ry+=dy*K;if(Math.abs(dy)>.03)moving=true;
+ const vis=activeTab==='overview'&&!document.hidden;if(vis)drawDrone({att:_attDisp});if(moving||vis)_attRAF=requestAnimationFrame(_attStep);
 }
 )DASH"
 R"DASH(
@@ -664,18 +833,79 @@ function mixExplain(m){
  else if(mag===Math.abs(r))axis='roll';else axis='yaw';
  const front=raw[0]+raw[2],rear=raw[1]+raw[3];
  const side = front>rear?'FRONT (M1+M3)':'REAR (M2+M4)';
- return[(sp>40?'':'ok'),'Spread '+sp+' DShot. Dominant axis: '+axis+'. Higher pair: '+side+'. P/I/D pitch out='+f(m.pid.p[3],1)+', roll out='+f(m.pid.r[3],1)+'.'];
+ const tr=m.mix.trim||[1,1,1,1],trTxt=tr.some(v=>Math.abs(v-1)>.0005)?' Trims: '+tr.map((v,i)=>'M'+(i+1)+'='+f(v,3)).join(' ')+'.':'';
+ const ax=Math.abs(m.pid.r[3])>=Math.abs(m.pid.p[3])?'roll':'pitch';
+ const t=ax==='roll'?m.pid.r:m.pid.p,ai=ax==='roll'?0:1;
+ const src=' '+ax.toUpperCase()+': target '+f(ai?m.att.tp:m.att.tr,2)+' deg, corrected '+f(ai?m.att.cp:m.att.cr,2)+
+  ' deg, rate SP '+f(m.pid.sp[ai],1)+' deg/s, gyro '+f(m.imu.g[ai],1)+' deg/s, P/I/D '+
+  f(t[0],1)+'/'+f(t[1],1)+'/'+f(t[2],1)+'.';
+ return[(sp>40?'':'ok'),'Spread '+sp+' DShot. Dominant PID axis: '+axis+'. Higher pair: '+side+'.'+src+trTxt];
+}
+let motorTrimDraft=[1,1,1,1],motorTrimDirty=[false,false,false,false],motorTrimPending=null;
+function setMotorTrimStatus(msg,err){
+ const e=document.getElementById('mix_trim_status');if(!e)return;e.textContent=msg;e.style.color=err?'#ffb020':'';
+}
+function motorTrimEdit(i,value){
+ const v=parseFloat(value);if(Number.isFinite(v))motorTrimDraft[i]=v;
+ motorTrimDirty[i]=true;motorTrimPending=null;setMotorTrimStatus('Edited values are not yet applied.');
+}
+function motorTrimMatches(a,b){
+ return Array.isArray(a)&&Array.isArray(b)&&a.length===4&&b.length===4&&a.every((v,i)=>Math.abs((+v)-(+b[i]))<0.0006);
 }
 function renderMixer(m){
  drawMix(document.getElementById('mix_canvas'),m,false);
  const mb=m.mix,raw=mb.m;const names=['M1 FR (CW)','M2 RR (CCW)','M3 FL (CCW)','M4 RL (CW)'];
- const pitch=[mb.pf,mb.pr,mb.pf,mb.pr];const roll=[-mb.r,-mb.r,mb.r,mb.r];const yaw=[-mb.y,mb.y,mb.y,-mb.y];
+ const trim=mb.trim||[1,1,1,1];const pitch=[mb.pf,mb.pr,mb.pf,mb.pr];const roll=[-mb.r,-mb.r,mb.r,mb.r];const yaw=[-mb.y,mb.y,mb.y,-mb.y];
  let h='';for(let i=0;i<4;i++)h+='<tr><td>'+names[i]+'</td><td class="mono">'+f(mb.base,0)+'</td><td class="mono">'+f(roll[i],1)
-  +'</td><td class="mono">'+f(pitch[i],1)+'</td><td class="mono">'+f(yaw[i],1)+'</td><td class="mono">'+f(mb.unc[i],0)+'</td><td class="mono">'+raw[i]+'</td></tr>';
+  +'</td><td class="mono">'+f(pitch[i],1)+'</td><td class="mono">'+f(yaw[i],1)+'</td><td class="mono">'+f(trim[i],3)+'</td><td class="mono">'+f(mb.unc[i],0)+'</td><td class="mono">'+raw[i]+'</td></tr>';
  document.getElementById('mix_tbody').innerHTML=h;
+ if(motorTrimPending&&motorTrimMatches(trim,motorTrimPending)){
+  motorTrimDraft=trim.map(Number);motorTrimDirty=[false,false,false,false];motorTrimPending=null;
+  setMotorTrimStatus('FCU live values confirmed.');
+ }
+ for(let i=0;i<4;i++){const now=document.getElementById('mix_trim_now_'+i),inp=document.getElementById('mix_trim_'+i);
+  if(now)now.textContent=f(trim[i],3);
+  if(!motorTrimDirty[i])motorTrimDraft[i]=+trim[i];
+  if(inp&&!motorTrimDirty[i]&&document.activeElement!==inp)inp.value=(+trim[i]).toFixed(3);}
  const ex=mixExplain(m);const eb=document.getElementById('mix_expl');eb.className='warnbox '+(ex[0]||'');eb.textContent=ex[1];
  // overview note
  document.getElementById('ov_mixnote').textContent=ex[1];
+}
+function readMotorTrims(){
+ const v=[];for(let i=0;i<4;i++){const inp=document.getElementById('mix_trim_'+i),n=parseFloat(inp.value);
+  v.push(motorTrimDirty[i]?motorTrimDraft[i]:n);}
+ if(v.some(x=>!(x>=0.9&&x<=1.1))){toast('Each motor trim must be 0.900–1.100',true);return null;}return v;
+}
+async function refreshMotorTrims(expected){
+ try{const r=await fetch('/api/mix');if(!r.ok)return false;const j=await r.json(),tr=j.trims;
+  if(!Array.isArray(tr)||tr.length!==4)return false;
+  if(expected&&!motorTrimMatches(tr,expected))return false;
+  motorTrimDraft=tr.map(Number);motorTrimDirty=[false,false,false,false];motorTrimPending=null;
+  for(let i=0;i<4;i++){const inp=document.getElementById('mix_trim_'+i);if(inp)inp.value=(+tr[i]).toFixed(3);}
+  return true;
+ }catch(e){return false;}
+}
+async function applyMotorTrims(silent){
+ const trims=readMotorTrims();if(!trims)return false;
+ motorTrimPending=trims.slice();motorTrimDirty=[true,true,true,true];
+ setMotorTrimStatus('Applying; waiting for FCU confirmation...');
+ const ok=await put('/api/mix',silent?'':'Motor trims applied',{trims});
+ if(!ok){motorTrimPending=null;setMotorTrimStatus('Apply failed; edited values were not changed.',true);return false;}
+ if(await refreshMotorTrims(trims))setMotorTrimStatus('Applied and verified in FCU RAM.');
+ else setMotorTrimStatus('Applied; waiting for live telemetry confirmation.',true);
+ return true;
+}
+async function saveMotorTrims(){
+ const expected=readMotorTrims();if(!expected)return;
+ if(!await applyMotorTrims(true))return;
+ if(!await act('/api/mix/save','Mixer settings saved to NVS')){setMotorTrimStatus('NVS save failed.',true);return;}
+ if(await refreshMotorTrims(expected))setMotorTrimStatus('Saved to NVS and verified against FCU live values.');
+ else setMotorTrimStatus('NVS reported saved, but live readback did not match.',true);
+}
+async function resetMotorTrims(){
+ motorTrimDraft=[1,1,1,1];motorTrimDirty=[true,true,true,true];
+ for(let i=0;i<4;i++)document.getElementById('mix_trim_'+i).value='1.000';
+ await applyMotorTrims();
 }
 )DASH"
 R"DASH(
@@ -746,7 +976,13 @@ function renderSensors(m){
  // IMU accel/gyro
  h+=sensRow('Gyroscope (ICM-20948)','SPI',im.rdy?'healthy':'fail',im.rdy?'ok':'err','['+f(im.g[0],0)+','+f(im.g[1],0)+','+f(im.g[2],0)+'] °/s','live');
  h+=sensRow('Accelerometer','SPI',im.rdy?(im.av?'healthy':'uncalibrated'):'fail',im.rdy?(im.av?'ok':'warn'):'err',f(im.am,3)+' g','live');
- h+=sensRow('Magnetometer (AK09916)','SPI(aux)',s.mag.v?(s.mag.cal?'healthy':'uncalibrated'):'invalid',s.mag.v?(s.mag.cal?'ok':'warn'):'err',f(s.mag.hdg,0)+'° '+f(s.mag.f,0)+'µT','live');
+ const mg=s.mag||{},ex=mg.ext||{};
+ const mxyz=Array.isArray(ex.xyz)?ex.xyz:[0,0,0],mh=Math.hypot(mxyz[0],mxyz[1]);
+ const exState=!ex.comp?'not compiled':(!ex.conn?'missing':(ex.v?(ex.cal?'healthy':'uncalibrated'):magRejectName(ex.rej)));
+ const exCls=!ex.comp?'grey':(!ex.conn?'err':(ex.v?(ex.cal?'ok':'warn'):'err'));
+ h+=sensRow('External magnetometer (MMC5603)','I2C 0x30',exState,exCls,
+  'XYZ ['+f(mxyz[0],1)+', '+f(mxyz[1],1)+', '+f(mxyz[2],1)+'] µT · H '+f(mh,1)+' · '+f(ex.hdg,0)+'° '+compassPoint(ex.hdg),'live');
+ h+=sensRow('Onboard magnetometer (AK09916)','SPI(aux)','ignored by policy','grey','not used for heading/yaw','—');
  h+=sensRow('Barometer (BMP280)','I2C',!s.baro.r?'missing':(s.baro.v&&s.baro.age<2000?'healthy':'stale'),!s.baro.r?'red':(s.baro.v&&s.baro.age<2000?'ok':'warn'),f(s.baro.alt,2)+' m '+f(s.baro.t,1)+'°C',ageTxt(s.baro.age));
  h+=sensRow('ToF (VL53L1X)',s.tof.comp?'I2C':'—',!s.tof.comp?'not compiled':(!s.tof.r?'missing':(s.tof.rng&&s.tof.age<1500?'healthy':'stale')),!s.tof.comp?'grey':(!s.tof.r?'red':(s.tof.rng&&s.tof.age<1500?'ok':'warn')),s.tof.mm+' mm',ageTxt(s.tof.age));
  h+=sensRow('GPS (NMEA)',s.gps.comp?'UART1':'—',!s.gps.comp?'not compiled':(!s.gps.r?'missing':(s.gps.fix?'fix '+s.gps.sats+' sats':'no fix')),!s.gps.comp?'grey':(!s.gps.r?'red':(s.gps.fix?'ok':'warn')),(s.gps.lat/1e7).toFixed(5)+', '+(s.gps.lon/1e7).toFixed(5),ageTxt(s.gps.age));
@@ -793,21 +1029,56 @@ function saveFailsafeBypass(){act('/api/failsafe/save','Failsafe setting saved t
 // ---------- compass + mag heading trim ----------
 let magTrimLoaded=false,magAcc=0;
 function magColour(fld){return fld>90?'#ff5252':(fld>=65?'#ffb020':(fld>=40?'#33d17a':'#5d6678'));}
+function magRejectName(r){return ['NO_SOURCE','NOT_PRESENT','DISABLED','FIELD_LOW','FIELD_HIGH','STALE','HEADING_JUMP','READ_FAIL'][r]||'INVALID';}
+function wrap360d(v){return ((+v%360)+360)%360;}
+function compassPoint(deg){
+ const p=['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'];
+ return Number.isFinite(+deg)?p[Math.round(wrap360d(deg)/22.5)%16]:'--';
+}
 function renderMag(m){
  const g=m.sen&&m.sen.mag;if(!g)return;
- const ok=g.v===1,hdg=+g.hdg||0,fld=+g.f||0,c=magColour(fld);
+ const e=g.ext||{},ok=g.v===1&&g.src===2,hdg=+(e.hdg??g.hdg)||0,fld=+(e.f??g.f)||0,c=magColour(fld);
+ const trim=+g.trim||0,declination=+g.dec||0,untrimmed=wrap360d(hdg-trim-declination);
+ const xyz=Array.isArray(e.xyz)?e.xyz:[0,0,0],horiz=Math.hypot(xyz[0],xyz[1]),vertical=Math.abs(xyz[2]);
  const nd=document.getElementById('mag_needle');if(nd){magAcc+=((hdg-magAcc)%360+540)%360-180;nd.style.transform='rotate('+magAcc+'deg)';nd.style.opacity=ok?'1':'0.22';}
- const ht=document.getElementById('mag_hdg');if(ht)ht.textContent=ok?hdg.toFixed(0)+'°':'--°';
- const ms=document.getElementById('mag_state');if(ms){ms.textContent=ok?'valid':'INVALID (15–95 µT gate)';ms.style.color=ok?'':'#ffb020';}
+ const ht=document.getElementById('mag_hdg');if(ht)ht.textContent=ok?hdg.toFixed(0)+'° '+compassPoint(hdg):'--°';
+ const magWarn=ok&&(!e.cal||Math.abs(trim)>45);
+ const ms=document.getElementById('mag_state');if(ms){ms.textContent=ok?('EXTERNAL valid · '+compassPoint(hdg)+' · cal '+(e.cal?'yes':'NO')+' · trim '+(trim>=0?'+':'')+f(trim,1)+'°'):('EXTERNAL rejected · '+magRejectName(e.rej));ms.style.color=(!ok||magWarn)?'#ffb020':'';}
  const rg=document.getElementById('mag_ring');if(rg)rg.setAttribute('stroke',ok?c:'#5d6678');
  const bar=document.getElementById('mag_bar');if(bar){bar.style.width=Math.max(0,Math.min(100,fld/120*100))+'%';bar.style.background=c;}
  const ft=document.getElementById('mag_field');if(ft)ft.textContent=f(fld,1)+' µT';
+ const gain=Math.max(0,Math.min(1,+g.gain||0)),gs=document.getElementById('mag_gain'),gn=document.getElementById('mag_gainn');
+ if(gs&&document.activeElement!==gs)gs.value=gain.toFixed(2);if(gn&&document.activeElement!==gn)gn.value=gain.toFixed(2);
+ const fs=document.getElementById('cfg_magfusion');if(fs){const tau=gain>0?(8/gain):0;
+  fs.innerHTML=kv('Source',ok?'<span class="tag ok">MMC5603 valid</span>':'<span class="tag err">external invalid</span>')
+   +kv('Displayed heading',ok?(f(hdg,1)+'° '+compassPoint(hdg)):'--')
+   +kv('Untrimmed magnetic',ok?(f(untrimmed,1)+'° '+compassPoint(untrimmed)):'--')
+   +kv('Saved trim',Math.abs(trim)>45?'<span class="tag err">'+(trim>=0?'+':'')+f(trim,1)+'° CHECK</span>':((trim>=0?'+':'')+f(trim,1)+'°'))
+   +kv('Declination',f(declination,1)+'°')
+   +kv('Calibration',e.cal?'<span class="tag ok">loaded</span>':'<span class="tag warn">NOT CALIBRATED</span>')
+   +kv('Heading hold',m.att.yh?('<span class="tag ok">ACTIVE · target '+f(m.att.ty,1)+'°</span>'):'<span class="tag">inactive</span>')
+   +kv('Body X / Y / Z',f(xyz[0],2)+' / '+f(xyz[1],2)+' / '+f(xyz[2],2)+' µT')
+   +kv('Horizontal / vertical',f(horiz,2)+' / '+f(vertical,2)+' µT')
+   +kv('Mode',gain===0?'<span class="tag">SHADOW</span>':('<span class="tag warn">ACTIVE '+f(gain,2)+'</span>'))
+   +kv('Approx. yaw pull',gain===0?'none':f(tau,0)+' s time constant')
+   +kv('Onboard AK09916','disabled');}
 }
 function loadMagTrim(){magTrimLoaded=true;fetch('/api/settings').then(r=>r.json()).then(j=>{
  if(typeof j.magTrimDeg!=='number')return;const s=document.getElementById('mag_trim'),n=document.getElementById('mag_trimn');
  if(s&&document.activeElement!==s)s.value=j.magTrimDeg;if(n&&document.activeElement!==n)n.value=j.magTrimDeg;}).catch(()=>{});}
-function saveMagTrim(){const v=Math.max(-360,Math.min(360,parseInt(document.getElementById('mag_trimn').value,10)||0));
- act('/api/settings','Heading trim saved: '+v+'°',{magTrimDeg:v});}
+async function saveMagTrim(){const v=Math.max(-360,Math.min(360,parseFloat(document.getElementById('mag_trimn').value)||0));
+ if(await act('/api/settings','Heading trim saved: '+v+'°',{magTrimDeg:v})){magTrimLoaded=false;loadMagTrim();}}
+async function resetMagTrim(){
+ document.getElementById('mag_trim').value=0;document.getElementById('mag_trimn').value=0;
+ await saveMagTrim();
+}
+async function applyMagGain(){
+ const v=parseFloat(document.getElementById('mag_gainn').value);
+ if(!(v>=0&&v<=1)){toast('Mag gain must be 0.00 to 1.00',true);return false;}
+ return put('/api/mag/config',v===0?'Mag correction in shadow mode':'Mag yaw correction applied in RAM',{gain:v});
+}
+async function saveMagGain(){if(await applyMagGain())await act('/api/mag/config/save','Mag yaw correction saved to NVS');}
+async function setMagGain(v){document.getElementById('mag_gain').value=v;document.getElementById('mag_gainn').value=v;await applyMagGain();}
 )DASH"
 R"DASH(
 // ---------- PID tuning ----------
@@ -815,24 +1086,65 @@ const PIDF=[['rrP','Rate Roll P',0,5000,25,'Roll rate'],['rrI','Rate Roll I',0,3
  ['rpP','Rate Pitch P',0,5000,25,'Pitch rate'],['rpI','Rate Pitch I',0,3000,25,'Pitch rate'],['rpD','Rate Pitch D',0,1000,5,'Pitch rate'],
  ['ryP','Rate Yaw P',0,5000,25,'Yaw rate'],['ryI','Rate Yaw I',0,3000,25,'Yaw rate'],['ryD','Rate Yaw D',0,1000,5,'Yaw rate'],
  ['aR','Angle Roll P',0,10000,100,'Angle'],['aP','Angle Pitch P',0,10000,100,'Angle'],['aY','Angle Yaw P',0,10000,100,'Angle']];
-let gains=new Array(12).fill(0),pushT=null;
+let gains=new Array(12).fill(0),pushT=null,MAGGAIN=0,magT=null;
+// Refresh every widget bound to gains[i] (main slider+number, value label, and
+// the yaw-card duplicate), skipping whichever the user is actively editing.
+function gainUI(i){const m=gains[i],a=document.activeElement;
+ const sl=document.getElementById('pr'+i),nu=document.getElementById('pn'+i),lv=document.getElementById('pv'+i),yk=document.getElementById('yk'+i),yn=document.getElementById('yk'+i+'n');
+ if(sl&&a!==sl)sl.value=m; if(nu&&a!==nu)nu.value=m; if(lv)lv.textContent=(m/1000).toFixed(3);
+ if(yk&&a!==yk)yk.value=m; if(yn&&a!==yn)yn.value=m;}
+function editGain(i,v){v=Math.max(PIDF[i][2],Math.min(PIDF[i][3],Math.round(v)));gains[i]=v;gainUI(i);pushPid();}
+function pushPid(){clearTimeout(pushT);pushT=setTimeout(()=>put('/api/pid',null,{gains}),140);}
 function buildPid(){const groups={};PIDF.forEach((ff,i)=>{(groups[ff[5]]=groups[ff[5]]||[]).push(i);});
  const root=document.getElementById('pidgroups');root.innerHTML='';
  for(const g in groups){const c=document.createElement('div');c.className='card';c.innerHTML='<h3>'+g+'</h3>';
   groups[g].forEach(i=>{const ff=PIDF[i];const r=document.createElement('div');r.className='row';
-   r.innerHTML='<label>'+ff[1]+'</label><input type="range" min="'+ff[2]+'" max="'+ff[3]+'" step="'+ff[4]+'" id="pr'+i+'"><div class="v" id="pv'+i+'">--</div>';
-   c.appendChild(r);const inp=r.querySelector('input');
-   inp.addEventListener('input',e=>{gains[i]=+e.target.value;document.getElementById('pv'+i).textContent=(gains[i]/1000).toFixed(3);pushPid();});});
+   r.innerHTML='<label>'+ff[1]+'</label><input type="range" min="'+ff[2]+'" max="'+ff[3]+'" step="'+ff[4]+'" id="pr'+i+'"><input type="number" style="width:74px" min="'+ff[2]+'" max="'+ff[3]+'" step="'+ff[4]+'" id="pn'+i+'"><div class="v" id="pv'+i+'">--</div>';
+   c.appendChild(r);
+   document.getElementById('pr'+i).addEventListener('input',e=>editGain(i,+e.target.value));
+   document.getElementById('pn'+i).addEventListener('change',e=>editGain(i,+e.target.value));});
   root.appendChild(c);}}
-function setPidUI(g){PIDF.forEach((ff,i)=>{const r=document.getElementById('pr'+i);if(r&&document.activeElement!==r){r.value=g[i];document.getElementById('pv'+i).textContent=(g[i]/1000).toFixed(3);}});gains=g.slice();}
-function pushPid(){clearTimeout(pushT);pushT=setTimeout(()=>put('/api/pid',null,{gains}),140);}
+function setPidUI(g){gains=g.slice();PIDF.forEach((ff,i)=>gainUI(i));}
 async function loadPid(){try{const r=await fetch('/api/pid');const j=await r.json();if(j.gains&&j.gains.length===12)setPidUI(j.gains);
- const s=document.getElementById('pid_safe');s.textContent=j.safe?'Bench-idle: edits allowed.':'ARMED / throttle ≠ 0 — edits refused.';s.style.color=j.safe?'var(--ok)':'var(--err)';}catch(e){}}
+ const s=document.getElementById('pid_safe');if(s){s.textContent=j.safe?'Bench-idle: edits allowed.':'ARMED / throttle ≠ 0 — edits refused.';s.style.color=j.safe?'var(--ok)':'var(--err)';}}catch(e){}}
 async function savePid(){const r=await fetch('/api/pid/save',{method:'POST',headers:authHdrs()});toast(r.ok?'PID saved to NVS':'Save failed',!r.ok);}
+// ---------- Yaw & heading stability card ----------
+const YAWPID=[[6,'Rate Yaw P · resist rotation'],[7,'Rate Yaw I · hold against bias'],[11,'Angle Yaw P · heading-hold strength']];
+function buildYawKnobs(){const root=document.getElementById('yawknobs');if(!root)return;root.innerHTML='';
+ YAWPID.forEach(function(k){const i=k[0],ff=PIDF[i],r=document.createElement('div');r.className='row';
+  r.innerHTML='<label>'+k[1]+'</label><input type="range" min="'+ff[2]+'" max="'+ff[3]+'" step="'+ff[4]+'" id="yk'+i+'"><input type="number" style="width:74px" min="'+ff[2]+'" max="'+ff[3]+'" step="'+ff[4]+'" id="yk'+i+'n">';
+  root.appendChild(r);
+  document.getElementById('yk'+i).addEventListener('input',e=>editGain(i,+e.target.value));
+  document.getElementById('yk'+i+'n').addEventListener('change',e=>editGain(i,+e.target.value));});
+ const r=document.createElement('div');r.className='row';
+ r.innerHTML='<label>Mag yaw correction gain · 0=off</label><input type="range" min="0" max="1" step="0.05" id="ykmag"><input type="number" style="width:74px" min="0" max="1" step="0.05" id="ykmagn">';
+ root.appendChild(r);
+ document.getElementById('ykmag').addEventListener('input',e=>setMagGainCard(+e.target.value));
+ document.getElementById('ykmagn').addEventListener('change',e=>setMagGainCard(+e.target.value));}
+function setMagGainCard(v){v=Math.max(0,Math.min(1,v||0));MAGGAIN=v;const a=document.activeElement;
+ const s=document.getElementById('ykmag'),n=document.getElementById('ykmagn');
+ if(s&&a!==s)s.value=v; if(n&&a!==n)n.value=v.toFixed(2);
+ clearTimeout(magT);magT=setTimeout(()=>put('/api/mag/config',null,{gain:v}),200);}
+async function loadMagGainCard(){try{const r=await fetch('/api/mag/config');const j=await r.json();if(typeof j.gain==='number'){MAGGAIN=j.gain;const a=document.activeElement,s=document.getElementById('ykmag'),n=document.getElementById('ykmagn');if(s&&a!==s)s.value=j.gain;if(n&&a!==n)n.value=j.gain.toFixed(2);}}catch(e){}}
+function gateBox(lbl,ok,sub){return '<div class="stat"><div class="l">'+lbl+'</div><div class="n" style="color:'+(ok?'var(--ok)':'var(--err)')+'">'+(ok?'✓':'✗')+'</div><div class="l">'+sub+'</div></div>';}
+function renderYawCard(m){const st=document.getElementById('yh_status');if(!st)return;
+ const a=(m&&m.att)||{},hold=a.yh===1;
+ st.textContent=hold?('HOLD ACTIVE · target '+f(a.ty,1)+'°'):'hold inactive';st.className='tag '+(hold?'ok':'');
+ const ex=(m&&m.sen&&m.sen.mag&&m.sen.mag.ext)||{};
+ const calOk=ex.cal===1||ex.cal===true,gainOk=MAGGAIN>0,ayOk=gains[11]>0;
+ const g=document.getElementById('yh_gates');if(g)g.innerHTML=
+  gateBox('Compass cal',calOk,calOk?'valid':'run mag cal')
+ +gateBox('Corr gain &gt;0',gainOk,gainOk?f(MAGGAIN,2):'raise above 0')
+ +gateBox('Angle Yaw P &gt;0',ayOk,ayOk?(gains[11]/1000).toFixed(2):'raise above 0')
+ +gateBox('Heading hold',hold,hold?('target '+f(a.ty,1)+'°'):'center yaw stick');}
+async function saveYaw(){await put('/api/mag/config',null,{gain:MAGGAIN});
+ const a=await fetch('/api/pid/save',{method:'POST',headers:authHdrs()});
+ const b=await fetch('/api/mag/config/save',{method:'POST',headers:authHdrs()});
+ const ok=a.ok&&b.ok;toast(ok?'Yaw tuning saved to NVS (PID + mag gain)':('Save failed'+(a.ok?'':' pid')+(b.ok?'':' mag')),!ok);}
 // periodic PID refresh (safety flag + external changes)
-setInterval(()=>{if(activeTab==='pid')loadPid();},1500);
+setInterval(()=>{if(activeTab==='pid'){loadPid();loadMagGainCard();}},1500);
 // ---------- boot ----------
-buildTabs();buildPid();updAuth();loadPid();connectWs();
+buildTabs();buildPid();buildYawKnobs();updAuth();loadPid();loadMagGainCard();connectWs();
 if(!TOKEN)setTimeout(()=>{if(!TOKEN)setToken();},500);
 window.onRender=null;
 // fetch cal info once for trim step + initial fields
@@ -943,6 +1255,6 @@ async function capStop(){if(await act('/api/capture/stop','Capture stopped'))cap
 async function capClear(){if(confirm('Clear diagnostic capture?')&&await act('/api/capture/clear','Capture cleared'))capPoll();}
 function capDownload(){window.location.href='/api/capture.csv';}
 STAGE.capture=()=>{capPoll();if(!capTimer)capTimer=setInterval(()=>{if(activeTab==='capture')capPoll();else{clearInterval(capTimer);capTimer=null;}},500);};
-(function(){const prev=window.onRender;window.onRender=m=>{if(prev)prev(m);if(activeTab==='vibe')renderVibe(m);};})();
+(function(){const prev=window.onRender;window.onRender=m=>{if(prev)prev(m);if(activeTab==='vibe')renderVibe(m);if(activeTab==='pid')renderYawCard(m);};})();
 </script>
 </body></html>)DASH";

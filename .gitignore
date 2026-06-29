@@ -48,12 +48,6 @@ src/pidweb_secrets.h
 # Logs
 *.log
 
-# Windows configurator generated output
-configurator/node_modules/
-configurator/dist/
-configurator/build/
-configurator/release/
-
 # Third-party reference clone (not part of this project's source)
 betaflight/
 
