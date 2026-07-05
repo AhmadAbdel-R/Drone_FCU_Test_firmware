@@ -2200,6 +2200,22 @@ GyroCalRuntime gGyroCal;
 LevelCalRuntime gLevelCal;
 MotorSpinRuntime gMotorSpin;
 
+// =============================================================================
+// [MOTOR TEST SESSION] — deadman-held wizard spin (Motors page).
+// One PHYSICAL output at a time. The browser holds the spin by re-POSTing
+// /api/motors/test every ~150 ms; each accepted request extends expiresAtMs by
+// the requested hold (clamped). If the refreshes stop for ANY reason —
+// button released, page closed, WiFi drop, browser crash — the flight task
+// stops the motor within one hold window. Guarded by gFlightMux.
+// =============================================================================
+struct MotorTestSession {
+  uint8_t motor = 0;          // 1..4 PHYSICAL output; 0 = idle
+  uint16_t raw = 0;           // commanded DShot value
+  uint32_t expiresAtMs = 0;   // deadman expiry
+  uint32_t startedMs = 0;     // session start (hard cap MOTOR_TEST_SESSION_MAX_MS)
+};
+MotorTestSession gMotorTest;
+
 // Live persistent level correction + manual trim (degrees), applied ONCE per
 // flight tick in updateControlLoop as
 //   correctedAttitude = rawAttitude - levelOffset - manualTrim.
@@ -6202,6 +6218,81 @@ std::atomic<uint32_t> gLoopDtMinUs{0xFFFFFFFFUL};
 std::atomic<uint32_t> gLoopDtMaxUs{0};
 std::atomic<uint32_t> gLoopDtAvgUs{0};
 
+// =============================================================================
+// [MOTOR CONFIG CACHE] — runtime motor order/idle/test settings from
+// fcu_config, cached in atomics for the flight task (same pattern as the
+// arming cache: the hot path never touches the config mutex).
+//
+// Motor map semantics: gMotorMapPacked byte i (LSB-first) = the PHYSICAL
+// output (1..4) that LOGICAL mixer slot i drives. Logical slots keep the
+// verified geometry (M1 FR, M2 RR, M3 FL, M4 RL); the map only re-routes
+// which pad each slot's command leaves on. Identity (0x04030201) = wiring
+// matches the mixer directly, which is today's flown configuration.
+// =============================================================================
+float fcuCfgReadByName(const char* name, float fallback);  // defined below
+
+std::atomic<uint32_t> gMotorMapPacked{0x04030201UL};
+std::atomic<bool> gMotorIdleEnable{false};      // armed idle OFF by default (safety)
+std::atomic<uint16_t> gMotorIdleValue{MOTOR_OUTPUT_MIN_ACTIVE_RAW};
+std::atomic<uint16_t> gMotorTestValue{200};     // wizard spin value (raw DShot)
+std::atomic<uint16_t> gMotorTestHoldMaxMs{800}; // deadman hold ceiling per refresh
+
+// Hard ceiling for any web motor test, independent of config. ~39% of the
+// DShot range — enough to identify a motor + direction, never a fly-away.
+static constexpr uint16_t MOTOR_TEST_ABS_MAX_RAW = 800;
+// One test session may not outlive this, deadman refreshes or not.
+static constexpr uint32_t MOTOR_TEST_SESSION_MAX_MS = 120000UL;
+
+void refreshMotorConfigCache() {
+  uint8_t map[4];
+  bool seen[4] = {false, false, false, false};
+  bool valid = true;
+  static const char* kMapNames[4] = {"motor_map_1", "motor_map_2", "motor_map_3",
+                                     "motor_map_4"};
+  for (int i = 0; i < 4; ++i) {
+    const int v = static_cast<int>(fcuCfgReadByName(kMapNames[i], static_cast<float>(i + 1)));
+    if (v < 1 || v > 4 || seen[v - 1]) {
+      valid = false;
+      break;
+    }
+    seen[v - 1] = true;
+    map[i] = static_cast<uint8_t>(v);
+  }
+  if (!valid) {
+    // Never fly a corrupt/non-permutation map: fall back to identity loudly.
+    fcu_log::logf(fcu_log::Level::Error,
+                  "[MOTOR] stored motor map is not a permutation — using identity\n");
+    map[0] = 1; map[1] = 2; map[2] = 3; map[3] = 4;
+  }
+  gMotorMapPacked.store(static_cast<uint32_t>(map[0]) |
+                        (static_cast<uint32_t>(map[1]) << 8) |
+                        (static_cast<uint32_t>(map[2]) << 16) |
+                        (static_cast<uint32_t>(map[3]) << 24),
+                        std::memory_order_relaxed);
+  gMotorIdleEnable.store(fcuCfgReadByName("motor_idle_enable", 0.0f) > 0.5f,
+                         std::memory_order_relaxed);
+  const float idleV = fcuCfgReadByName("motor_idle_value",
+                                       static_cast<float>(MOTOR_OUTPUT_MIN_ACTIVE_RAW));
+  gMotorIdleValue.store(static_cast<uint16_t>(constrain(idleV, 48.0f, 300.0f)),
+                        std::memory_order_relaxed);
+  const float testV = fcuCfgReadByName("motor_test_value", 200.0f);
+  gMotorTestValue.store(static_cast<uint16_t>(
+                            constrain(testV, 48.0f, static_cast<float>(MOTOR_TEST_ABS_MAX_RAW))),
+                        std::memory_order_relaxed);
+  const float holdV = fcuCfgReadByName("motor_test_timeout_ms", 800.0f);
+  gMotorTestHoldMaxMs.store(static_cast<uint16_t>(constrain(holdV, 200.0f, 5000.0f)),
+                            std::memory_order_relaxed);
+}
+
+// Unpack the live motor map (logical slot -> 1-based physical output).
+inline void motorMapUnpack(uint8_t out[4]) {
+  const uint32_t p = gMotorMapPacked.load(std::memory_order_relaxed);
+  out[0] = static_cast<uint8_t>(p & 0xFF);
+  out[1] = static_cast<uint8_t>((p >> 8) & 0xFF);
+  out[2] = static_cast<uint8_t>((p >> 16) & 0xFF);
+  out[3] = static_cast<uint8_t>((p >> 24) & 0xFF);
+}
+
 // Config-dependent gates, cached in atomics so the 50 Hz evaluation never
 // touches fcu_config's mutex (an import holds it across NVS writes).
 struct ArmingConfigCache {
@@ -6339,15 +6430,14 @@ void updateArmingDisableFlags(uint32_t nowMs) {
   }
 
   // ---- Bench activity -------------------------------------------------------
-#if ENABLE_PID_WEBSERVER
   {
     bool motorTestBusy = false;
     portENTER_CRITICAL(&gFlightMux);
-    motorTestBusy = (gMotorSpin.requestedMotor != 0U) || (gMotorSpin.activeMotor != 0U);
+    motorTestBusy = (gMotorSpin.requestedMotor != 0U) || (gMotorSpin.activeMotor != 0U) ||
+                    (gMotorTest.motor != 0U);
     portEXIT_CRITICAL(&gFlightMux);
     if (motorTestBusy) f |= arming::FLAG_MOTOR_TEST;
   }
-#endif
   if (fcu_config::writeInProgress()) f |= arming::FLAG_CONFIG_WRITE;
   if (!gState.escReady) f |= arming::FLAG_ESC_NOT_READY;
   if (gArmBlockedLatch.load(std::memory_order_relaxed)) {
@@ -6421,6 +6511,9 @@ void fcuConfigGroupChanged(uint8_t group) {
   switch (group) {
     case fcu_config::GROUP_ARMING:
       refreshArmingConfigCache();
+      break;
+    case fcu_config::GROUP_MOTOR:
+      refreshMotorConfigCache();
       break;
     default:
       break;
@@ -7801,6 +7894,11 @@ void publishPidWebSafety() {
                                benchActionBusy);
 }
 
+// Deadman motor-test session (defined with servicePidWebMotorSpin below).
+bool requestMotorTest(uint8_t physMotor, uint16_t rawIn, uint16_t holdMsIn);
+bool requestMotorTestStop();
+void pidWebGetMotorTest(pid_webserver::MotorTestState& s);
+
 pid_webserver::Callbacks buildConfiguratorCallbacks() {
   pid_webserver::Callbacks cbs;
   cbs.getPid = pidWebGetPid;
@@ -7810,6 +7908,9 @@ pid_webserver::Callbacks buildConfiguratorCallbacks() {
   cbs.resetToDefaults = pidWebResetToDefaults;
   cbs.calibrateImu = requestGyroCalibration;
   cbs.spinMotor = requestMotorSpin;
+  cbs.motorTestRun = requestMotorTest;
+  cbs.motorTestStop = requestMotorTestStop;
+  cbs.getMotorTest = pidWebGetMotorTest;
   cbs.getMixPitchFrontBias = pidWebGetMixBias;
   cbs.setMixPitchFrontBias = pidWebSetMixBias;
   cbs.saveMixPitchFrontBiasToNvs = pidWebSaveMixBiasToNvs;
@@ -8158,14 +8259,26 @@ void applyMotorOutputs(const std::array<uint16_t, 4>& raw) {
     return;
   }
 
-  const bool armed0 = ensureSingleEscArmed(1, gMotor0, gState.motor0Ready);
-  const bool armed1 = ensureSingleEscArmed(2, gMotor1, gState.motor1Ready);
-  const bool armed2 = ensureSingleEscArmed(3, gMotor2, gState.motor2Ready);
-  const bool armed3 = ensureSingleEscArmed(4, gMotor3, gState.motor3Ready);
-  const bool ok0 = armed0 && gMotor0.spinRaw(raw[0]);
-  const bool ok1 = armed1 && gMotor1.spinRaw(raw[1]);
-  const bool ok2 = armed2 && gMotor2.spinRaw(raw[2]);
-  const bool ok3 = armed3 && gMotor3.spinRaw(raw[3]);
+  // [MOTOR MAP] logical mixer slot i drives physical output map[i]. raw[],
+  // gState.motorRaw and motorAcceptedRaw all stay in the LOGICAL frame; only
+  // the ESC object selection is remapped, so telemetry/mixer views are
+  // unchanged by a re-ordering. Identity map = the verified wiring.
+  uint8_t map[4];
+  motorMapUnpack(map);
+  esc::EasyEscMotor* motorByPhys[4] = {&gMotor0, &gMotor1, &gMotor2, &gMotor3};
+  bool* readyByPhys[4] = {&gState.motor0Ready, &gState.motor1Ready,
+                          &gState.motor2Ready, &gState.motor3Ready};
+  bool okArr[4];
+  for (int i = 0; i < 4; ++i) {
+    const uint8_t p = static_cast<uint8_t>(map[i] - 1U);
+    const bool armed = ensureSingleEscArmed(static_cast<uint8_t>(p + 1U),
+                                            *motorByPhys[p], *readyByPhys[p]);
+    okArr[i] = armed && motorByPhys[p]->spinRaw(raw[i]);
+  }
+  const bool ok0 = okArr[0];
+  const bool ok1 = okArr[1];
+  const bool ok2 = okArr[2];
+  const bool ok3 = okArr[3];
   const bool ok = ok0 && ok1 && ok2 && ok3;
   // Record what each ESC actually accepted (vs the commanded gState.motorRaw set
   // above); hold the last accepted value on a failed write. (F10)
@@ -8238,6 +8351,187 @@ void forceMotorStop(const char* reason) {
 }
 
 #if ENABLE_PID_WEBSERVER
+// =============================================================================
+// [MOTOR TEST SESSION] request / stop / service (see MotorTestSession decl).
+// =============================================================================
+
+// Accept (or refresh) a deadman motor-test hold. Called from the webserver
+// task. Returns false with a logged reason when any safety condition fails.
+bool requestMotorTest(uint8_t physMotor, uint16_t rawIn, uint16_t holdMsIn) {
+  const uint32_t nowMs = millis();
+  if (physMotor < 1 || physMotor > 4) return false;
+  if (!gState.escReady || escStartupSettleActive(nowMs)) {
+    fcu_log::logf(fcu_log::Level::Warn, "[MOTOR_TEST] refused: ESC not ready/settling\n");
+    return false;
+  }
+
+  uint8_t throttle = 0;
+  bool failsafe = false;
+  portENTER_CRITICAL(&gControlMux);
+  throttle = gState.control.appliedThrottlePercent;
+  failsafe = gState.control.failsafeActive;
+  portEXIT_CRITICAL(&gControlMux);
+  if (throttle != 0U || failsafe ||
+      gFlightStatePublished.load(std::memory_order_relaxed) != flight_state::State::IDLE) {
+    fcu_log::logf(fcu_log::Level::Warn, "[MOTOR_TEST] refused: not bench-idle\n");
+    return false;
+  }
+
+  bool calBusy = false;
+  portENTER_CRITICAL(&gFlightMux);
+  calBusy = gGyroCal.active || gGyroCal.requested || gLevelCal.active ||
+            (gMotorSpin.requestedMotor != 0U) || (gMotorSpin.activeMotor != 0U);
+  portEXIT_CRITICAL(&gFlightMux);
+  if (calBusy) {
+    fcu_log::logf(fcu_log::Level::Warn, "[MOTOR_TEST] refused: calibration/one-shot busy\n");
+    return false;
+  }
+
+  // Battery gate: when the battery monitor is enabled, require a plausible
+  // pack voltage so the ESCs actually have drive power (a USB-only powered
+  // bench refuses instead of "spinning" silently). Monitor disabled = bench
+  // PSU assumed, allowed.
+  bool battEnabled = false;
+  float battVolts = 0.0f;
+  portENTER_CRITICAL(&gSensorMux);
+  battEnabled = gState.battery.enabled;
+  battVolts = gState.battery.volts;
+  portEXIT_CRITICAL(&gSensorMux);
+  if (battEnabled && battVolts < 7.0f) {
+    fcu_log::logf(fcu_log::Level::Warn, "[MOTOR_TEST] refused: battery %.2fV < 7V\n",
+                  static_cast<double>(battVolts));
+    return false;
+  }
+
+  uint16_t raw = (rawIn == 0U) ? gMotorTestValue.load(std::memory_order_relaxed) : rawIn;
+  raw = constrain(raw, static_cast<uint16_t>(48), MOTOR_TEST_ABS_MAX_RAW);
+  const uint16_t holdCap = gMotorTestHoldMaxMs.load(std::memory_order_relaxed);
+  uint16_t holdMs = (holdMsIn == 0U) ? 400U : holdMsIn;
+  holdMs = constrain(holdMs, static_cast<uint16_t>(50), holdCap);
+
+  bool accepted = false;
+  bool fresh = false;
+  portENTER_CRITICAL(&gFlightMux);
+  if (gMotorTest.motor == 0U || gMotorTest.motor == physMotor) {
+    fresh = (gMotorTest.motor == 0U);
+    if (fresh) gMotorTest.startedMs = nowMs;
+    gMotorTest.motor = physMotor;
+    gMotorTest.raw = raw;
+    gMotorTest.expiresAtMs = nowMs + holdMs;
+    accepted = true;
+  }
+  portEXIT_CRITICAL(&gFlightMux);
+  if (!accepted) {
+    fcu_log::logf(fcu_log::Level::Warn,
+                  "[MOTOR_TEST] refused: another output is under test\n");
+    return false;
+  }
+  if (fresh) {
+    fcu_log::logf(fcu_log::Level::Info,
+                  "[MOTOR_TEST] session start OUT%u raw=%u hold=%ums (deadman)\n",
+                  static_cast<unsigned>(physMotor), static_cast<unsigned>(raw),
+                  static_cast<unsigned>(holdMs));
+  }
+  return true;
+}
+
+// Always-available stop. No bench gating: stopping motors must never be
+// refused.
+bool requestMotorTestStop() {
+  uint8_t had = 0;
+  portENTER_CRITICAL(&gFlightMux);
+  had = gMotorTest.motor;
+  gMotorTest.motor = 0;
+  portEXIT_CRITICAL(&gFlightMux);
+  if (had != 0U) {
+    forceMotorStop("motor_test_stop");
+    fcu_log::logf(fcu_log::Level::Info, "[MOTOR_TEST] stopped OUT%u (web stop)\n",
+                  static_cast<unsigned>(had));
+  }
+  return true;
+}
+
+// Flight-task service. Returns true while a session owns the motors this tick
+// (the caller then skips failsafe/control exactly like the one-shot path).
+// Re-checks the full safety envelope EVERY tick — any violation stops the
+// motor immediately, not at the next web request.
+bool serviceMotorTestSession(uint32_t nowMs) {
+  uint8_t motor = 0;
+  uint16_t raw = 0;
+  uint32_t expires = 0, started = 0;
+  portENTER_CRITICAL(&gFlightMux);
+  motor = gMotorTest.motor;
+  raw = gMotorTest.raw;
+  expires = gMotorTest.expiresAtMs;
+  started = gMotorTest.startedMs;
+  portEXIT_CRITICAL(&gFlightMux);
+  if (motor == 0U) return false;
+
+  uint8_t throttle = 0;
+  bool failsafe = false;
+  portENTER_CRITICAL(&gControlMux);
+  throttle = gState.control.appliedThrottlePercent;
+  failsafe = gState.control.failsafeActive;
+  portEXIT_CRITICAL(&gControlMux);
+
+  const bool envOk = gState.escReady && !escStartupSettleActive(nowMs) &&
+                     throttle == 0U && !failsafe &&
+                     gFlightStatePublished.load(std::memory_order_relaxed) ==
+                         flight_state::State::IDLE;
+  const bool deadmanLapsed = static_cast<int32_t>(nowMs - expires) >= 0;
+  const bool sessionCapHit = (nowMs - started) >= MOTOR_TEST_SESSION_MAX_MS;
+  if (!envOk || deadmanLapsed || sessionCapHit) {
+    portENTER_CRITICAL(&gFlightMux);
+    gMotorTest.motor = 0;
+    portEXIT_CRITICAL(&gFlightMux);
+    forceMotorStop(!envOk ? "motor_test_env"
+                          : (deadmanLapsed ? "motor_test_deadman" : "motor_test_cap"));
+    fcu_log::logf(fcu_log::Level::Info, "[MOTOR_TEST] OUT%u stopped (%s)\n",
+                  static_cast<unsigned>(motor),
+                  !envOk ? "env change" : (deadmanLapsed ? "deadman" : "session cap"));
+    return true;
+  }
+
+  // Drive the requested PHYSICAL output. applyMotorOutputs remaps logical
+  // slots to physical pads, so command the logical slot whose map entry is
+  // this output — the wizard spins pads, not mixer positions.
+  uint8_t map[4];
+  motorMapUnpack(map);
+  std::array<uint16_t, 4> out = {0, 0, 0, 0};
+  for (int i = 0; i < 4; ++i) {
+    if (map[i] == motor) {
+      out[static_cast<size_t>(i)] = raw;
+      break;
+    }
+  }
+  applyMotorOutputs(out);
+  return true;
+}
+
+// Motors-page state snapshot (test session + cached config + saved map/dir).
+void pidWebGetMotorTest(pid_webserver::MotorTestState& s) {
+  const uint32_t nowMs = millis();
+  portENTER_CRITICAL(&gFlightMux);
+  s.activeMotor = gMotorTest.motor;
+  s.raw = gMotorTest.raw;
+  s.deadmanMsLeft = (gMotorTest.motor != 0U &&
+                     static_cast<int32_t>(gMotorTest.expiresAtMs - nowMs) > 0)
+                        ? (gMotorTest.expiresAtMs - nowMs)
+                        : 0;
+  portEXIT_CRITICAL(&gFlightMux);
+  s.testValue = gMotorTestValue.load(std::memory_order_relaxed);
+  s.holdMaxMs = gMotorTestHoldMaxMs.load(std::memory_order_relaxed);
+  s.idleEnable = gMotorIdleEnable.load(std::memory_order_relaxed);
+  s.idleValue = gMotorIdleValue.load(std::memory_order_relaxed);
+  motorMapUnpack(s.map);
+  static const char* kDirNames[4] = {"motor_dir_1", "motor_dir_2", "motor_dir_3",
+                                     "motor_dir_4"};
+  for (int i = 0; i < 4; ++i) {
+    s.dir[i] = fcuCfgReadByName(kDirNames[i], (i == 0 || i == 3) ? 0.0f : 1.0f) > 0.5f ? 1 : 0;
+  }
+  s.safe = pidWebWriteSafe();
+}
+
 bool servicePidWebMotorSpin(uint32_t nowMs) {
   uint8_t motor = 0;
   uint32_t startedMs = 0;
@@ -10768,9 +11062,14 @@ void updateControlLoop(uint32_t nowMs) {
   //      stick resumes controlled flight immediately.
   // Note: the controlled-link-loss + zero-throttle case never reaches here —
   // it exits via the soft-release branch above.
+  // Armed idle is a RUNTIME config now (motor_idle_enable / motor_idle_value
+  // via fcu_config, default OFF — arming spins props on the ground when ON).
+  // This supersedes the compile-time FCU_ARMED_IDLE_ENABLE flag: the value the
+  // Motors page shows is always the value the craft flies.
+  const bool armedIdleEnabled = gMotorIdleEnable.load(std::memory_order_relaxed);
   bool armedIdleActive = false;
   if (smoothedThrottle == 0) {
-    if (!allowFlight || !ARMED_IDLE_ENABLED) {
+    if (!allowFlight || !armedIdleEnabled) {
       // DISARMED (flight switch off / no flight mode / safe-boot incomplete /
       // failsafe) — the legitimate zero-throttle hard stop.
       forceMotorStop(!allowFlight ? "disarmed" : "zero_throttle_legacy");
@@ -10945,7 +11244,9 @@ void updateControlLoop(uint32_t nowMs) {
   // value printed by the rig/tuning logs is the post-desat base actually flown.
   float base = static_cast<float>(throttleToMotorRaw(smoothedThrottle));
   if (armedIdleActive) {
-    base = static_cast<float>(ARMED_IDLE_MOTOR_RAW);
+    // Runtime-configured idle command (>= DShot 48 floor, <= 300). Separate
+    // from the wizard's test throttle by design.
+    base = static_cast<float>(gMotorIdleValue.load(std::memory_order_relaxed));
   }
   const float roll = rollT.output * MIX_ROLL_SIGN;
   const float pitch = pitchT.output * MIX_PITCH_SIGN;
@@ -11831,7 +12132,9 @@ void flightTask(void* /*arg*/) {
     }
     serviceEscStartupSettle(nowMs);
 #if ENABLE_PID_WEBSERVER
-    if (servicePidWebMotorSpin(nowMs)) {
+    // Deadman wizard session first (it owns the motors while held), then the
+    // legacy one-shot orientation pulse.
+    if (serviceMotorTestSession(nowMs) || servicePidWebMotorSpin(nowMs)) {
       updateTaskHealth(gHealth.flight, iterStartUs, millis(), FLIGHT_OVERRUN_WARN_US);
       feedTaskWatchdog();
       flightLoopPace(lastWake, period);
@@ -12241,6 +12544,7 @@ void setup() {
   registerFcuConfigExternalBindings();
 #endif
   refreshArmingConfigCache();  // arming gates read config through atomics
+  refreshMotorConfigCache();   // motor map / armed idle / test limits likewise
   initNrfStatusLeds();
 
   // ---- Nav status LED (4 blinks on first GPS fix and on origin lock) ------

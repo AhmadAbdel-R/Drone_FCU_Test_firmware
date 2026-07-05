@@ -1312,6 +1312,117 @@ esp_err_t handleCaptureCsv(httpd_req_t* req) {
 }
 
 // ============================================================================
+// Motors page endpoints — deadman motor test + order/direction save.
+// ============================================================================
+
+// GET /api/motors — session + config snapshot (no auth; read-only).
+esp_err_t handleGetMotors(httpd_req_t* req) {
+  if (!gCb.getMotorTest) return sendError(req, 500, "no_callback");
+  MotorTestState s;
+  gCb.getMotorTest(s);
+  char body[420];
+  const int n = snprintf(body, sizeof(body),
+      "{\"active\":%u,\"raw\":%u,\"deadmanMs\":%lu,\"testValue\":%u,\"holdMaxMs\":%u,"
+      "\"idleEnable\":%s,\"idleValue\":%u,\"map\":[%u,%u,%u,%u],\"dir\":[%u,%u,%u,%u],"
+      "\"safe\":%s}",
+      s.activeMotor, s.raw, (unsigned long)s.deadmanMsLeft, s.testValue, s.holdMaxMs,
+      s.idleEnable ? "true" : "false", s.idleValue,
+      s.map[0], s.map[1], s.map[2], s.map[3],
+      s.dir[0], s.dir[1], s.dir[2], s.dir[3],
+      s.safe ? "true" : "false");
+  if (n < 0 || n >= (int)sizeof(body)) return sendError(req, 500, "fmt");
+  return sendJson(req, body);
+}
+
+// POST /api/motors/test {"motor":1..4,"value":raw?,"ms":hold?,"ack":"props-removed"}
+// PROPS-OFF ONLY. The ack string is required on every request — the UI wires
+// it to an explicit "propellers removed" checkbox. Deadman: the browser must
+// re-POST before `ms` elapses or the firmware stops the motor.
+esp_err_t handleMotorsTest(httpd_req_t* req) {
+  if (!gCb.motorTestRun) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
+  char body[192];
+  if (recvBody(req, body, sizeof(body)) < 0) return sendError(req, 400, "bad_body");
+  if (strstr(body, "\"ack\"") == nullptr || strstr(body, "props-removed") == nullptr) {
+    return sendError(req, 400, "props_ack_required");
+  }
+  float motor = 0.0f, value = 0.0f, ms = 0.0f;
+  if (!parseJsonFloat(body, "motor", motor)) return sendError(req, 400, "bad_json");
+  parseJsonFloat(body, "value", value);  // optional; 0 = configured default
+  parseJsonFloat(body, "ms", ms);        // optional; 0 = 400 ms
+  if (motor < 1.0f || motor > 4.0f) return sendError(req, 400, "bad_motor");
+  if (!gCb.motorTestRun(static_cast<uint8_t>(motor), static_cast<uint16_t>(value),
+                        static_cast<uint16_t>(ms))) {
+    return sendError(req, 409, "motor_test_refused");
+  }
+  return sendJson(req, "{\"ok\":true}");
+}
+
+// POST /api/motors/stop — auth only; never gated on bench state.
+esp_err_t handleMotorsStop(httpd_req_t* req) {
+  if (!gCb.motorTestStop) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  (void)gCb.motorTestStop();
+  return sendJson(req, "{\"ok\":true,\"stopped\":true}");
+}
+
+// POST /api/motors/save-order {"map":[p1,p2,p3,p4]} — logical slot i (FR/RR/
+// FL/RL) drives physical output p_i. Must be a permutation of 1..4.
+esp_err_t handleMotorsSaveOrder(httpd_req_t* req) {
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
+  char body[128];
+  if (recvBody(req, body, sizeof(body)) < 0) return sendError(req, 400, "bad_body");
+  float m[4] = {};
+  if (!parseJsonFloat4(body, "map", m)) return sendError(req, 400, "bad_json");
+  bool seen[4] = {false, false, false, false};
+  for (float v : m) {
+    const int iv = (int)v;
+    if (v != (float)iv || iv < 1 || iv > 4 || seen[iv - 1]) {
+      return sendError(req, 400, "map_not_permutation");
+    }
+    seen[iv - 1] = true;
+  }
+  static const char* kNames[4] = {"motor_map_1", "motor_map_2", "motor_map_3", "motor_map_4"};
+  for (int i = 0; i < 4; ++i) {
+    if (!fcu_config::setAndSave(kNames[i], m[i])) {
+      return sendError(req, 500, "save_failed");
+    }
+  }
+  return sendJson(req, "{\"ok\":true,\"persisted\":true}");
+}
+
+// POST /api/motors/save-direction {"dir":[0/1 x4]} — CW/CCW metadata per
+// logical slot (documentation + future mixer-sign validation; DShot cannot
+// reverse a motor without ESC config).
+esp_err_t handleMotorsSaveDirection(httpd_req_t* req) {
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
+  char body[128];
+  if (recvBody(req, body, sizeof(body)) < 0) return sendError(req, 400, "bad_body");
+  float d[4] = {};
+  if (!parseJsonFloat4(body, "dir", d)) return sendError(req, 400, "bad_json");
+  for (float v : d) {
+    if (v != 0.0f && v != 1.0f) return sendError(req, 400, "bad_direction");
+  }
+  static const char* kNames[4] = {"motor_dir_1", "motor_dir_2", "motor_dir_3", "motor_dir_4"};
+  for (int i = 0; i < 4; ++i) {
+    if (!fcu_config::setAndSave(kNames[i], d[i])) {
+      return sendError(req, 500, "save_failed");
+    }
+  }
+  // Mixer-sign sanity: with the standard Quad-X geometry, diagonal motors
+  // spin the same direction and adjacent ones opposite. Warn (not fail) so
+  // unconventional props-out setups stay possible.
+  const bool conventional = (d[0] == d[3]) && (d[1] == d[2]) && (d[0] != d[1]);
+  char resp[96];
+  snprintf(resp, sizeof(resp), "{\"ok\":true,\"persisted\":true,\"conventional\":%s}",
+           conventional ? "true" : "false");
+  return sendJson(req, resp);
+}
+
+// ============================================================================
 // Config registry endpoints (fcu_config). The registry is a firmware module,
 // not a callback — it owns its own locking and validation, and every mutation
 // is additionally gated here on auth + bench-idle exactly like the callbacks.
@@ -1539,6 +1650,12 @@ bool startHttpServer() {
   registerUri(gServer, "/api/servo/stop",      HTTP_POST, handleServoStop);
   registerUri(gServer, "/api/servo/release",   HTTP_POST, handleServoRelease);
   registerUri(gServer, "/api/servo/config",    HTTP_PUT,  handleServoConfig);
+  // ---- Motors page (deadman test + order/direction) ----
+  registerUri(gServer, "/api/motors",               HTTP_GET,  handleGetMotors);
+  registerUri(gServer, "/api/motors/test",          HTTP_POST, handleMotorsTest);
+  registerUri(gServer, "/api/motors/stop",          HTTP_POST, handleMotorsStop);
+  registerUri(gServer, "/api/motors/save-order",    HTTP_POST, handleMotorsSaveOrder);
+  registerUri(gServer, "/api/motors/save-direction", HTTP_POST, handleMotorsSaveDirection);
   // ---- Config registry (fcu_config) ----
   registerUri(gServer, "/api/config",           HTTP_GET,  handleGetConfig);
   registerUri(gServer, "/api/config",           HTTP_POST, handlePostConfig);

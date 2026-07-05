@@ -320,6 +320,20 @@ struct SensorsLiveSnapshot {
   uint16_t loopHz = 0;
 };
 
+// Motors-page snapshot: deadman test session + motor order/direction config.
+struct MotorTestState {
+  uint8_t activeMotor = 0;     // 1..4 physical output under test; 0 = idle
+  uint16_t raw = 0;            // commanded DShot value while active
+  uint32_t deadmanMsLeft = 0;  // ms until the hold lapses without a refresh
+  uint16_t testValue = 200;    // configured default spin value (motor_test_value)
+  uint16_t holdMaxMs = 800;    // per-refresh hold ceiling (motor_test_timeout_ms)
+  bool idleEnable = false;     // armed-idle runtime config
+  uint16_t idleValue = 48;
+  uint8_t map[4] = {1, 2, 3, 4};   // logical slot -> physical output
+  uint8_t dir[4] = {0, 1, 1, 0};   // 0=CW 1=CCW metadata per logical slot
+  bool safe = false;               // bench-idle (test allowed)
+};
+
 // Read-only calibration / level / trim detail for the Attitude & Level tab.
 struct CalInfo {
   float levelOffsetDeg[2] = {0, 0};
@@ -411,6 +425,15 @@ struct Callbacks {
   bool (*calibrateImu)() = nullptr;
   // Request a short one-motor orientation pulse. Motor index is 1..4.
   bool (*spinMotor)(uint8_t oneBasedMotor) = nullptr;
+  // ---- Deadman motor-test session (Motors page wizard) ---------------------
+  // Start/refresh a held spin of one PHYSICAL output. raw==0 uses the
+  // configured motor_test_value; holdMs==0 uses 400 ms. The flight task stops
+  // the motor when refreshes lapse (deadman), on any safety-envelope change,
+  // and at the hard session cap. Returns false when refused.
+  bool (*motorTestRun)(uint8_t physMotor, uint16_t raw, uint16_t holdMs) = nullptr;
+  // Immediate stop — never gated.
+  bool (*motorTestStop)() = nullptr;
+  void (*getMotorTest)(MotorTestState& s) = nullptr;
   // ---- Mixer front-pitch bias (forward-CG compensation) -------------------
   // Read the live runtime value. Range [1.0, 2.0]; default usually 1.0 (off).
   void (*getMixPitchFrontBias)(float& out) = nullptr;

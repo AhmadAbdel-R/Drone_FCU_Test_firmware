@@ -226,6 +226,60 @@ canvas{display:block;width:100%;background:#0a0d12;border-radius:8px;border:1px 
   </div>
  </section>
 
+ <!-- ===== MOTORS (wizard + deadman test) ===== -->
+ <section class="tab" id="t_motors">
+  <div class="warnbox err" style="font-size:14px">&#9888; <b>REMOVE ALL PROPELLERS before any motor test.</b> Motors only spin while a button is physically held; releasing, closing the page or losing WiFi stops them within half a second.</div>
+  <div class="grid wide">
+   <div class="card span2"><h3>Motor test <span class="tag" id="mo_state">idle</span></h3>
+    <div class="row" style="margin-bottom:2px">
+     <label style="flex:0 0 auto;display:flex;align-items:center;gap:8px;color:var(--txt)">
+      <input type="checkbox" id="mo_ack" style="width:18px;height:18px"> <b>Propellers are removed</b>
+     </label>
+     <span class="dim small">required before any spin button works</span>
+    </div>
+    <div class="row"><label>Test value (DShot)</label>
+     <input type="number" id="mo_val" min="48" max="800" step="1" style="max-width:110px">
+     <button class="btn sm" onclick="moSaveTestVal()">Save default</button>
+     <span class="dim small">48&ndash;800 (never 1&ndash;47: DShot special commands)</span>
+    </div>
+    <div style="display:flex;gap:18px;flex-wrap:wrap;align-items:center;margin-top:8px">
+     <canvas id="mo_quad" height="240" style="width:240px;max-width:100%;flex:0 0 auto"></canvas>
+     <div style="flex:1;min-width:230px">
+      <div class="dim small" style="margin-bottom:6px">Hold a button to spin that OUTPUT (pad). Release = stop.</div>
+      <div class="btns" style="gap:10px">
+       <button class="btn" id="mo_b1" style="min-width:100px">&#9210; OUT 1</button>
+       <button class="btn" id="mo_b2" style="min-width:100px">&#9210; OUT 2</button>
+       <button class="btn" id="mo_b3" style="min-width:100px">&#9210; OUT 3</button>
+       <button class="btn" id="mo_b4" style="min-width:100px">&#9210; OUT 4</button>
+      </div>
+      <button class="btn danger" style="width:100%;margin-top:12px;font-size:15px;padding:12px"
+       onclick="moStop()">&#9632; STOP ALL MOTORS</button>
+      <div class="note" id="mo_note">--</div>
+     </div>
+    </div>
+   </div>
+   <div class="card span2"><h3>Motor order wizard <span class="tag" id="mw_tag">idle</span></h3>
+    <div class="note">Spins each OUTPUT one at a time; you tell it which corner moved and which way it spins (seen from above). Finish writes the motor map + direction metadata to the config. Props off, craft held or strapped down.</div>
+    <div id="mw_body" style="margin-top:8px"><div class="dim small">Not started.</div></div>
+    <div class="btns" style="margin-top:8px">
+     <button class="btn pri" id="mw_start" onclick="mwStart()">Start wizard</button>
+    </div>
+   </div>
+   <div class="card"><h3>Saved order &amp; direction</h3>
+    <table><thead><tr><th>Mixer slot</th><th>Output</th><th>Direction</th></tr></thead>
+    <tbody id="mo_maptable"></tbody></table>
+    <div class="note">Mixer slots keep the Quad-X geometry (M1 FR, M2 RR, M3 FL, M4 RL); the map re-routes which pad each slot drives. Direction is metadata — reversing a motor requires ESC configuration (AM32/BLHeli), not the FCU.</div>
+   </div>
+   <div class="card"><h3>Armed idle <span class="tag warn">spins props on arm</span></h3>
+    <div class="warnbox">When enabled, arming immediately spins all motors at the idle value — like every commercial FCU. Leave OFF until the airframe passes the props-off checklist.</div>
+    <div class="row"><label>Idle on arm</label><input type="checkbox" id="mo_idleen" style="width:18px;height:18px"></div>
+    <div class="row"><label>Idle value (DShot)</label><input type="number" id="mo_idleval" min="48" max="300" step="1" style="max-width:110px"></div>
+    <div class="btns"><button class="btn pri" onclick="moSaveIdle()">Save idle config</button></div>
+    <div class="note">Idle stops on disarm, failsafe and kill switch. Separate from the test value above.</div>
+   </div>
+  </div>
+ </section>
+
  <!-- ===== ATTITUDE & LEVEL ===== -->
  <section class="tab" id="t_attitude">
   <div class="grid wide">
@@ -547,7 +601,7 @@ async function put(url,okMsg,body){
  }catch(e){toast('Network error',true);return false;}
 }
 // ---------- tabs ----------
-const TABS=[['overview','Overview'],['setup','Setup'],['attitude','Attitude & Level'],['pid','PID Tuning'],
+const TABS=[['overview','Overview'],['setup','Setup'],['motors','Motors'],['attitude','Attitude & Level'],['pid','PID Tuning'],
  ['diag','PID Diagnostics'],['mixer','Motor Mixer'],['sensors','Sensors'],['radio','Radio & Links'],
  ['vibe','Vibration & FFT'],['notch','Filters & Notch'],['servo','Pan/Tilt'],['capture','Capture'],['config','Config']];
 let activeTab='overview';
@@ -1283,6 +1337,152 @@ async function capClear(){if(confirm('Clear diagnostic capture?')&&await act('/a
 function capDownload(){window.location.href='/api/capture.csv';}
 STAGE.capture=()=>{capPoll();if(!capTimer)capTimer=setInterval(()=>{if(activeTab==='capture')capPoll();else{clearInterval(capTimer);capTimer=null;}},500);};
 (function(){const prev=window.onRender;window.onRender=m=>{if(prev)prev(m);if(activeTab==='vibe')renderVibe(m);if(activeTab==='pid')renderYawCard(m);};})();
+// ===== Motors tab (deadman test + order wizard) =============================
+// SAFETY MODEL: a motor spins only while a hold-button is down. The browser
+// re-POSTs /api/motors/test every 150 ms with a 400 ms deadman; the firmware
+// stops the motor when refreshes lapse for ANY reason (release, tab close,
+// WiFi drop). The STOP button and props-removed checkbox are always visible.
+let MO={cfg:null,holdTimer:null,holdOut:0,pollTimer:null};
+async function moPoll(){try{const r=await fetch('/api/motors');if(!r.ok)return;MO.cfg=await r.json();moRender();}catch(e){}}
+function moAck(){return document.getElementById('mo_ack').checked;}
+function moVal(){const v=+document.getElementById('mo_val').value||0;return Math.max(48,Math.min(800,v));}
+async function moSendTest(out){
+ try{const r=await fetch('/api/motors/test',{method:'POST',headers:authHdrs({'content-type':'application/json'}),
+  body:JSON.stringify({motor:out,value:moVal(),ms:400,ack:'props-removed'})});
+  if(!r.ok){moHoldEnd(false);let m='refused';try{const j=await r.json();m=j.error||m;}catch(e){}
+   toast('Motor test '+m,true);}
+ }catch(e){moHoldEnd(false);}
+}
+function moHoldStart(out){
+ if(!moAck()){toast('Check "Propellers are removed" first',true);return;}
+ if(MO.holdOut)return;
+ MO.holdOut=out;moSendTest(out);
+ MO.holdTimer=setInterval(()=>moSendTest(out),150);
+ moRender();
+}
+function moHoldEnd(sendStop){
+ if(MO.holdTimer){clearInterval(MO.holdTimer);MO.holdTimer=null;}
+ if(MO.holdOut){MO.holdOut=0;if(sendStop!==false)moStop(true);}
+ moRender();
+}
+async function moStop(quiet){
+ try{await fetch('/api/motors/stop',{method:'POST',headers:authHdrs()});}catch(e){}
+ if(!quiet)toast('Motors stopped');
+ moPoll();
+}
+function moBindHold(){
+ const ie=document.getElementById('mo_idleen');
+ if(ie&&!ie._bound){ie._bound=1;ie.addEventListener('change',()=>ie._touched=1);}
+ for(let n=1;n<=4;n++){const b=document.getElementById('mo_b'+n);if(!b||b._bound)continue;b._bound=1;
+  b.addEventListener('pointerdown',e=>{e.preventDefault();b.setPointerCapture(e.pointerId);moHoldStart(n);});
+  ['pointerup','pointercancel','pointerleave','lostpointercapture'].forEach(ev=>
+   b.addEventListener(ev,()=>{if(MO.holdOut===n)moHoldEnd();}));
+  b.addEventListener('contextmenu',e=>e.preventDefault());}
+}
+// stop on tab hide / navigation as extra belt-and-braces (deadman covers it anyway)
+document.addEventListener('visibilitychange',()=>{if(document.hidden&&MO.holdOut)moHoldEnd();});
+function moDrawQuad(){
+ const cv=document.getElementById('mo_quad');if(!cv)return;
+ const d=Math.min(window.devicePixelRatio||1,2),S=240;
+ if(cv.width!==S*d){cv.width=S*d;cv.height=S*d;}
+ const x=cv.getContext('2d');x.setTransform(d,0,0,d,0,0);x.clearRect(0,0,S,S);
+ const c=S/2,arm=78,r=30;
+ const cfg=MO.cfg||{map:[1,2,3,4],dir:[0,1,1,0],active:0};
+ // logical slots: 0=FR 1=RR 2=FL 3=RL — canvas: nose up
+ const pos=[[c+arm,c-arm],[c+arm,c+arm],[c-arm,c-arm],[c-arm,c+arm]];
+ x.strokeStyle='#28303f';x.lineWidth=8;
+ x.beginPath();x.moveTo(pos[2][0],pos[2][1]);x.lineTo(pos[1][0],pos[1][1]);
+ x.moveTo(pos[0][0],pos[0][1]);x.lineTo(pos[3][0],pos[3][1]);x.stroke();
+ // nose arrow
+ x.fillStyle='#3fa9ff';x.beginPath();x.moveTo(c,c-30);x.lineTo(c-10,c-8);x.lineTo(c+10,c-8);x.closePath();x.fill();
+ x.font='11px system-ui';x.textAlign='center';
+ const names=['FR','RR','FL','RL'];
+ for(let i=0;i<4;i++){
+  const out=cfg.map[i],act=cfg.active===out&&out>0;
+  x.beginPath();x.arc(pos[i][0],pos[i][1],r,0,7);
+  x.fillStyle=act?'#13314d':'#161c28';x.fill();
+  x.strokeStyle=act?'#3fa9ff':'#28303f';x.lineWidth=2;x.stroke();
+  // direction arc (from above): CW or CCW
+  x.strokeStyle=cfg.dir[i]?'#33d17a':'#ffb020';x.lineWidth=2;
+  x.beginPath();
+  if(cfg.dir[i])x.arc(pos[i][0],pos[i][1],r-6,0.6,2.5);else x.arc(pos[i][0],pos[i][1],r-6,0.6,2.5,false);
+  x.stroke();
+  const ang=cfg.dir[i]?2.5:0.6,ax=pos[i][0]+(r-6)*Math.cos(ang),ay=pos[i][1]+(r-6)*Math.sin(ang);
+  x.fillStyle=cfg.dir[i]?'#33d17a':'#ffb020';
+  x.beginPath();x.arc(ax,ay,3,0,7);x.fill();
+  x.fillStyle='#e7ebf2';x.fillText('OUT '+out,pos[i][0],pos[i][1]-2);
+  x.fillStyle='#8a94a6';x.fillText(names[i]+' · '+(cfg.dir[i]?'CCW':'CW'),pos[i][0],pos[i][1]+12);
+ }
+}
+function moRender(){
+ const cfg=MO.cfg;if(!cfg)return;
+ const st=document.getElementById('mo_state');
+ if(cfg.active){st.className='tag warn';st.textContent='SPINNING OUT '+cfg.active+' @ '+cfg.raw;}
+ else if(!cfg.safe){st.className='tag err';st.textContent='NOT BENCH-IDLE';}
+ else{st.className='tag ok';st.textContent='ready';}
+ const val=document.getElementById('mo_val');
+ if(document.activeElement!==val&&!val.value)val.value=cfg.testValue;
+ const ie=document.getElementById('mo_idleen'),iv=document.getElementById('mo_idleval');
+ if(document.activeElement!==ie&&!ie._touched)ie.checked=!!cfg.idleEnable;
+ if(document.activeElement!==iv&&!iv.value)iv.value=cfg.idleValue;
+ document.getElementById('mo_note').textContent=
+  'deadman '+(cfg.deadmanMs||0)+' ms · hold ceiling '+cfg.holdMaxMs+' ms · session cap 120 s';
+ const names=['M1 · front-right','M2 · rear-right','M3 · front-left','M4 · rear-left'];
+ document.getElementById('mo_maptable').innerHTML=cfg.map.map((o,i)=>
+  '<tr><td>'+names[i]+'</td><td class="mono">OUT '+o+'</td><td>'+(cfg.dir[i]?'CCW':'CW')+'</td></tr>').join('');
+ moDrawQuad();
+}
+function moSaveTestVal(){act('/api/config','Test value saved',{motor_test_value:moVal()});}
+function moSaveIdle(){
+ const en=document.getElementById('mo_idleen').checked?1:0;
+ const v=Math.max(48,Math.min(300,+document.getElementById('mo_idleval').value||48));
+ if(en&&!confirm('Enable ARMED IDLE?\n\nArming will spin ALL motors at '+v+' immediately, on the ground. Only proceed if the props-off checklist passed.'))return;
+ act('/api/config','Armed-idle config saved',{motor_idle_enable:en,motor_idle_value:v});
+}
+// ---- order wizard ----
+let MW={run:false,out:1,ans:{}};
+function mwStart(){MW={run:true,out:1,ans:{}};document.getElementById('mw_tag').textContent='output 1 of 4';mwDraw();}
+function mwPick(kind,v){
+ const a=MW.ans[MW.out]=MW.ans[MW.out]||{};a[kind]=v;mwDraw();
+}
+function mwNext(){
+ const a=MW.ans[MW.out];
+ if(!a||a.pos==null||a.dir==null){toast('Pick the corner and direction first',true);return;}
+ if(MW.out<4){MW.out++;document.getElementById('mw_tag').textContent='output '+MW.out+' of 4';mwDraw();}
+ else mwFinish();
+}
+async function mwFinish(){
+ MW.run=false;
+ const posOf={};let dup=false;
+ for(let o=1;o<=4;o++){const p=MW.ans[o].pos;if(posOf[p]!=null)dup=true;posOf[p]=o;}
+ if(dup){toast('Two outputs were assigned the same corner — restart',true);
+  document.getElementById('mw_tag').textContent='conflict';mwDraw();return;}
+ // logical order: 0=FR 1=RR 2=FL 3=RL; map[i]=output at that corner
+ const map=[posOf.FR,posOf.RR,posOf.FL,posOf.RL];
+ const dirOf={};for(let o=1;o<=4;o++)dirOf[o]=MW.ans[o].dir;
+ const dir=map.map(o=>dirOf[o]==='CCW'?1:0);
+ const ok1=await act('/api/motors/save-order','Motor order saved',{map:map});
+ const ok2=ok1&&await act('/api/motors/save-direction','Directions saved',{dir:dir});
+ document.getElementById('mw_tag').textContent=(ok1&&ok2)?'saved':'save failed';
+ document.getElementById('mw_tag').className='tag '+((ok1&&ok2)?'ok':'err');
+ mwDraw();moPoll();
+}
+function mwDraw(){
+ const el=document.getElementById('mw_body');if(!el)return;
+ if(!MW.run){if(!Object.keys(MW.ans).length)el.innerHTML='<div class="dim small">Not started.</div>';return;}
+ const a=MW.ans[MW.out]||{};
+ const corner=(p,l)=>'<button class="btn sm'+(a.pos===p?' pri':'')+'" onclick="mwPick(\'pos\',\''+p+'\')">'+l+'</button>';
+ const dirb=(dv,l)=>'<button class="btn sm'+(a.dir===dv?' pri':'')+'" onclick="mwPick(\'dir\',\''+dv+'\')">'+l+'</button>';
+ el.innerHTML=
+  '<div class="warnbox">Hold <b>OUT '+MW.out+'</b> above (props off). Watch which corner motor turns.</div>'
+ +'<div class="row"><label>Corner that spun</label><div class="btns">'
+ +corner('FR','Front-right')+corner('RR','Rear-right')+corner('FL','Front-left')+corner('RL','Rear-left')+'</div></div>'
+ +'<div class="row"><label>Direction (from above)</label><div class="btns">'
+ +dirb('CW','Clockwise')+dirb('CCW','Counter-clockwise')+'</div></div>'
+ +'<div class="btns"><button class="btn pri" onclick="mwNext()">'+(MW.out<4?'Next output':'Finish & save')+'</button></div>';
+}
+STAGE.motors=()=>{moBindHold();moPoll();
+ if(!MO.pollTimer)MO.pollTimer=setInterval(()=>{if(activeTab==='motors')moPoll();else{clearInterval(MO.pollTimer);MO.pollTimer=null;}},600);};
 // ===== Setup / Instruments tab ==============================================
 // Artificial horizon + heading tape drawn from the corrected estimator
 // attitude (m.att.cr/cp) and the active heading source. All 2D canvas — no
