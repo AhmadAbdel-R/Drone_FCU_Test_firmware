@@ -200,6 +200,32 @@ canvas{display:block;width:100%;background:#0a0d12;border-radius:8px;border:1px 
   </div>
  </section>
 
+ <!-- ===== SETUP / INSTRUMENTS ===== -->
+ <section class="tab" id="t_setup">
+  <div class="grid wide">
+   <div class="card span2"><h3>Instruments <span class="small dim">estimator attitude &middot; a wrong board orientation shows here immediately</span></h3>
+    <canvas id="su_tape" height="44"></canvas>
+    <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start;margin-top:10px">
+     <canvas id="su_ah" height="330" style="width:330px;max-width:100%;flex:0 0 auto"></canvas>
+     <div style="flex:1;min-width:210px">
+      <div id="su_nums"></div>
+      <div class="note" style="margin-top:8px">The horizon uses the <b>corrected estimator attitude</b> (same signal the angle controller flies), not raw gyro integration. Tilt the craft by hand: the horizon must move opposite the craft, like a real ADI.</div>
+     </div>
+    </div>
+   </div>
+   <div class="card"><h3>Arming <span class="tag" id="su_armtag">--</span></h3><div id="su_arm"></div></div>
+   <div class="card"><h3>Sensor health</h3><div id="su_sens"></div></div>
+   <div class="card span2"><h3>Board alignment test <span class="tag" id="su_altag">idle</span></h3>
+    <div class="note">Props off. This guided check confirms the IMU axes match the airframe: tilt the craft and verify the instruments answer in the correct direction. A failed step almost always means a wrong board mounting/rotation.</div>
+    <div id="su_alsteps" style="margin:10px 0"></div>
+    <div class="btns">
+     <button class="btn pri" id="su_albtn" onclick="alignStart()">Start test</button>
+     <button class="btn sm" onclick="alignSkip()" id="su_alskip" disabled>Skip step</button>
+    </div>
+   </div>
+  </div>
+ </section>
+
  <!-- ===== ATTITUDE & LEVEL ===== -->
  <section class="tab" id="t_attitude">
   <div class="grid wide">
@@ -521,7 +547,7 @@ async function put(url,okMsg,body){
  }catch(e){toast('Network error',true);return false;}
 }
 // ---------- tabs ----------
-const TABS=[['overview','Overview'],['attitude','Attitude & Level'],['pid','PID Tuning'],
+const TABS=[['overview','Overview'],['setup','Setup'],['attitude','Attitude & Level'],['pid','PID Tuning'],
  ['diag','PID Diagnostics'],['mixer','Motor Mixer'],['sensors','Sensors'],['radio','Radio & Links'],
  ['vibe','Vibration & FFT'],['notch','Filters & Notch'],['servo','Pan/Tilt'],['capture','Capture'],['config','Config']];
 let activeTab='overview';
@@ -620,7 +646,8 @@ function render(m){
  renderHealth(m);renderWarn(warns);renderOvRc(m);renderOvServo(m);
  setDroneTarget(m.att,m.sen&&m.sen.mag);renderOvHeading(m);drawMix(document.getElementById('ov_mix'),m,true);
  // active tab content
- if(activeTab==='attitude')renderAttitude(m);
+ if(activeTab==='setup')renderSetup(m);
+ else if(activeTab==='attitude')renderAttitude(m);
  else if(activeTab==='diag')renderDiag(m);
  else if(activeTab==='mixer')renderMixer(m);
  else if(activeTab==='sensors')renderSensors(m);
@@ -1256,5 +1283,159 @@ async function capClear(){if(confirm('Clear diagnostic capture?')&&await act('/a
 function capDownload(){window.location.href='/api/capture.csv';}
 STAGE.capture=()=>{capPoll();if(!capTimer)capTimer=setInterval(()=>{if(activeTab==='capture')capPoll();else{clearInterval(capTimer);capTimer=null;}},500);};
 (function(){const prev=window.onRender;window.onRender=m=>{if(prev)prev(m);if(activeTab==='vibe')renderVibe(m);if(activeTab==='pid')renderYawCard(m);};})();
+// ===== Setup / Instruments tab ==============================================
+// Artificial horizon + heading tape drawn from the corrected estimator
+// attitude (m.att.cr/cp) and the active heading source. All 2D canvas — no
+// libraries, works offline on the FCU AP.
+const AF_NAMES=['THROTTLE_HIGH','KILL_SWITCH','RX_INVALID','GYRO_NOT_CAL','GYRO_UNSTABLE',
+ 'ACCEL_NOT_CAL','MAG_NOT_CAL','GPS_NO_FIX','GPS_SATS_LOW','GPS_HDOP_HIGH','BARO_MISSING',
+ 'BATTERY','MOTOR_TEST','CONFIG_WRITE','FAILSAFE','BOARD_TILT','SAFE_BOOT','IMU_INVALID',
+ 'ESC_NOT_READY','ARM_SWITCH_CYCLE_REQUIRED'];
+const AF_HINT={THROTTLE_HIGH:'lower the throttle stick',RX_INVALID:'no RC link',
+ GYRO_NOT_CAL:'run gyro calibration',GYRO_UNSTABLE:'keep the craft still',
+ ACCEL_NOT_CAL:'run accel calibration',MAG_NOT_CAL:'calibrate the compass',
+ GPS_NO_FIX:'wait for GPS fix',GPS_SATS_LOW:'wait for more satellites',
+ GPS_HDOP_HIGH:'GPS accuracy poor',BARO_MISSING:'barometer unhealthy',
+ BATTERY:'battery low or absent',MOTOR_TEST:'motor test running',
+ CONFIG_WRITE:'config write in progress',FAILSAFE:'clear the failsafe',
+ BOARD_TILT:'level the craft',SAFE_BOOT:'hold throttle low after boot',
+ IMU_INVALID:'IMU not ready',ESC_NOT_READY:'ESC init incomplete',
+ ARM_SWITCH_CYCLE_REQUIRED:'cycle the arm switch OFF then ON'};
+function headingSource(m){
+ const g=m.sen&&m.sen.mag,e=g&&g.ext||{};
+ if(g&&g.v===1&&g.src===2)return{deg:+(e.hdg??g.hdg)||0,src:'mag'};
+ return{deg:((+m.att.ry%360)+360)%360,src:'gyro'};
+}
+function drawAH(cv,rollDeg,pitchDeg){
+ const d=Math.min(window.devicePixelRatio||1,2),S=330;
+ if(cv.width!==S*d){cv.width=S*d;cv.height=S*d;}
+ const x=cv.getContext('2d');x.setTransform(d,0,0,d,0,0);x.clearRect(0,0,S,S);
+ const c=S/2,R=c-6,ppd=3.2; // pixels per degree of pitch
+ x.save();x.beginPath();x.arc(c,c,R,0,7);x.clip();
+ x.translate(c,c);x.rotate(-rollDeg*Math.PI/180);
+ const off=pitchDeg*ppd;
+ // sky / ground split by the horizon (positive pitch = nose up = more ground visible below center)
+ x.fillStyle='#2d6cd0';x.fillRect(-S,-S*1.5+off,2*S,1.5*S);
+ x.fillStyle='#7a5230';x.fillRect(-S,off,2*S,1.5*S);
+ x.strokeStyle='#e7ebf2';x.lineWidth=2;x.beginPath();x.moveTo(-S,off);x.lineTo(S,off);x.stroke();
+ // pitch ladder every 10 deg, minor 5 deg
+ x.font='10px system-ui';x.textAlign='center';x.lineWidth=1.2;
+ for(let p=-40;p<=40;p+=5){if(p===0)continue;const y=off+(-p)*ppd*2;const w=(p%10===0)?38:20;
+  x.strokeStyle=p>0?'#ffffffcc':'#ffffff88';x.beginPath();x.moveTo(-w,y);x.lineTo(w,y);x.stroke();
+  if(p%10===0){x.fillStyle='#fff';x.fillText(Math.abs(p),w+13,y+3);x.fillText(Math.abs(p),-w-13,y+3);}}
+ x.restore();
+ // roll arc + pointer
+ x.save();x.translate(c,c);
+ x.strokeStyle='#8a94a6';x.lineWidth=1.5;
+ for(const a of[-60,-45,-30,-20,-10,0,10,20,30,45,60]){
+  const t=(a-90)*Math.PI/180,l=(a%30===0)?12:7;
+  x.beginPath();x.moveTo((R-2)*Math.cos(t),(R-2)*Math.sin(t));
+  x.lineTo((R-2-l)*Math.cos(t),(R-2-l)*Math.sin(t));x.stroke();}
+ x.rotate(-rollDeg*Math.PI/180);
+ x.fillStyle='#ffb020';x.beginPath();x.moveTo(0,-R+16);x.lineTo(-7,-R+30);x.lineTo(7,-R+30);x.closePath();x.fill();
+ x.restore();
+ // fixed reticle (the aircraft symbol never moves)
+ x.strokeStyle='#ffb020';x.lineWidth=3;x.beginPath();
+ x.moveTo(c-58,c);x.lineTo(c-18,c);x.moveTo(c+18,c);x.lineTo(c+58,c);
+ x.moveTo(c-18,c);x.lineTo(c-8,c+9);x.lineTo(c,c);x.lineTo(c+8,c+9);x.lineTo(c+18,c);x.stroke();
+ x.strokeStyle='#28303f';x.lineWidth=2;x.beginPath();x.arc(c,c,R,0,7);x.stroke();
+}
+function drawTape(cv,hdgDeg){
+ const{ctx:x,W,H}=canvasCtx(cv);
+ const ppd=W/80; // 80 deg visible
+ x.font='11px system-ui';x.textAlign='center';
+ for(let a=-45;a<=45;a+=5){
+  const deg=((Math.round((hdgDeg+a)/5)*5)%360+360)%360;
+  const dd=(deg-hdgDeg+540)%360-180;const xx=W/2+dd*ppd;
+  if(xx<-10||xx>W+10)continue;
+  const major=deg%30===0;
+  x.strokeStyle=major?'#e7ebf2':'#5d6678';x.lineWidth=major?2:1;
+  x.beginPath();x.moveTo(xx,H-14);x.lineTo(xx,H-(major?30:22));x.stroke();
+  if(major){const names={0:'N',90:'E',180:'S',270:'W'};
+   x.fillStyle=names[deg]?'#3fa9ff':'#8a94a6';x.fillText(names[deg]||deg,xx,H-33);}}
+ x.fillStyle='#ffb020';x.beginPath();x.moveTo(W/2,H-2);x.lineTo(W/2-6,H-12);x.lineTo(W/2+6,H-12);x.closePath();x.fill();
+}
+function renderSetup(m){
+ const st=m.sys,att=m.att,sen=m.sen;
+ const h=headingSource(m);
+ drawAH(document.getElementById('su_ah'),+att.cr||0,+att.cp||0);
+ drawTape(document.getElementById('su_tape'),h.deg);
+ document.getElementById('su_nums').innerHTML=
+  kv('Roll / Pitch',f(att.cr,1)+'° / '+f(att.cp,1)+'°')
+ +kv('Heading',f(h.deg,0)+'° ('+h.src+')')
+ +kv('Gyro yaw',f(att.ry,1)+'°')
+ +kv('Mag field',sen.mag?f((sen.mag.ext&&sen.mag.ext.f)??sen.mag.f,1)+' µT':'--')
+ +kv('Baro altitude',sen.baro.v?f(sen.baro.alt,2)+' m':'<span class="dim">--</span>')
+ +kv('Loop',st.loop+' Hz · max '+st.maxus+' µs · ovr '+st.ovr);
+ // arming card
+ const flags=+st.armf||0,latch=!!st.armlatch;
+ const tag=document.getElementById('su_armtag');
+ if(st.armed){tag.className='tag err';tag.textContent='ARMED';}
+ else if(flags===0){tag.className='tag ok';tag.textContent='READY TO ARM';}
+ else{tag.className='tag warn';tag.textContent='BLOCKED';}
+ let ah='';
+ if(st.armed)ah='<div class="warnbox err">Craft is ARMED. Do not touch props.</div>';
+ else if(flags===0)ah='<div class="warnbox ok">All arming checks pass.</div>';
+ else{ah='<div class="dim small" style="margin-bottom:6px">Arming disabled because:</div>';
+  for(let b=0;b<AF_NAMES.length;b++)if(flags&(1<<b))
+   ah+='<div class="warnbox">'+AF_NAMES[b]+(AF_HINT[AF_NAMES[b]]?' — <span class="dim">'+AF_HINT[AF_NAMES[b]]+'</span>':'')+'</div>';}
+ document.getElementById('su_arm').innerHTML=ah;
+ // sensor health card
+ const g=sen.gps,mg=sen.mag,e=mg&&mg.ext||{};
+ document.getElementById('su_sens').innerHTML=
+  kv('IMU',(m.imu.rdy?led('ok'):led('err'))+(m.imu.rdy?'ready':'not ready'))
+ +kv('Gyro cal',(m.imu.gbv?led('ok'):led('warn'))+(m.imu.gbv?'valid':'missing'))
+ +kv('Accel cal',(m.imu.av?led('ok'):led('warn'))+(m.imu.av?'valid':'missing'))
+ +kv('GPS',(g.comp?(g.fix?led('ok'):led('warn')):led('grey'))+(g.comp?(g.fix?'fix q'+g.q:'no fix')+' · '+g.sats+' sats · HDOP '+(g.hdv?f(g.hdop,1):'--'):'not compiled'))
+ +kv('Compass',((mg.v===1)?led('ok'):led('warn'))+((e.cal||mg.cal)?'calibrated':'uncalibrated')+' · '+f(e.f??mg.f,0)+' µT')
+ +kv('Baro',(sen.baro.v?led('ok'):led('err'))+(sen.baro.v?f(sen.baro.alt,2)+' m':'invalid'))
+ +kv('Rangefinder',(sen.tof.comp?(sen.tof.rng?led('ok'):led('warn')):led('grey'))+(sen.tof.comp?(sen.tof.rng?sen.tof.mm+' mm':'not ranging'):'not compiled'));
+ alignTick(m,h);
+}
+// ---- board alignment wizard ----
+// Steps verify estimator sign conventions against physical motion.
+const AL_STEPS=[
+ {id:'level',t:'Place the craft LEVEL and still',chk:(m)=>Math.abs(m.att.cr)<6&&Math.abs(m.att.cp)<6,
+  fail:null,hint:'roll/pitch should read near 0°'},
+ {id:'nose',t:'Tilt the NOSE DOWN ~20°',chk:(m)=>m.att.cp<-12,fail:(m)=>m.att.cp>12,
+  hint:'pitch must go NEGATIVE (horizon drops). If it goes positive, pitch axis is reversed.'},
+ {id:'roll',t:'Return level, then ROLL RIGHT ~20° (right side down)',chk:(m)=>m.att.cr>12,fail:(m)=>m.att.cr<-12,
+  hint:'roll must go POSITIVE. If it goes negative, roll axis is reversed.'},
+ {id:'yaw',t:'Return level, then YAW CLOCKWISE ~45° (viewed from above)',chk:null,fail:null,
+  hint:'heading must INCREASE clockwise. Uses compass when valid, else gyro yaw.'},
+];
+let AL={run:false,step:0,state:[],yawRef:null,dwell:0};
+function alignStart(){AL={run:true,step:0,state:AL_STEPS.map(()=>0),yawRef:null,dwell:0};
+ document.getElementById('su_albtn').textContent='Restart';document.getElementById('su_alskip').disabled=false;alignDraw();}
+function alignSkip(){if(!AL.run)return;AL.state[AL.step]=AL.state[AL.step]||3;alignAdvance();}
+function alignAdvance(){if(AL.step<AL_STEPS.length-1){AL.step++;AL.yawRef=null;AL.dwell=0;}
+ else{AL.run=false;document.getElementById('su_alskip').disabled=true;
+  document.getElementById('su_altag').textContent=AL.state.every(s=>s===2)?'PASS':'CHECK FAILED STEPS';
+  document.getElementById('su_altag').className='tag '+(AL.state.every(s=>s===2)?'ok':'warn');}
+ alignDraw();}
+function alignTick(m,h){
+ if(!AL.run)return;
+ const s=AL_STEPS[AL.step];let pass=false,fail=false;
+ if(s.id==='yaw'){
+  if(AL.yawRef==null)AL.yawRef=h.deg;
+  const dd=((h.deg-AL.yawRef+540)%360)-180;
+  pass=dd>20;fail=dd<-20;
+ }else{pass=s.chk&&s.chk(m);fail=s.fail&&s.fail(m);}
+ if(fail&&AL.state[AL.step]!==2){AL.state[AL.step]=3;alignDraw();}
+ if(pass){if(AL.state[AL.step]!==2){AL.state[AL.step]=2;AL.dwell=Date.now();alignDraw();}
+  else if(Date.now()-AL.dwell>900)alignAdvance();}
+}
+function alignDraw(){
+ const el=document.getElementById('su_alsteps');if(!el)return;
+ if(!AL.run&&AL.state.every(s=>s===0)){el.innerHTML='<div class="dim small">Not started.</div>';return;}
+ el.innerHTML=AL_STEPS.map((s,i)=>{
+  const st=AL.state[i],cur=AL.run&&i===AL.step;
+  const icon=st===2?'&#10003;':(st===3?'&#10007;':(cur?'&#9654;':'&#9675;'));
+  const cls=st===2?'ok':(st===3?'err':'');
+  return '<div class="warnbox '+cls+'" style="'+(cur?'outline:1px solid var(--accent);':'')+'">'
+   +icon+' <b>Step '+(i+1)+':</b> '+s.t+' <span class="dim small">— '+s.hint+'</span></div>';
+ }).join('');
+ document.getElementById('su_altag').textContent=AL.run?('step '+(AL.step+1)+'/'+AL_STEPS.length):document.getElementById('su_altag').textContent;
+}
 </script>
 </body></html>)DASH";
