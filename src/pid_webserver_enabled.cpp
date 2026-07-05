@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "fcu_config.h"
 #include "pidweb_dashboard_html.h"
 
 namespace pid_webserver {
@@ -1232,6 +1233,99 @@ esp_err_t handleCaptureCsv(httpd_req_t* req) {
   return httpd_resp_send_chunk(req, nullptr, 0);
 }
 
+// ============================================================================
+// Config registry endpoints (fcu_config). The registry is a firmware module,
+// not a callback — it owns its own locking and validation, and every mutation
+// is additionally gated here on auth + bench-idle exactly like the callbacks.
+// ============================================================================
+
+// Stream a chunked-JSON generator (export/meta) as one HTTP response.
+esp_err_t sendChunkedJson(httpd_req_t* req,
+                          uint32_t (*gen)(uint32_t, char*, uint32_t, uint32_t&),
+                          const char* attachmentName) {
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  if (attachmentName != nullptr) {
+    static char disp[96];
+    snprintf(disp, sizeof(disp), "attachment; filename=\"%s\"", attachmentName);
+    httpd_resp_set_hdr(req, "Content-Disposition", disp);
+  }
+  static char chunk[2048];
+  uint32_t cursor = 0;
+  for (uint16_t guard = 0; guard < 512; ++guard) {
+    uint32_t next = 0;
+    const uint32_t n = gen(cursor, chunk, sizeof(chunk), next);
+    if (n > 0U) {
+      const esp_err_t err = httpd_resp_send_chunk(req, chunk, n);
+      if (err != ESP_OK) return err;
+    }
+    if (next == 0U) break;
+    if (n == 0U && next == cursor) break;  // stuck — bail rather than spin
+    cursor = next;
+  }
+  return httpd_resp_send_chunk(req, nullptr, 0);
+}
+
+esp_err_t handleGetConfig(httpd_req_t* req) {
+  return sendChunkedJson(req, fcu_config::metaJsonChunk, nullptr);
+}
+
+esp_err_t handleGetConfigExport(httpd_req_t* req) {
+  return sendChunkedJson(req, fcu_config::exportJsonChunk, "fcu_config_backup.json");
+}
+
+esp_err_t sendImportResult(httpd_req_t* req, const fcu_config::ImportResult& r) {
+  char body[224];
+  const int n = snprintf(body, sizeof(body),
+      "{\"ok\":%s,\"applied\":%u,\"unknown\":%u,\"rejected\":%u,"
+      "\"rolledBack\":%s,\"fileVersion\":%u,\"error\":\"%s\"}",
+      r.ok ? "true" : "false", r.applied, r.unknown, r.rejected,
+      r.rolledBack ? "true" : "false", r.fileVersion, r.firstError);
+  if (n < 0 || n >= (int)sizeof(body)) return sendError(req, 500, "fmt");
+  if (!r.ok) {
+    httpd_resp_set_status(req, "400");
+  }
+  return sendJson(req, body);
+}
+
+// POST /api/config — partial apply+persist of a flat {"name":value,...} object.
+esp_err_t handlePostConfig(httpd_req_t* req) {
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
+  static char body[4096];  // static: httpd task stack is only ~6 kB
+  const int n = recvBody(req, body, sizeof(body));
+  if (n < 0) return sendError(req, 400, "bad_body");
+  const auto res = fcu_config::applyJsonObject(body, static_cast<size_t>(n));
+  return sendImportResult(req, res);
+}
+
+// POST /api/config/import — full backup restore with validate-then-apply and
+// rollback-on-failure semantics (see fcu_config::importJson).
+esp_err_t handlePostConfigImport(httpd_req_t* req) {
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
+  static char body[12288];
+  const int n = recvBody(req, body, sizeof(body));
+  if (n < 0) return sendError(req, 400, "bad_body");
+  const auto res = fcu_config::importJson(body, static_cast<size_t>(n));
+  return sendImportResult(req, res);
+}
+
+esp_err_t handlePostConfigReset(httpd_req_t* req) {
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
+  if (!fcu_config::resetStoredToDefaults()) return sendError(req, 500, "nvs_write_failed");
+  return sendJson(req, "{\"ok\":true,\"defaults\":true}");
+}
+
+esp_err_t handleReboot(httpd_req_t* req) {
+  if (!gCb.requestReboot) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
+  if (!gCb.requestReboot()) return sendError(req, 409, "refused");
+  return sendJson(req, "{\"ok\":true,\"rebooting\":true}");
+}
+
 void registerUri(httpd_handle_t srv, const char* path, httpd_method_t method,
                  esp_err_t (*handler)(httpd_req_t*)) {
   httpd_uri_t u = {};
@@ -1299,7 +1393,7 @@ bool startHttpServer() {
   cfg.task_priority = 3;        // well below flight/radio/sensor
   cfg.core_id = 0;              // keep off core 1 (flight + radio)
   cfg.stack_size = FCU_PID_HTTPD_STACK_BYTES;
-  cfg.max_uri_handlers = 60;    // base tuner + dashboard + level/servo/notch/capture
+  cfg.max_uri_handlers = 96;    // tuner + dashboard + level/servo/notch/capture + config
   cfg.lru_purge_enable = true;
 
   esp_err_t err = httpd_start(&gServer, &cfg);
@@ -1365,6 +1459,13 @@ bool startHttpServer() {
   registerUri(gServer, "/api/servo/stop",      HTTP_POST, handleServoStop);
   registerUri(gServer, "/api/servo/release",   HTTP_POST, handleServoRelease);
   registerUri(gServer, "/api/servo/config",    HTTP_PUT,  handleServoConfig);
+  // ---- Config registry (fcu_config) ----
+  registerUri(gServer, "/api/config",           HTTP_GET,  handleGetConfig);
+  registerUri(gServer, "/api/config",           HTTP_POST, handlePostConfig);
+  registerUri(gServer, "/api/config/export",    HTTP_GET,  handleGetConfigExport);
+  registerUri(gServer, "/api/config/import",    HTTP_POST, handlePostConfigImport);
+  registerUri(gServer, "/api/config/reset",     HTTP_POST, handlePostConfigReset);
+  registerUri(gServer, "/api/reboot",           HTTP_POST, handleReboot);
   // ---- Diagnostic capture ----
   registerUri(gServer, "/api/capture",          HTTP_GET,  handleGetCapture);
   registerUri(gServer, "/api/capture/start",    HTTP_POST, handleCaptureStart);

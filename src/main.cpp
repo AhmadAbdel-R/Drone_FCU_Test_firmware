@@ -114,6 +114,7 @@
 // Cross-cutting protocol + types + utilities.
 #include "control_protocol.h"
 #include "fcu_nvs.h"
+#include "fcu_config.h"     // INAV-style versioned param registry + JSON export/import
 #include "DynamicNotchFilter.h"
 #include "notch_analysis.h"
 #include "diag_capture.h"
@@ -6177,6 +6178,16 @@ uint8_t mixerSatFlagsByte() {
   return f;
 }
 
+// ---- [FCU CONFIG] group-change hook -----------------------------------------
+// Fired by fcu_config after a validated set / import / factory-reset touches a
+// group. Runtime consumers re-stage the touched state from here (never from
+// the flight task). Consumers land stage-by-stage with their pages; groups
+// without a consumer yet just log.
+void fcuConfigGroupChanged(uint8_t group) {
+  fcu_log::logf(fcu_log::Level::Info, "[CFG] group %u changed\n",
+                static_cast<unsigned>(group));
+}
+
 #if ENABLE_PID_WEBSERVER
 enum class PendingSystemAction : uint8_t {
   None = 0,
@@ -7504,7 +7515,227 @@ pid_webserver::Callbacks buildConfiguratorCallbacks() {
   cbs.stopCapture = pidWebStopCapture;
   cbs.clearCapture = pidWebClearCapture;
   cbs.captureCsvChunk = pidWebCaptureCsvChunk;
+  cbs.requestReboot = requestSystemReboot;
   return cbs;
+}
+
+// =============================================================================
+// [FCU CONFIG] external-binding dispatcher.
+// Folds the values that already have owners + NVS records elsewhere (PID
+// gains, mixer bias, trims, mag policy, dyn-notch band, autonomy gains) into
+// fcu_config's whole-craft JSON export/import. get() reads live RAM; set()
+// routes through the same bench-idle-gated helpers the dashboard uses, so an
+// import can never mutate flight state while armed; save() persists every
+// externally-owned record (called once at the end of a successful import).
+// =============================================================================
+
+#if ENABLE_DYNAMIC_NOTCH
+// Stage a new notch band the same way pidWebApplyNotchTemp does (pending
+// config + dirty flag; the flight task swaps it in atomically). Import applies
+// min/max/q as three independent sets, so when one bound crosses the other we
+// slide the other bound to keep the intermediate band valid — the final state
+// after all three sets is exactly what was asked for.
+bool fcuCfgStageNotchBand(float minHz, float maxHz, float q) {
+  if (!pidWebWriteSafe()) return false;
+  if (!(isfinite(minHz) && isfinite(maxHz) && isfinite(q))) return false;
+  if (minHz >= maxHz) {
+    maxHz = minHz + 5.0f;
+  }
+  minHz = constrain(minHz, 10.0f, 495.0f);
+  maxHz = constrain(maxHz, minHz + 5.0f, 500.0f);
+  q = constrain(q, 0.5f, 20.0f);
+  DynamicNotchConfig cfg = gNotchCfg;
+  cfg.minFrequencyHz = minHz;
+  cfg.maxFrequencyHz = maxHz;
+  cfg.q = q;
+  portENTER_CRITICAL(&gFlightMux);
+  gNotchPendingCfg = cfg;
+  gNotchCfgDirty.store(true, std::memory_order_release);
+  portEXIT_CRITICAL(&gFlightMux);
+  gNotchCfg = cfg;
+  return true;
+}
+#endif
+
+bool fcuCfgExtGet(uint16_t extId, float& out) {
+  using namespace fcu_config;
+  if (extId < EXT_PID_BASE + 12) {
+    int16_t gains[12] = {};
+    pidWebGetPid(gains);
+    out = static_cast<float>(gains[extId - EXT_PID_BASE]);
+    return true;
+  }
+  switch (extId) {
+    case EXT_MIX_PITCH_FRONT_BIAS:
+      out = gMixPitchFrontBias.load(std::memory_order_relaxed);
+      return true;
+    case EXT_MOTOR_TRIM_1 + 0:
+    case EXT_MOTOR_TRIM_1 + 1:
+    case EXT_MOTOR_TRIM_1 + 2:
+    case EXT_MOTOR_TRIM_1 + 3:
+      out = gMotorThrustTrim[extId - EXT_MOTOR_TRIM_1].load(std::memory_order_relaxed);
+      return true;
+    case EXT_MAG_YAW_GAIN:
+      out = gMagYawCorrGain.load(std::memory_order_relaxed);
+      return true;
+    case EXT_MAG_HEADING_TRIM:
+      out = gMagTrimDeg.load(std::memory_order_relaxed);
+      return true;
+    case EXT_FAILSAFE_BYPASS:
+      out = gFailsafeBypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
+      return true;
+#if ENABLE_DYNAMIC_NOTCH
+    case EXT_NOTCH_ENABLE: out = gDynamicNotch.runtimeBypass() ? 0.0f : 1.0f; return true;
+    case EXT_NOTCH_MIN_HZ: out = gNotchCfg.minFrequencyHz; return true;
+    case EXT_NOTCH_MAX_HZ: out = gNotchCfg.maxFrequencyHz; return true;
+    case EXT_NOTCH_Q:      out = gNotchCfg.q; return true;
+#endif
+    case EXT_VEL_H_P: out = gVelocityCtrl.config().kHorizP; return true;
+    case EXT_VEL_H_I: out = gVelocityCtrl.config().kHorizI; return true;
+    case EXT_VEL_H_D: out = gVelocityCtrl.config().kHorizD; return true;
+    case EXT_VEL_V_P: out = gVelocityCtrl.config().kVertP; return true;
+    case EXT_VEL_V_I: out = gVelocityCtrl.config().kVertI; return true;
+    case EXT_VEL_V_D: out = gVelocityCtrl.config().kVertD; return true;
+    case EXT_POS_P: out = gPositionCtrl.config().kP; return true;
+    case EXT_POS_I: out = gPositionCtrl.config().kI; return true;
+    case EXT_POS_D: out = gPositionCtrl.config().kD; return true;
+    case EXT_LAND_P: out = gLandingCtrl.config().kP; return true;
+    case EXT_LAND_I: out = gLandingCtrl.config().kI; return true;
+    case EXT_LAND_D: out = gLandingCtrl.config().kD; return true;
+    case EXT_LAND_HOVER: out = gLandingCtrl.config().hoverThrottlePct; return true;
+    default:
+      return false;
+  }
+}
+
+bool fcuCfgExtSet(uint16_t extId, float value) {
+  using namespace fcu_config;
+  if (extId < EXT_PID_BASE + 12) {
+    int16_t gains[12] = {};
+    pidWebGetPid(gains);
+    gains[extId - EXT_PID_BASE] = static_cast<int16_t>(lroundf(value));
+    return pidWebApplyPid(gains);  // bench-idle gated + re-clamped inside
+  }
+  switch (extId) {
+    case EXT_MIX_PITCH_FRONT_BIAS:
+      return pidWebSetMixBias(value);
+    case EXT_MOTOR_TRIM_1 + 0:
+    case EXT_MOTOR_TRIM_1 + 1:
+    case EXT_MOTOR_TRIM_1 + 2:
+    case EXT_MOTOR_TRIM_1 + 3: {
+      float trims[4];
+      pidWebGetMotorThrustTrims(trims);
+      trims[extId - EXT_MOTOR_TRIM_1] = value;
+      return pidWebSetMotorThrustTrims(trims);
+    }
+    case EXT_MAG_YAW_GAIN:
+      return pidWebSetMagConfig(true, false, true, value);
+    case EXT_MAG_HEADING_TRIM:
+      return pidWebSetMagTrim(value);
+    case EXT_FAILSAFE_BYPASS:
+      return pidWebSetFailsafeBypass(value > 0.5f);
+#if ENABLE_DYNAMIC_NOTCH
+    case EXT_NOTCH_ENABLE:
+      return pidWebSetNotchEnabled(value > 0.5f);
+    case EXT_NOTCH_MIN_HZ:
+      return fcuCfgStageNotchBand(value, gNotchCfg.maxFrequencyHz, gNotchCfg.q);
+    case EXT_NOTCH_MAX_HZ:
+      return fcuCfgStageNotchBand(gNotchCfg.minFrequencyHz, value, gNotchCfg.q);
+    case EXT_NOTCH_Q:
+      return fcuCfgStageNotchBand(gNotchCfg.minFrequencyHz, gNotchCfg.maxFrequencyHz, value);
+#endif
+    case EXT_VEL_H_P:
+    case EXT_VEL_H_I:
+    case EXT_VEL_H_D: {
+      if (!pidWebWriteSafe() || !isfinite(value)) return false;
+      const auto& c = gVelocityCtrl.config();
+      float p = c.kHorizP, i = c.kHorizI, d = c.kHorizD;
+      if (extId == EXT_VEL_H_P) p = value;
+      if (extId == EXT_VEL_H_I) i = value;
+      if (extId == EXT_VEL_H_D) d = value;
+      gVelocityCtrl.setGainsHoriz(p, i, d);
+      return true;
+    }
+    case EXT_VEL_V_P:
+    case EXT_VEL_V_I:
+    case EXT_VEL_V_D: {
+      if (!pidWebWriteSafe() || !isfinite(value)) return false;
+      const auto& c = gVelocityCtrl.config();
+      float p = c.kVertP, i = c.kVertI, d = c.kVertD;
+      if (extId == EXT_VEL_V_P) p = value;
+      if (extId == EXT_VEL_V_I) i = value;
+      if (extId == EXT_VEL_V_D) d = value;
+      gVelocityCtrl.setGainsVert(p, i, d);
+      return true;
+    }
+    case EXT_POS_P:
+    case EXT_POS_I:
+    case EXT_POS_D: {
+      if (!pidWebWriteSafe() || !isfinite(value)) return false;
+      const auto& c = gPositionCtrl.config();
+      float p = c.kP, i = c.kI, d = c.kD;
+      if (extId == EXT_POS_P) p = value;
+      if (extId == EXT_POS_I) i = value;
+      if (extId == EXT_POS_D) d = value;
+      gPositionCtrl.setGains(p, i, d);
+      return true;
+    }
+    case EXT_LAND_P:
+    case EXT_LAND_I:
+    case EXT_LAND_D:
+    case EXT_LAND_HOVER: {
+      if (!pidWebWriteSafe() || !isfinite(value)) return false;
+      LandingController::Config lc = gLandingCtrl.config();
+      if (extId == EXT_LAND_P) lc.kP = value;
+      if (extId == EXT_LAND_I) lc.kI = value;
+      if (extId == EXT_LAND_D) lc.kD = value;
+      if (extId == EXT_LAND_HOVER) lc.hoverThrottlePct = value;
+      gLandingCtrl.configure(lc);
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+bool fcuCfgExtSave() {
+  bool ok = true;
+  ok &= pidWebSaveAllToNvs();
+  ok &= pidWebSaveMixBiasToNvs();
+  ok &= pidWebSaveMotorThrustTrimsToNvs();
+  ok &= pidWebSaveMagTrimToNvs();
+  ok &= pidWebSaveMagConfigToNvs();
+  ok &= pidWebSaveFailsafeBypassToNvs();
+#if ENABLE_DYNAMIC_NOTCH
+  ok &= pidWebSaveNotch();
+#endif
+  if (gPidNvs.ready()) {
+    fcu_nvs::FcuPidNvs::VelocityGains vg;
+    const auto& vc = gVelocityCtrl.config();
+    vg.horizP = vc.kHorizP; vg.horizI = vc.kHorizI; vg.horizD = vc.kHorizD;
+    vg.vertP = vc.kVertP;   vg.vertI = vc.kVertI;   vg.vertD = vc.kVertD;
+    ok &= gPidNvs.saveVelocityGains(vg);
+    fcu_nvs::FcuPidNvs::PositionGains pg;
+    const auto& pc = gPositionCtrl.config();
+    pg.kP = pc.kP; pg.kI = pc.kI; pg.kD = pc.kD;
+    ok &= gPidNvs.savePositionGains(pg);
+    fcu_nvs::FcuPidNvs::LandingGains lg;
+    const auto& lc = gLandingCtrl.config();
+    lg.kP = lc.kP; lg.kI = lc.kI; lg.kD = lc.kD;
+    lg.hoverThrottlePct = lc.hoverThrottlePct;
+    ok &= gPidNvs.saveLandingGains(lg);
+  } else {
+    ok = false;
+  }
+  return ok;
+}
+
+void registerFcuConfigExternalBindings() {
+  fcu_config::ExternalBindings b;
+  b.get = fcuCfgExtGet;
+  b.set = fcuCfgExtSet;
+  b.save = fcuCfgExtSave;
+  fcu_config::registerExternalBindings(b);
 }
 
 #if ENABLE_PID_WEBSERVER
@@ -11622,6 +11853,17 @@ void setup() {
     Serial.println("[NVS] Preferences begin failed; PID will use compile-time defaults");
   }
   configurePidFromPacket(gState.control.lastPacket);
+
+  // ---- INAV-style config registry (versioned params + JSON export/import) --
+  // Own NVS namespace ("fcucfg1"), independent of gPidNvs. Values that already
+  // persist elsewhere (PID gains, notch, trims, ...) are folded into the JSON
+  // export/import through external bindings — pidweb builds only, because the
+  // web API is the only writer of those bindings today.
+  (void)fcu_config::begin();
+  fcu_config::registerGroupHook(fcuConfigGroupChanged);
+#if ENABLE_PID_WEBSERVER
+  registerFcuConfigExternalBindings();
+#endif
   initNrfStatusLeds();
 
   // ---- Nav status LED (4 blinks on first GPS fix and on origin lock) ------

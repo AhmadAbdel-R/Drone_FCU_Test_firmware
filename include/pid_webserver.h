@@ -442,6 +442,11 @@ struct Callbacks {
   // row cursors. nextCursor=0 means the stream is complete.
   uint32_t (*captureCsvChunk)(uint32_t cursor, char* buf, uint32_t maxLen,
                               uint32_t& nextCursor) = nullptr;
+
+  // ---- System ----------------------------------------------------------------
+  // Queue a reboot (bench-idle only; the implementation defers the actual
+  // esp_restart() so the HTTP response can flush first).
+  bool (*requestReboot)() = nullptr;
 };
 
 // Register the callback table. Must be called BEFORE start(). Safe to call
