@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "arming_flags.h"
 #include "fcu_config.h"
 #include "pidweb_dashboard_html.h"
 
@@ -477,13 +478,15 @@ int formatDashJson(char* out, size_t cap, const DashTelemetry& d,
   JsonAppender j{out, cap, 0};
   j.f("{\"sys\":{\"up\":%lu,\"armed\":%d,\"fs\":%d,\"fsr\":%u,\"fsb\":%d,\"fsc\":%d,\"link\":%d,\"thr\":%u,"
       "\"loop\":%u,\"bv\":%.2f,\"bp\":%d,\"blow\":%d,\"ben\":%d,\"heap\":%lu,"
-      "\"minheap\":%lu,\"ovr\":%lu,\"maxus\":%lu,\"wsc\":%u,\"whz\":%u,\"mode\":%u}",
+      "\"minheap\":%lu,\"ovr\":%lu,\"maxus\":%lu,\"wsc\":%u,\"whz\":%u,\"mode\":%u,"
+      "\"armf\":%lu,\"armlatch\":%d}",
       (unsigned long)d.uptimeMs, d.armed ? 1 : 0, d.failsafeActive ? 1 : 0, d.failsafeReason,
       d.failsafeBypass ? 1 : 0, d.failsafeBypassCompiledDefault ? 1 : 0,
       d.controlLinkUp ? 1 : 0, d.throttlePct, d.loopHz, jf(d.battVolts),
       (d.battPercent == 0xFF) ? -1 : (int)d.battPercent, d.battLow ? 1 : 0, d.battEnabled ? 1 : 0,
       (unsigned long)d.freeHeap, (unsigned long)d.minFreeHeap, (unsigned long)d.flightOverruns,
-      (unsigned long)d.flightMaxUs, wsClients, webHz, d.flightMode);
+      (unsigned long)d.flightMaxUs, wsClients, webHz, d.flightMode,
+      (unsigned long)d.armingFlags, d.armBlockedLatch ? 1 : 0);
   j.f(",\"att\":{\"rr\":%.2f,\"rp\":%.2f,\"ry\":%.2f,\"cr\":%.2f,\"cp\":%.2f,"
       "\"tr\":%.2f,\"tp\":%.2f,\"ty\":%.2f,\"yh\":%d,\"tyr\":%.1f,"
       "\"er\":%.2f,\"ep\":%.2f,\"at\":%d}",
@@ -491,10 +494,11 @@ int formatDashJson(char* out, size_t cap, const DashTelemetry& d,
       jf(d.targetRollDeg), jf(d.targetPitchDeg), jf(d.targetYawDeg), d.yawHoldActive ? 1 : 0,
       jf(d.targetYawRateDps), jf(d.rollErrDeg), jf(d.pitchErrDeg), d.accelTrusted ? 1 : 0);
   j.f(",\"imu\":{\"a\":[%.4f,%.4f,%.4f],\"ao\":[%.4f,%.4f,%.4f],\"av\":%d,\"am\":%.4f,"
-      "\"g\":[%.3f,%.3f,%.3f],\"gb\":[%.3f,%.3f,%.3f],\"gbv\":%d,\"rdy\":%d}",
+      "\"g\":[%.3f,%.3f,%.3f],\"graw\":[%.3f,%.3f,%.3f],\"gb\":[%.3f,%.3f,%.3f],\"gbv\":%d,\"rdy\":%d}",
       jf(d.accelG[0]), jf(d.accelG[1]), jf(d.accelG[2]), jf(d.accelOffG[0]), jf(d.accelOffG[1]),
       jf(d.accelOffG[2]), d.accelValid ? 1 : 0, jf(d.accelMag), jf(d.gyroDps[0]), jf(d.gyroDps[1]),
-      jf(d.gyroDps[2]), jf(d.gyroBiasDps[0]), jf(d.gyroBiasDps[1]), jf(d.gyroBiasDps[2]),
+      jf(d.gyroDps[2]), jf(d.gyroRawDps[0]), jf(d.gyroRawDps[1]), jf(d.gyroRawDps[2]),
+      jf(d.gyroBiasDps[0]), jf(d.gyroBiasDps[1]), jf(d.gyroBiasDps[2]),
       d.gyroBiasValid ? 1 : 0, d.imuReady ? 1 : 0);
   j.f(",\"lvl\":{\"o\":[%.3f,%.3f],\"t\":[%.3f,%.3f],\"ld\":%d,\"st\":%u,\"er\":%u,\"n\":%u,"
       "\"std\":[%.3f,%.3f]}",
@@ -525,7 +529,8 @@ int formatDashJson(char* out, size_t cap, const DashTelemetry& d,
       d.rcChannelsUs[4], d.rcChannelsUs[5], d.rcChannelsUs[6], d.rcChannelsUs[7]);
   j.f(",\"sen\":{\"baro\":{\"r\":%d,\"v\":%d,\"pa\":%.1f,\"alt\":%.2f,\"t\":%.1f,\"age\":%lu},"
       "\"tof\":{\"comp\":%d,\"r\":%d,\"rng\":%d,\"mm\":%u,\"age\":%lu},"
-      "\"gps\":{\"comp\":%d,\"r\":%d,\"fix\":%d,\"sats\":%u,\"q\":%u,\"lat\":%ld,\"lon\":%ld,\"age\":%lu,"
+      "\"gps\":{\"comp\":%d,\"r\":%d,\"fix\":%d,\"sats\":%u,\"q\":%u,\"hdop\":%.1f,\"hdv\":%d,"
+      "\"lat\":%ld,\"lon\":%ld,\"age\":%lu,"
       "\"gsv\":%d,\"cv\":%d,\"vv\":%d,\"sp\":%u,\"spd\":%.2f,\"cog\":%u,\"vn\":%.2f,\"ve\":%.2f,\"rmc\":%lu},"
       "\"mag\":{\"v\":%d,\"hdg\":%.1f,\"f\":%.1f,\"cal\":%d,\"src\":%u,\"gain\":%.3f,"
       "\"trim\":%.1f,\"dec\":%.1f,"
@@ -538,7 +543,8 @@ int formatDashJson(char* out, size_t cap, const DashTelemetry& d,
       d.baroReady ? 1 : 0, d.baroValid ? 1 : 0, jf(d.baroPa), jf(d.baroAltM), jf(d.baroTempC),
       (unsigned long)d.baroAgeMs, d.tofCompiled ? 1 : 0, d.tofReady ? 1 : 0, d.tofRanging ? 1 : 0,
       d.tofMm, (unsigned long)d.tofAgeMs, d.gpsCompiled ? 1 : 0, d.gpsReady ? 1 : 0, d.gpsFix ? 1 : 0,
-      d.gpsSats, d.gpsFixQual, (long)d.gpsLatE7, (long)d.gpsLonE7, (unsigned long)d.gpsAgeMs,
+      d.gpsSats, d.gpsFixQual, jf(d.gpsHdop), d.gpsHdopValid ? 1 : 0,
+      (long)d.gpsLatE7, (long)d.gpsLonE7, (unsigned long)d.gpsAgeMs,
       d.gpsGroundSpeedValid ? 1 : 0, d.gpsCourseValid ? 1 : 0, d.gpsVelocityValid ? 1 : 0,
       d.gpsGroundSpeedKmh10, jf(d.gpsGroundSpeedMs), d.gpsCourseCentiDeg,
       jf(d.gpsVelNorthMs), jf(d.gpsVelEastMs), (unsigned long)d.gpsRmcAgeMs,
@@ -602,7 +608,7 @@ esp_err_t handleWs(httpd_req_t* req) {
 }
 
 void telemetryTask(void*) {
-  static char buf[3700];  // own buffer (handler uses a separate one)
+  static char buf[4400];  // own buffer (handler uses a separate one)
   uint32_t lastRateMs = millis();
   uint16_t frames = 0;
   for (;;) {
@@ -847,6 +853,78 @@ esp_err_t handleGetTune(httpd_req_t* req) {
   return sendJson(req, body);
 }
 
+// GET /api/status — craft summary: armed/mode/battery/timing/sensor health +
+// the arming-disable bitmask expanded into human-readable reason names.
+esp_err_t handleGetStatus(httpd_req_t* req) {
+  if (!gCb.getStatus) return sendError(req, 500, "no_callback");
+  StatusSnapshot s;
+  gCb.getStatus(s);
+  static char body[1280];
+  JsonAppender j{body, sizeof(body), 0};
+  j.f("{\"armed\":%s,\"mode\":%u,\"failsafe\":%s,\"failsafeReason\":%u,"
+      "\"battVolts\":%.2f,\"battPercent\":%d,\"battEnabled\":%s,"
+      "\"loopHz\":%u,\"loopDtUs\":{\"min\":%lu,\"max\":%lu,\"avg\":%lu},"
+      "\"flightOverruns\":%lu,\"flightTaskMaxUs\":%lu,"
+      "\"imuOk\":%s,\"gps\":{\"compiled\":%s,\"connected\":%s,\"fix\":%s,"
+      "\"fixQuality\":%u,\"sats\":%u,\"hdop\":%.1f},"
+      "\"magHealthy\":%s,\"magCalValid\":%s,\"baroHealthy\":%s,"
+      "\"freeHeap\":%lu,\"uptimeMs\":%lu,"
+      "\"armingDisableFlags\":%lu,\"armBlockedLatch\":%s,\"armingDisableReasons\":[",
+      s.armed ? "true" : "false", s.flightMode,
+      s.failsafeActive ? "true" : "false", s.failsafeReason,
+      jf(s.battVolts), (s.battPercent == 0xFF) ? -1 : (int)s.battPercent,
+      s.battEnabled ? "true" : "false",
+      s.loopHz, (unsigned long)s.loopDtMinUs, (unsigned long)s.loopDtMaxUs,
+      (unsigned long)s.loopDtAvgUs,
+      (unsigned long)s.flightOverruns, (unsigned long)s.flightTaskMaxUs,
+      s.imuOk ? "true" : "false",
+      s.gpsCompiled ? "true" : "false", s.gpsConnected ? "true" : "false",
+      s.gpsFix ? "true" : "false", s.gpsFixQuality, s.gpsSats, jf(s.gpsHdop),
+      s.magHealthy ? "true" : "false", s.magCalValid ? "true" : "false",
+      s.baroHealthy ? "true" : "false",
+      (unsigned long)s.freeHeap, (unsigned long)s.uptimeMs,
+      (unsigned long)s.armingDisableFlags, s.armBlockedLatch ? "true" : "false");
+  bool first = true;
+  for (uint8_t bit = 0; bit < arming::kFlagCount; ++bit) {
+    if ((s.armingDisableFlags & (1UL << bit)) == 0U) continue;
+    j.f("%s\"%s\"", first ? "" : ",", arming::flagName(bit));
+    first = false;
+  }
+  j.f("]}");
+  return sendJson(req, body);
+}
+
+// GET /api/sensors/live — one-shot full sensor readout (raw + filtered gyro,
+// calibrated accel + offsets, mag, attitude, baro, GPS, rangefinder).
+esp_err_t handleGetSensorsLive(httpd_req_t* req) {
+  if (!gCb.getSensorsLive) return sendError(req, 500, "no_callback");
+  SensorsLiveSnapshot s;
+  gCb.getSensorsLive(s);
+  static char body[1280];
+  JsonAppender j{body, sizeof(body), 0};
+  j.f("{\"gyroRaw\":[%.3f,%.3f,%.3f],\"gyroFilt\":[%.3f,%.3f,%.3f],"
+      "\"accel\":[%.4f,%.4f,%.4f],\"accelOff\":[%.4f,%.4f,%.4f],"
+      "\"mag\":[%.2f,%.2f,%.2f],\"magFieldUt\":%.1f,\"magHeadingDeg\":%.1f,\"magValid\":%s,"
+      "\"attitude\":{\"roll\":%.2f,\"pitch\":%.2f,\"yaw\":%.2f},"
+      "\"baro\":{\"altM\":%.2f,\"pa\":%.1f,\"tempC\":%.1f,\"valid\":%s},"
+      "\"gps\":{\"lat\":%ld,\"lon\":%ld,\"altDm\":%d,\"speedMs\":%.2f,\"courseDeg\":%.1f,"
+      "\"hdop\":%.1f,\"sats\":%u,\"fixQuality\":%u,\"fix\":%s},"
+      "\"tof\":{\"mm\":%u,\"valid\":%s},\"loopHz\":%u}",
+      jf(s.gyroRawDps[0]), jf(s.gyroRawDps[1]), jf(s.gyroRawDps[2]),
+      jf(s.gyroFiltDps[0]), jf(s.gyroFiltDps[1]), jf(s.gyroFiltDps[2]),
+      jf(s.accelG[0]), jf(s.accelG[1]), jf(s.accelG[2]),
+      jf(s.accelOffG[0]), jf(s.accelOffG[1]), jf(s.accelOffG[2]),
+      jf(s.magUt[0]), jf(s.magUt[1]), jf(s.magUt[2]),
+      jf(s.magFieldUt), jf(s.magHeadingDeg), s.magValid ? "true" : "false",
+      jf(s.rollDeg), jf(s.pitchDeg), jf(s.yawDeg),
+      jf(s.baroAltM), jf(s.baroPa), jf(s.baroTempC), s.baroValid ? "true" : "false",
+      (long)s.gpsLatE7, (long)s.gpsLonE7, (int)s.gpsAltDm, jf(s.gpsSpeedMs),
+      jf(s.gpsCourseDeg), jf(s.gpsHdop), s.gpsSats, s.gpsFixQuality,
+      s.gpsFix ? "true" : "false",
+      s.tofMm, s.tofValid ? "true" : "false", s.loopHz);
+  return sendJson(req, body);
+}
+
 esp_err_t handleGetHealth(httpd_req_t* req) {
   if (!gCb.getHealth) return sendError(req, 500, "no_callback");
   HealthSnapshot h;
@@ -867,7 +945,7 @@ esp_err_t handleGetHealth(httpd_req_t* req) {
 // static buffer so it can't race the telemetry task's buffer.
 esp_err_t handleGetDash(httpd_req_t* req) {
   if (!gCb.getDashTelemetry) return sendError(req, 500, "no_callback");
-  static char dashBuf[3700];
+  static char dashBuf[4400];
   DashTelemetry t;
   gCb.getDashTelemetry(t);
   const int n = formatDashJson(dashBuf, sizeof(dashBuf), t,
@@ -1418,6 +1496,8 @@ bool startHttpServer() {
   registerUri(gServer, "/api/failsafe/save", HTTP_POST, handleSaveFailsafe);
   registerUri(gServer, "/api/state",       HTTP_GET,  handleGetState);
   registerUri(gServer, "/api/health",      HTTP_GET,  handleGetHealth);
+  registerUri(gServer, "/api/status",      HTTP_GET,  handleGetStatus);
+  registerUri(gServer, "/api/sensors/live", HTTP_GET, handleGetSensorsLive);
   registerUri(gServer, "/api/tune",        HTTP_GET,  handleGetTune);
 
   // ---- Dashboard: legacy fallback, live telemetry, calibration/level/trim ---

@@ -59,6 +59,8 @@ struct GpsState {
   bool hasFix = false;                   // fixQuality > 0
   uint8_t fixQuality = 0;                // GGA byte: 0 = no fix, 1 = GPS, 2 = DGPS
   uint8_t satellites = 0;                // satellites in view used for fix
+  float hdop = 99.9f;                    // horizontal dilution of precision (GGA field 8)
+  bool hdopValid = false;                // hdop parsed from the last accepted GGA
   int32_t latE7 = 0;                     // latitude, degrees × 1e7
   int32_t lonE7 = 0;                     // longitude, degrees × 1e7
   int16_t altDm = 0;                     // altitude MSL, decimeters

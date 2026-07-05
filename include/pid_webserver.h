@@ -147,6 +147,8 @@ struct DashTelemetry {
   uint32_t flightMaxUs = 0;
   uint8_t wsClients = 0;
   uint16_t webTelemHz = 0;      // measured dashboard push rate
+  uint32_t armingFlags = 0;     // arming::FLAG_* bitmask (0 = clear to arm)
+  bool armBlockedLatch = false; // arm refused; switch must be cycled
 
   // ---- Attitude: raw estimator vs controller-corrected vs target ----
   float rawRollDeg = 0.0f, rawPitchDeg = 0.0f, rawYawDeg = 0.0f;
@@ -164,6 +166,7 @@ struct DashTelemetry {
   bool accelValid = false;           // accel offset applied?
   float accelMag = 0.0f;
   float gyroDps[3] = {0, 0, 0};      // corrected gyro (what the rate PID closes on)
+  float gyroRawDps[3] = {0, 0, 0};   // pre-notch/pre-filter gyro (noise view)
   float gyroBiasDps[3] = {0, 0, 0};  // applied startup bias (raw = corrected + bias)
   bool gyroBiasValid = false;
 
@@ -215,6 +218,8 @@ struct DashTelemetry {
   uint8_t gpsSats = 0, gpsFixQual = 0;
   int32_t gpsLatE7 = 0, gpsLonE7 = 0;
   uint32_t gpsAgeMs = 0xFFFFFFFF;
+  float gpsHdop = 99.9f;
+  bool gpsHdopValid = false;
   bool gpsGroundSpeedValid = false, gpsCourseValid = false, gpsVelocityValid = false;
   uint16_t gpsGroundSpeedKmh10 = 0, gpsCourseCentiDeg = 0;
   float gpsGroundSpeedMs = 0.0f, gpsCourseDeg = 0.0f;
@@ -257,6 +262,62 @@ struct DashTelemetry {
   uint16_t panUs = 0, tiltUs = 0, panTargetUs = 0, tiltTargetUs = 0;
 
   uint16_t flightMode = 0;
+};
+
+// One-shot craft status for GET /api/status — the INAV-style "can I fly and
+// why not" summary. Everything here is cheap to sample; no history.
+struct StatusSnapshot {
+  bool armed = false;
+  uint8_t flightMode = 0;             // flight_modes::FlightMode
+  bool failsafeActive = false;
+  uint8_t failsafeReason = 0;
+  float battVolts = 0.0f;
+  uint8_t battPercent = 0xFF;         // 0xFF = unknown
+  bool battEnabled = false;
+  uint16_t loopHz = 0;
+  uint32_t loopDtMinUs = 0;           // since boot
+  uint32_t loopDtMaxUs = 0;
+  uint32_t loopDtAvgUs = 0;           // EMA
+  uint32_t flightOverruns = 0;
+  uint32_t flightTaskMaxUs = 0;
+  bool imuOk = false;
+  bool gpsCompiled = false;
+  bool gpsConnected = false;          // UART up + sentences fresh
+  bool gpsFix = false;
+  uint8_t gpsFixQuality = 0;
+  uint8_t gpsSats = 0;
+  float gpsHdop = 99.9f;
+  bool magHealthy = false;
+  bool magCalValid = false;
+  bool baroHealthy = false;
+  uint32_t armingDisableFlags = 0;    // arming::FLAG_* bitmask
+  bool armBlockedLatch = false;       // arm refused; switch cycle required
+  uint32_t freeHeap = 0;
+  uint32_t uptimeMs = 0;
+};
+
+// One-shot full sensor readout for GET /api/sensors/live (the WS dash frame is
+// the streaming variant; this exists for tools/scripts and WS-less fallback).
+struct SensorsLiveSnapshot {
+  float gyroRawDps[3] = {0, 0, 0};    // pre-notch/filter
+  float gyroFiltDps[3] = {0, 0, 0};   // what the rate PID sees
+  float accelG[3] = {0, 0, 0};        // calibrated body accel
+  float accelOffG[3] = {0, 0, 0};     // applied offset (raw = calibrated + offset)
+  float magUt[3] = {0, 0, 0};         // calibrated body-frame field (active source)
+  float magFieldUt = 0.0f;
+  float magHeadingDeg = 0.0f;
+  bool magValid = false;
+  float rollDeg = 0.0f, pitchDeg = 0.0f, yawDeg = 0.0f;
+  float baroAltM = 0.0f, baroPa = 0.0f, baroTempC = 0.0f;
+  bool baroValid = false;
+  int32_t gpsLatE7 = 0, gpsLonE7 = 0;
+  int16_t gpsAltDm = 0;
+  float gpsSpeedMs = 0.0f, gpsCourseDeg = 0.0f, gpsHdop = 99.9f;
+  uint8_t gpsSats = 0, gpsFixQuality = 0;
+  bool gpsFix = false;
+  uint16_t tofMm = 0;
+  bool tofValid = false;
+  uint16_t loopHz = 0;
 };
 
 // Read-only calibration / level / trim detail for the Attitude & Level tab.
@@ -368,6 +429,10 @@ struct Callbacks {
   void (*getState)(StateSnapshot& s) = nullptr;
   // Fill out health stats.
   void (*getHealth)(HealthSnapshot& h) = nullptr;
+  // Fill the /api/status craft summary (arming flags, sensor health, timing).
+  void (*getStatus)(StatusSnapshot& s) = nullptr;
+  // Fill the /api/sensors/live full sensor readout.
+  void (*getSensorsLive)(SensorsLiveSnapshot& s) = nullptr;
   // Fill out a full PID/mixer snapshot for the 1 Hz tune log panel.
   // Implementation must read under the flight-mux so all fields are mutually
   // consistent (no partial torn reads of P/I/D terms vs motor outputs).

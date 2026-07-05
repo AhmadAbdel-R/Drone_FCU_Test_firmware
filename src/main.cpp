@@ -115,6 +115,7 @@
 #include "control_protocol.h"
 #include "fcu_nvs.h"
 #include "fcu_config.h"     // INAV-style versioned param registry + JSON export/import
+#include "arming_flags.h"   // central arming-disable bitmask (flags + names)
 #include "DynamicNotchFilter.h"
 #include "notch_analysis.h"
 #include "diag_capture.h"
@@ -5225,6 +5226,10 @@ static void parseGpsGgaLine(const char* line, uint32_t nowMs) {
   gState.gps.fixQuality = fixQuality;
   gState.gps.hasFix = hasFix;
   gState.gps.satellites = satellites;
+  // HDOP straight from GGA field 8 — consumed by the arming/nav quality
+  // gates and reported on /api/status. hdopOk was validated above.
+  gState.gps.hdopValid = hdopOk;
+  gState.gps.hdop = hdopOk ? static_cast<float>(hdopRaw) : 99.9f;
   // Only overwrite position/altitude with freshly-validated values; a single
   // malformed sentence must not zero out the last-known good fix. (F3)
   if (coordsOk) {
@@ -6178,12 +6183,248 @@ uint8_t mixerSatFlagsByte() {
   return f;
 }
 
+// =============================================================================
+// [ARMING FLAGS] central "why can't I arm" evaluation + the arm-edge gate.
+//
+// updateArmingDisableFlags() runs on the sensor task (~50 Hz) and publishes
+// the arming::FLAG_* bitmask. enforceArmingGate() runs in
+// processControlPacket() and refuses a RISING arm-switch edge while any bit
+// is set — it never disarms an already-armed craft (in-air handling belongs
+// to the failsafe system). A refused arm latches until the switch is cycled
+// so a transiently-clearing flag can't arm the craft "late" by surprise.
+// =============================================================================
+std::atomic<uint32_t> gArmingDisableFlags{0};
+std::atomic<bool> gArmBlockedLatch{false};
+
+// Flight-loop dt statistics for /api/status (min/max since boot + EMA avg).
+// Written only by the flight task; read by the webserver.
+std::atomic<uint32_t> gLoopDtMinUs{0xFFFFFFFFUL};
+std::atomic<uint32_t> gLoopDtMaxUs{0};
+std::atomic<uint32_t> gLoopDtAvgUs{0};
+
+// Config-dependent gates, cached in atomics so the 50 Hz evaluation never
+// touches fcu_config's mutex (an import holds it across NVS writes).
+struct ArmingConfigCache {
+  std::atomic<bool> requireGps{false};
+  std::atomic<bool> requireMag{false};
+  std::atomic<bool> requireBaro{false};
+  std::atomic<bool> requireBatt{false};
+  std::atomic<float> minSats{6.0f};
+  std::atomic<float> maxHdop{2.5f};
+  std::atomic<float> maxAngleDeg{25.0f};
+  std::atomic<float> minBattVolts{10.5f};
+};
+ArmingConfigCache gArmCfg;
+
+float fcuCfgReadByName(const char* name, float fallback) {
+  size_t idx = 0;
+  float v = fallback;
+  if (fcu_config::paramByName(name, &idx) != nullptr && fcu_config::getValue(idx, v)) {
+    return v;
+  }
+  return fallback;
+}
+
+void refreshArmingConfigCache() {
+  gArmCfg.requireGps.store(fcuCfgReadByName("arm_require_gps", 0.0f) > 0.5f,
+                           std::memory_order_relaxed);
+  gArmCfg.requireMag.store(fcuCfgReadByName("arm_require_mag", 0.0f) > 0.5f,
+                           std::memory_order_relaxed);
+  gArmCfg.requireBaro.store(fcuCfgReadByName("arm_require_baro", 0.0f) > 0.5f,
+                            std::memory_order_relaxed);
+  gArmCfg.requireBatt.store(fcuCfgReadByName("arm_require_batt", 0.0f) > 0.5f,
+                            std::memory_order_relaxed);
+  gArmCfg.minSats.store(fcuCfgReadByName("arm_min_sats", 6.0f), std::memory_order_relaxed);
+  gArmCfg.maxHdop.store(fcuCfgReadByName("arm_max_hdop", 2.5f), std::memory_order_relaxed);
+  gArmCfg.maxAngleDeg.store(fcuCfgReadByName("arm_max_angle_deg", 25.0f),
+                            std::memory_order_relaxed);
+  gArmCfg.minBattVolts.store(fcuCfgReadByName("arm_min_batt_volts", 10.5f),
+                             std::memory_order_relaxed);
+}
+
+// Disarmed craft should be still before arming; this catches being carried /
+// wind-rocked on a boat deck etc. Matches the boot-cal stationary threshold
+// order of magnitude but looser (10 dps) so idle sensor noise never trips it.
+constexpr float ARM_GYRO_STABLE_DPS = 10.0f;
+
+void updateArmingDisableFlags(uint32_t nowMs) {
+  (void)nowMs;
+  uint32_t f = 0;
+
+  // ---- Control link / failsafe / safe boot --------------------------------
+  bool linkActive = false, failsafe = false, safeBoot = false;
+  portENTER_CRITICAL(&gControlMux);
+  linkActive = gState.control.linkActive;
+  failsafe = gState.control.failsafeActive;
+  safeBoot = gState.control.safeBootComplete;
+  portEXIT_CRITICAL(&gControlMux);
+  if (!linkActive) f |= arming::FLAG_RX_INVALID;
+  if (failsafe) f |= arming::FLAG_FAILSAFE;
+  if (!safeBoot) f |= arming::FLAG_SAFE_BOOT;
+
+  // ---- Throttle stick position (raw channel — the bridge zeroes the packet
+  // ---- throttle while disarmed, so the packet can't be used here) ---------
+#if USE_ELRS_CRSF_CONTROL
+  {
+    const uint16_t thrUs = gCrsf.channelMicros(2);  // CH3
+    if (thrUs > 1100U) f |= arming::FLAG_THROTTLE_HIGH;
+  }
+#endif
+
+  // ---- IMU / attitude ------------------------------------------------------
+  float rollDeg = 0.0f, pitchDeg = 0.0f;
+  float gx = 0.0f, gy = 0.0f, gz = 0.0f;
+  bool imuOk = false;
+  portENTER_CRITICAL(&gFlightMux);
+  imuOk = gState.imuReady && gState.imuSampleValid;
+  rollDeg = gState.attitude.rollDeg;
+  pitchDeg = gState.attitude.pitchDeg;
+  gx = gState.imuSample.gx_dps;
+  gy = gState.imuSample.gy_dps;
+  gz = gState.imuSample.gz_dps;
+  portEXIT_CRITICAL(&gFlightMux);
+  if (!imuOk) f |= arming::FLAG_IMU_INVALID;
+  const float maxAngle = gArmCfg.maxAngleDeg.load(std::memory_order_relaxed);
+  if (fabsf(rollDeg) > maxAngle || fabsf(pitchDeg) > maxAngle) {
+    f |= arming::FLAG_BOARD_TILT;
+  }
+  const float gyroMag = sqrtf(gx * gx + gy * gy + gz * gz);
+  if (imuOk && gyroMag > ARM_GYRO_STABLE_DPS) f |= arming::FLAG_GYRO_UNSTABLE;
+  if (!gGyroBias.valid) f |= arming::FLAG_GYRO_NOT_CAL;
+  if (!gCal.accel_valid.load(std::memory_order_relaxed)) f |= arming::FLAG_ACCEL_NOT_CAL;
+
+  // ---- Config-gated sensor requirements ------------------------------------
+  if (gArmCfg.requireGps.load(std::memory_order_relaxed)) {
+    bool fix = false, hdopValid = false;
+    uint8_t sats = 0;
+    float hdop = 99.9f;
+    portENTER_CRITICAL(&gSensorMux);
+    fix = gState.gps.hasFix;
+    sats = gState.gps.satellites;
+    hdop = gState.gps.hdop;
+    hdopValid = gState.gps.hdopValid;
+    portEXIT_CRITICAL(&gSensorMux);
+    if (!fix) f |= arming::FLAG_GPS_NO_FIX;
+    if (static_cast<float>(sats) < gArmCfg.minSats.load(std::memory_order_relaxed)) {
+      f |= arming::FLAG_GPS_SATS;
+    }
+    if (!hdopValid || hdop > gArmCfg.maxHdop.load(std::memory_order_relaxed)) {
+      f |= arming::FLAG_GPS_HDOP;
+    }
+  }
+  if (gArmCfg.requireMag.load(std::memory_order_relaxed)) {
+    bool magOk = false;
+#if FCU_ENABLE_EXTERNAL_MAG
+    magOk = (gActiveMagSource.load(std::memory_order_relaxed) == MAG_SOURCE_EXTERNAL) &&
+            gExtCal.valid.load(std::memory_order_relaxed) &&
+            gExtMag.connected.load(std::memory_order_relaxed) &&
+            gExtMag.healthy.load(std::memory_order_relaxed);
+#endif
+    if (!magOk) f |= arming::FLAG_MAG_NOT_CAL;
+  }
+  if (gArmCfg.requireBaro.load(std::memory_order_relaxed)) {
+    bool baroOk = false;
+    portENTER_CRITICAL(&gSensorMux);
+    baroOk = gState.baro.ready && gState.baro.valid;
+    portEXIT_CRITICAL(&gSensorMux);
+    if (!baroOk) f |= arming::FLAG_BARO_MISSING;
+  }
+  if (gArmCfg.requireBatt.load(std::memory_order_relaxed)) {
+    bool battOk = false;
+    portENTER_CRITICAL(&gSensorMux);
+    battOk = gState.battery.enabled &&
+             gState.battery.volts >= gArmCfg.minBattVolts.load(std::memory_order_relaxed);
+    portEXIT_CRITICAL(&gSensorMux);
+    if (!battOk) f |= arming::FLAG_BATTERY;
+  }
+
+  // ---- Bench activity -------------------------------------------------------
+#if ENABLE_PID_WEBSERVER
+  {
+    bool motorTestBusy = false;
+    portENTER_CRITICAL(&gFlightMux);
+    motorTestBusy = (gMotorSpin.requestedMotor != 0U) || (gMotorSpin.activeMotor != 0U);
+    portEXIT_CRITICAL(&gFlightMux);
+    if (motorTestBusy) f |= arming::FLAG_MOTOR_TEST;
+  }
+#endif
+  if (fcu_config::writeInProgress()) f |= arming::FLAG_CONFIG_WRITE;
+  if (!gState.escReady) f |= arming::FLAG_ESC_NOT_READY;
+  if (gArmBlockedLatch.load(std::memory_order_relaxed)) {
+    f |= arming::FLAG_ARM_BLOCKED_LATCH;
+  }
+
+  gArmingDisableFlags.store(f, std::memory_order_relaxed);
+}
+
+// Called from processControlPacket() on every inbound packet, BEFORE the
+// packet is stored. Refuses a rising arm-switch edge while any arming-disable
+// flag is set by rewriting the packet to its disarmed form (flag cleared,
+// mode 0, throttle 0 — exactly what the bridge sends when the switch is low).
+void enforceArmingGate(control_protocol::ControlPacket& packet, uint32_t nowMs) {
+  static bool armedAllowed = false;   // post-gate arm state we last let through
+  const bool wantArm =
+      control_protocol::flagIsSet(packet.flags, control_protocol::kFlagFlightSwitchOn);
+
+  if (!wantArm) {
+    // Switch low: disarm normally and clear the block latch (a fresh OFF->ON
+    // edge gets a fresh evaluation).
+    armedAllowed = false;
+    gArmBlockedLatch.store(false, std::memory_order_relaxed);
+    return;
+  }
+  if (armedAllowed) {
+    return;  // already armed — flags never disarm in flight
+  }
+
+  // Ignore the latch bit itself when evaluating (it is an output of this
+  // gate, not an input), but keep every real reason blocking.
+  const uint32_t flags =
+      gArmingDisableFlags.load(std::memory_order_relaxed) & ~arming::FLAG_ARM_BLOCKED_LATCH;
+  const bool latched = gArmBlockedLatch.load(std::memory_order_relaxed);
+
+  if (flags == 0U && !latched) {
+    armedAllowed = true;  // clean edge — allow arming
+    return;
+  }
+
+  // Blocked: rewrite to disarmed form and latch until the switch cycles.
+  if (!latched) {
+    gArmBlockedLatch.store(true, std::memory_order_relaxed);
+    char reasons[160];
+    size_t len = 0;
+    for (uint8_t bit = 0; bit < arming::kFlagCount; ++bit) {
+      if ((flags & (1UL << bit)) == 0U) continue;
+      const char* name = arming::flagName(bit);
+      const size_t nameLen = strlen(name);
+      if (len + nameLen + 2 >= sizeof(reasons)) break;
+      if (len > 0) reasons[len++] = ',';
+      memcpy(reasons + len, name, nameLen);
+      len += nameLen;
+    }
+    reasons[len] = '\0';
+    fcu_log::logf(fcu_log::Level::Warn,
+                  "[ARM] arming REFUSED (cycle switch to retry): %s\n", reasons);
+  }
+  (void)nowMs;
+  packet.flags &= static_cast<uint8_t>(~control_protocol::kFlagFlightSwitchOn);
+  packet.mode = 0;
+  packet.throttlePercent = 0;
+}
+
 // ---- [FCU CONFIG] group-change hook -----------------------------------------
 // Fired by fcu_config after a validated set / import / factory-reset touches a
 // group. Runtime consumers re-stage the touched state from here (never from
 // the flight task). Consumers land stage-by-stage with their pages; groups
 // without a consumer yet just log.
 void fcuConfigGroupChanged(uint8_t group) {
+  switch (group) {
+    case fcu_config::GROUP_ARMING:
+      refreshArmingConfigCache();
+      break;
+    default:
+      break;
+  }
   fcu_log::logf(fcu_log::Level::Info, "[CFG] group %u changed\n",
                 static_cast<unsigned>(group));
 }
@@ -6736,6 +6977,9 @@ void pidWebGetDash(pid_webserver::DashTelemetry& d) {
   d.gyroDps[0] = gState.imuSample.gx_dps;
   d.gyroDps[1] = gState.imuSample.gy_dps;
   d.gyroDps[2] = gState.imuSample.gz_dps;
+  d.gyroRawDps[0] = gState.pid.gyroPreFilterDps[0];
+  d.gyroRawDps[1] = gState.pid.gyroPreFilterDps[1];
+  d.gyroRawDps[2] = gState.pid.gyroPreFilterDps[2];
   d.magHeadingDeg = gState.imuSample.magHeadingDeg;
   d.magFieldUt = gState.imuSample.magFieldUt;
   d.magValid = gState.imuSample.magValid;
@@ -6846,6 +7090,8 @@ void pidWebGetDash(pid_webserver::DashTelemetry& d) {
   d.armed = (throttle > 0U) ||
             (gFlightStatePublished.load(std::memory_order_relaxed) != flight_state::State::IDLE);
   d.flightMode = static_cast<uint16_t>(gActiveFlightMode.load(std::memory_order_relaxed));
+  d.armingFlags = gArmingDisableFlags.load(std::memory_order_relaxed);
+  d.armBlockedLatch = gArmBlockedLatch.load(std::memory_order_relaxed);
 
   // ---- Sensor-mux: baro / tof / gps / battery ----
   portENTER_CRITICAL(&gSensorMux);
@@ -6865,6 +7111,8 @@ void pidWebGetDash(pid_webserver::DashTelemetry& d) {
   d.gpsFixQual = gState.gps.fixQuality;
   d.gpsLatE7 = gState.gps.latE7;
   d.gpsLonE7 = gState.gps.lonE7;
+  d.gpsHdop = gState.gps.hdop;
+  d.gpsHdopValid = gState.gps.hdopValid;
   const uint32_t gpsMs = gState.gps.lastSentenceMs;
   d.gpsGroundSpeedValid = gState.gps.groundSpeedValid;
   d.gpsCourseValid = gState.gps.courseValid;
@@ -6943,6 +7191,109 @@ void pidWebGetDash(pid_webserver::DashTelemetry& d) {
   d.panTargetUs = gCameraGimbal.panTargetMicros();
   d.tiltTargetUs = gCameraGimbal.tiltTargetMicros();
 #endif
+}
+
+// GET /api/status backend — craft summary + arming-disable flags.
+void pidWebGetStatus(pid_webserver::StatusSnapshot& s) {
+  const uint32_t now = millis();
+  s.uptimeMs = now;
+  s.freeHeap = ESP.getFreeHeap();
+  s.loopDtMinUs = gLoopDtMinUs.load(std::memory_order_relaxed);
+  s.loopDtMaxUs = gLoopDtMaxUs.load(std::memory_order_relaxed);
+  s.loopDtAvgUs = gLoopDtAvgUs.load(std::memory_order_relaxed);
+  if (s.loopDtMinUs == 0xFFFFFFFFUL) s.loopDtMinUs = 0;  // no tick yet
+  s.flightOverruns = gHealth.flight.overrunCount;
+  s.flightTaskMaxUs = gHealth.flight.maxDurationUs;
+  s.failsafeReason = readFailsafeReason();
+
+  portENTER_CRITICAL(&gFlightMux);
+  s.imuOk = gState.imuReady && gState.imuSampleValid;
+  s.loopHz = gState.loopRate.lastHz;
+  portEXIT_CRITICAL(&gFlightMux);
+
+  uint8_t throttle = 0;
+  portENTER_CRITICAL(&gControlMux);
+  throttle = gState.control.appliedThrottlePercent;
+  s.failsafeActive = gState.control.failsafeActive;
+  portEXIT_CRITICAL(&gControlMux);
+  s.armed = (throttle > 0U) ||
+            (gFlightStatePublished.load(std::memory_order_relaxed) != flight_state::State::IDLE);
+  s.flightMode = static_cast<uint8_t>(gActiveFlightMode.load(std::memory_order_relaxed));
+
+  uint32_t gpsSentenceMs = 0;
+  portENTER_CRITICAL(&gSensorMux);
+  gpsSentenceMs = gState.gps.lastSentenceMs;
+  s.gpsFix = gState.gps.hasFix;
+  s.gpsFixQuality = gState.gps.fixQuality;
+  s.gpsSats = gState.gps.satellites;
+  s.gpsHdop = gState.gps.hdopValid ? gState.gps.hdop : 99.9f;
+  s.baroHealthy = gState.baro.ready && gState.baro.valid;
+  s.battEnabled = gState.battery.enabled;
+  s.battVolts = gState.battery.volts;
+  s.battPercent = gState.battery.percent;
+  const bool gpsUart = gState.gps.uartReady;
+  portEXIT_CRITICAL(&gSensorMux);
+  s.gpsCompiled = (FCU_ENABLE_GPS != 0);
+  s.gpsConnected = gpsUart && gpsSentenceMs != 0U && (now - gpsSentenceMs) < 5000U;
+
+#if FCU_ENABLE_EXTERNAL_MAG
+  s.magHealthy = gExtMag.connected.load(std::memory_order_relaxed) &&
+                 gExtMag.healthy.load(std::memory_order_relaxed);
+  s.magCalValid = gExtCal.valid.load(std::memory_order_relaxed);
+#else
+  s.magHealthy = false;
+  s.magCalValid = false;
+#endif
+
+  s.armingDisableFlags = gArmingDisableFlags.load(std::memory_order_relaxed);
+  s.armBlockedLatch = gArmBlockedLatch.load(std::memory_order_relaxed);
+}
+
+// GET /api/sensors/live backend — one-shot full sensor readout.
+void pidWebGetSensorsLive(pid_webserver::SensorsLiveSnapshot& s) {
+  portENTER_CRITICAL(&gFlightMux);
+  for (int i = 0; i < 3; ++i) {
+    s.gyroRawDps[i] = gState.pid.gyroPreFilterDps[i];
+    s.gyroFiltDps[i] = gState.pid.gyroPidDps[i];
+  }
+  s.accelG[0] = gState.imuSample.ax_g;
+  s.accelG[1] = gState.imuSample.ay_g;
+  s.accelG[2] = gState.imuSample.az_g;
+  s.rollDeg = gState.attitude.rollDeg;
+  s.pitchDeg = gState.attitude.pitchDeg;
+  s.yawDeg = gState.attitude.yawDeg;
+  s.magHeadingDeg = gState.imuSample.magHeadingDeg;
+  s.magFieldUt = gState.imuSample.magFieldUt;
+  s.magValid = gState.imuSample.magValid;
+  s.loopHz = gState.loopRate.lastHz;
+  portEXIT_CRITICAL(&gFlightMux);
+
+  s.accelOffG[0] = gCal.accel_off_x.load(std::memory_order_relaxed);
+  s.accelOffG[1] = gCal.accel_off_y.load(std::memory_order_relaxed);
+  s.accelOffG[2] = gCal.accel_off_z.load(std::memory_order_relaxed);
+#if FCU_ENABLE_EXTERNAL_MAG
+  s.magUt[0] = gExtMag.mx.load(std::memory_order_relaxed);
+  s.magUt[1] = gExtMag.my.load(std::memory_order_relaxed);
+  s.magUt[2] = gExtMag.mz.load(std::memory_order_relaxed);
+#endif
+
+  portENTER_CRITICAL(&gSensorMux);
+  s.baroAltM = gState.baro.relativeAltM;
+  s.baroPa = gState.baro.pressurePa;
+  s.baroTempC = gState.baro.temperatureC;
+  s.baroValid = gState.baro.ready && gState.baro.valid;
+  s.gpsLatE7 = gState.gps.latE7;
+  s.gpsLonE7 = gState.gps.lonE7;
+  s.gpsAltDm = gState.gps.altDm;
+  s.gpsSpeedMs = gState.gps.groundSpeedMs;
+  s.gpsCourseDeg = gState.gps.courseDeg;
+  s.gpsHdop = gState.gps.hdopValid ? gState.gps.hdop : 99.9f;
+  s.gpsSats = gState.gps.satellites;
+  s.gpsFixQuality = gState.gps.fixQuality;
+  s.gpsFix = gState.gps.hasFix;
+  s.tofMm = gState.tof.distanceMm;
+  s.tofValid = gState.tof.ready && gState.tof.ranging;
+  portEXIT_CRITICAL(&gSensorMux);
 }
 
 // Read-only calibration + level/trim detail for the Attitude & Level tab.
@@ -7472,6 +7823,8 @@ pid_webserver::Callbacks buildConfiguratorCallbacks() {
   cbs.saveFailsafeBypassToNvs = pidWebSaveFailsafeBypassToNvs;
   cbs.getState = pidWebGetState;
   cbs.getHealth = pidWebGetHealth;
+  cbs.getStatus = pidWebGetStatus;
+  cbs.getSensorsLive = pidWebGetSensorsLive;
   cbs.getTune = pidWebGetTune;
   // Live dashboard + persistent level/trim calibration.
   cbs.getDashTelemetry = pidWebGetDash;
@@ -8173,7 +8526,14 @@ void acceptControlPacketFromRadio(const control_protocol::ControlPacket& packet,
 }
 
 // [FLIGHT CONTROL] — declared in include/flight_control.h
-void processControlPacket(const control_protocol::ControlPacket& packet, uint32_t nowMs) {
+void processControlPacket(const control_protocol::ControlPacket& packetIn, uint32_t nowMs) {
+  // [ARMING GATE] A rising arm-switch edge is refused (packet rewritten to its
+  // disarmed form) while any arming-disable flag is set. Local mutable copy so
+  // the rest of this function — and everything downstream — sees the gated
+  // packet. Never affects an already-armed craft.
+  control_protocol::ControlPacket packet = packetIn;
+  enforceArmingGate(packet, nowMs);
+
   // Any valid control packet refreshes the link, including non-flight
   // zero-throttle heartbeats from the remote.
   bool failsafeLatched = false;
@@ -9906,6 +10266,21 @@ void updateControlLoop(uint32_t nowMs) {
   gState.pid.lastUpdateUs = nowUs;
   gState.pid.lastUpdateMs = nowMs;
   gState.pid.lastDtUs = elapsedUs;  // mirrored for the [FLT_STATE] line
+  // Loop-dt stats for /api/status. Uses the RAW dt (not the constrained one)
+  // so stalls/overruns are visible in max. Single writer (this task).
+  {
+    if (rawElapsedUs < gLoopDtMinUs.load(std::memory_order_relaxed)) {
+      gLoopDtMinUs.store(rawElapsedUs, std::memory_order_relaxed);
+    }
+    if (rawElapsedUs > gLoopDtMaxUs.load(std::memory_order_relaxed)) {
+      gLoopDtMaxUs.store(rawElapsedUs, std::memory_order_relaxed);
+    }
+    const uint32_t avg = gLoopDtAvgUs.load(std::memory_order_relaxed);
+    const uint32_t next = (avg == 0U)
+        ? rawElapsedUs
+        : avg + ((static_cast<int32_t>(rawElapsedUs) - static_cast<int32_t>(avg)) >> 6);
+    gLoopDtAvgUs.store(next, std::memory_order_relaxed);
+  }
   gState.loopRate.ticks++;
   if (nowMs - gState.loopRate.lastSampleMs >= 1000U) {
     const uint32_t deltaMs = nowMs - gState.loopRate.lastSampleMs;
@@ -11552,6 +11927,7 @@ void sensorTask(void* /*arg*/) {
     emitPiTelemetry(nowMs);   // FCU -> Pi: GPS + FCU_STATE @ ~5 Hz, self-throttled
     pollBattery(nowMs);
     updateFlightStateMachine(nowMs);  // observer-mode FSM, ~50 Hz
+    updateArmingDisableFlags(nowMs);  // central "why can't I arm" bitmask
     // [LED] Pick the desired continuous pattern then advance the blinker.
     // setPattern() is cheap when the pattern hasn't changed. Bursts queued
     // by GPS events still overlay this — they finish, then we resume the
@@ -11864,6 +12240,7 @@ void setup() {
 #if ENABLE_PID_WEBSERVER
   registerFcuConfigExternalBindings();
 #endif
+  refreshArmingConfigCache();  // arming gates read config through atomics
   initNrfStatusLeds();
 
   // ---- Nav status LED (4 blinks on first GPS fix and on origin lock) ------
