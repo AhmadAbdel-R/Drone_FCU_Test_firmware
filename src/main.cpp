@@ -117,6 +117,7 @@
 #include "fcu_config.h"     // INAV-style versioned param registry + JSON export/import
 #include "arming_flags.h"   // central arming-disable bitmask (flags + names)
 #include "gps_ublox.h"      // clean-room UBX config frame builders (GPS page)
+#include "flight_filters.h" // modular PT1/biquad gyro+accel+setpoint chains
 #include "DynamicNotchFilter.h"
 #include "notch_analysis.h"
 #include "diag_capture.h"
@@ -1542,6 +1543,9 @@ static constexpr uint8_t PID_ITERM_MIN_THROTTLE_PCT = 5;
 static constexpr bool PID_DERIV_ON_MEASUREMENT = (FCU_PID_DERIV_ON_MEASUREMENT != 0);
 static constexpr float PID_DTERM_LPF_HZ = FCU_PID_DTERM_LPF_HZ;
 static constexpr float PID_INTEGRAL_LIMIT_RAW = FCU_PID_INTEGRAL_LIMIT_RAW;
+// Runtime D-term LPF cutoff (dterm_lpf_hz via fcu_config; the compile value
+// is the default). Consumed by configurePidAxis() on every PID reconfigure.
+static std::atomic<float> gDtermLpfHz{FCU_PID_DTERM_LPF_HZ};
 
 // Conservative first-flight gains for the current heavy quad layout:
 // M1 FR CW, M2 RR CCW, M3 FL CCW, M4 RL CW. The bench logs show clean
@@ -4071,7 +4075,7 @@ void configurePidAxis(FcuPidController& pid, int16_t kpMilli, int16_t kiMilli, i
   config.integralMax = PID_INTEGRAL_LIMIT_RAW;
   // Derivative kick removal + D-term low-pass (rate loops only).
   config.derivativeOnMeasurement = PID_DERIV_ON_MEASUREMENT;
-  config.dTermCutoffHz = PID_DTERM_LPF_HZ;
+  config.dTermCutoffHz = gDtermLpfHz.load(std::memory_order_relaxed);
   pid.configure(config);
 }
 
@@ -6440,6 +6444,58 @@ void refreshModesConfigCache() {
   gModeAssignedFuncs.store(assigned, std::memory_order_relaxed);
 }
 
+// =============================================================================
+// [FILTER CHAIN] — staged gyro/accel/setpoint filters (fcu_config GROUP_FILTER).
+//
+// The chain objects are OWNED BY THE FLIGHT TASK; the config path only writes
+// the pending copy + dirty flag (same hand-off as the notch/mixer configs).
+// The D-term LPF rides the existing PID configure path instead (gDtermLpfHz).
+// =============================================================================
+struct FilterStagedCfg {
+  flt::GyroChainConfig gyro;
+  flt::AccelChainConfig accel;
+  float setpointHz = 0.0f;
+};
+FilterStagedCfg gFilterPendingCfg;
+std::atomic<bool> gFilterCfgDirty{false};
+// Flight-task-only instances (configured via the staged copy; never touched
+// from any other task).
+flt::GyroChain gGyroChain;
+flt::AccelChain gAccelChain;
+flt::SetpointFilter gSetpointFilter;
+
+void refreshFilterConfigCache() {
+  FilterStagedCfg c;
+  c.gyro.lpf1Type = static_cast<uint8_t>(fcuCfgReadByName("gyro_lpf_type", 1.0f));
+  c.gyro.lpf1Hz = fcuCfgReadByName("gyro_lpf_hz", 90.0f);
+  c.gyro.lpf1DynMinHz = fcuCfgReadByName("gyro_lpf_dyn_min_hz", 0.0f);
+  c.gyro.lpf1DynMaxHz = fcuCfgReadByName("gyro_lpf_dyn_max_hz", 0.0f);
+  c.gyro.lpf1DynExpo = fcuCfgReadByName("gyro_lpf_dyn_expo", 5.0f);
+  c.gyro.lpf2Type = static_cast<uint8_t>(fcuCfgReadByName("gyro_lpf2_type", 0.0f));
+  c.gyro.lpf2Hz = fcuCfgReadByName("gyro_lpf2_hz", 150.0f);
+  c.accel.lpfType = static_cast<uint8_t>(fcuCfgReadByName("accel_lpf_type", 2.0f));
+  c.accel.lpfHz = fcuCfgReadByName("accel_lpf_hz", 15.0f);
+  c.accel.notchHz = fcuCfgReadByName("accel_notch_hz", 0.0f);
+  c.accel.notchQ = fcuCfgReadByName("accel_notch_q", 3.0f);
+  c.setpointHz = fcuCfgReadByName("setpoint_lpf_hz", 0.0f);
+  portENTER_CRITICAL(&gFlightMux);
+  gFilterPendingCfg = c;
+  gFilterCfgDirty.store(true, std::memory_order_release);
+  portEXIT_CRITICAL(&gFlightMux);
+
+  // D-term cutoff flows through the normal PID configure path so the PID
+  // classes stay the single owner of their internal filter state.
+  const float d = fcuCfgReadByName("dterm_lpf_hz", PID_DTERM_LPF_HZ);
+  if (d != gDtermLpfHz.load(std::memory_order_relaxed)) {
+    gDtermLpfHz.store(d, std::memory_order_relaxed);
+    control_protocol::ControlPacket pkt;
+    portENTER_CRITICAL(&gControlMux);
+    pkt = gState.control.lastPacket;
+    portEXIT_CRITICAL(&gControlMux);
+    configurePidFromPacket(pkt);
+  }
+}
+
 void refreshMixerConfigCache() {
   static const char* kAxis[4] = {"throttle", "roll", "pitch", "yaw"};
   float table[16];
@@ -6729,6 +6785,9 @@ void fcuConfigGroupChanged(uint8_t group) {
       break;
     case fcu_config::GROUP_MODES:
       refreshModesConfigCache();
+      break;
+    case fcu_config::GROUP_FILTER:
+      refreshFilterConfigCache();
       break;
     case fcu_config::GROUP_NAV:
       refreshArmingConfigCache();  // nav quality gates live in the arming cache
@@ -10992,7 +11051,39 @@ void updateControlLoop(uint32_t nowMs) {
 #if FCU_ENABLE_RPM_FILTER
       gRpmNotch.process(sample.gx_dps, sample.gy_dps, sample.gz_dps);
 #endif
-      // Vibration/FFT capture tap: pre-notch (dbg*) vs post-notch (sample.*).
+      // [FILTER CHAIN] staged gyro LPF1/LPF2 + accel LPF/notch. Runs after
+      // the notch filters so the FFT tap below compares raw vs the FULL
+      // filtered signal the PIDs actually see. Config swaps in between ticks
+      // only (pending + dirty, set by refreshFilterConfigCache).
+      if (gFilterCfgDirty.load(std::memory_order_acquire)) {
+        FilterStagedCfg fcfg;
+        portENTER_CRITICAL(&gFlightMux);
+        fcfg = gFilterPendingCfg;
+        gFilterCfgDirty.store(false, std::memory_order_relaxed);
+        portEXIT_CRITICAL(&gFlightMux);
+        gGyroChain.configure(fcfg.gyro);
+        gAccelChain.configure(fcfg.accel);
+        gSetpointFilter.setCutoff(fcfg.setpointHz);
+        fcu_log::logf(fcu_log::Level::Info,
+                      "[FILTER] gyro lpf1 t%u %.0fHz dyn %.0f-%.0f e%.0f | lpf2 t%u %.0fHz | "
+                      "accel t%u %.0fHz notch %.0fHz q%.1f | sp %.0fHz\n",
+                      fcfg.gyro.lpf1Type, (double)fcfg.gyro.lpf1Hz,
+                      (double)fcfg.gyro.lpf1DynMinHz, (double)fcfg.gyro.lpf1DynMaxHz,
+                      (double)fcfg.gyro.lpf1DynExpo, fcfg.gyro.lpf2Type,
+                      (double)fcfg.gyro.lpf2Hz, fcfg.accel.lpfType, (double)fcfg.accel.lpfHz,
+                      (double)fcfg.accel.notchHz, (double)fcfg.accel.notchQ,
+                      (double)fcfg.setpointHz);
+      }
+      {
+        // Throttle 0..1 for the dynamic LPF schedule — previous tick's
+        // smoothed throttle (flight-task-owned, so a plain read is safe).
+        const float thr01 = gState.pid.smoothedThrottleInit
+                                ? gState.pid.smoothedThrottlePct * 0.01f
+                                : 0.0f;
+        gGyroChain.process(sample.gx_dps, sample.gy_dps, sample.gz_dps, dtSeconds, thr01);
+        gAccelChain.process(sample.ax_g, sample.ay_g, sample.az_g, dtSeconds);
+      }
+      // Vibration/FFT capture tap: pre-filter (dbg*) vs post-filter (sample.*).
       // No-op unless a capture is active; never blocks the loop.
       {
         const float rawG[3] = {dbgGxRaw, dbgGyRaw, dbgGzRaw};
@@ -11544,12 +11635,19 @@ void updateControlLoop(uint32_t nowMs) {
   FcuPidTerms pitchT;
   FcuPidTerms yawT;
   portENTER_CRITICAL(&gFlightMux);
-  const float rollRateSetpointDps =
+  // Optional setpoint smoothing (setpoint_lpf_hz; 0 = off = passthrough):
+  // PT1 on the rate commands so stick steps don't kick the rate loop, while
+  // the gyro/disturbance path keeps its full bandwidth.
+  const float rollRateSetpointDps = gSetpointFilter.applyAxis(
+      0,
       constrain((rollAngleSetpointDeg - correctedRollDeg) * gState.pid.angleRollGain,
-                -MAX_ANGLE_RATE_SETPOINT_DPS, MAX_ANGLE_RATE_SETPOINT_DPS);
-  const float pitchRateSetpointDps =
+                -MAX_ANGLE_RATE_SETPOINT_DPS, MAX_ANGLE_RATE_SETPOINT_DPS),
+      dtSeconds);
+  const float pitchRateSetpointDps = gSetpointFilter.applyAxis(
+      1,
       constrain((pitchAngleSetpointDeg - correctedPitchDeg) * gState.pid.anglePitchGain,
-                -MAX_ANGLE_RATE_SETPOINT_DPS, MAX_ANGLE_RATE_SETPOINT_DPS);
+                -MAX_ANGLE_RATE_SETPOINT_DPS, MAX_ANGLE_RATE_SETPOINT_DPS),
+      dtSeconds);
   float yawRateSetpointDps = manualYawRateSetpointDps;
   if (allowFlight && yawStickCentered && yawHeadingUsable && gState.pid.angleYawGain > 0.0f) {
     if (!gState.pid.yawHoldActive) {
@@ -11566,6 +11664,7 @@ void updateControlLoop(uint32_t nowMs) {
     gState.pid.angleYawSetpointDeg = attitudeSnap.yawDeg;
     gState.pid.yawHoldActive = false;
   }
+  yawRateSetpointDps = gSetpointFilter.applyAxis(2, yawRateSetpointDps, dtSeconds);
   rollT = gState.pid.roll.update(rollRateSetpointDps, imuSampleSnap.gx_dps, dtSeconds,
                                  allowIntegration);
   pitchT = gState.pid.pitch.update(pitchRateSetpointDps, imuSampleSnap.gy_dps, dtSeconds,
@@ -12935,6 +13034,7 @@ void setup() {
   refreshMotorConfigCache();   // motor map / armed idle / test limits likewise
   refreshMixerConfigCache();   // stage the custom mixer table for the flight task
   refreshModesConfigCache();   // aux-range mode slots for the CRSF task
+  refreshFilterConfigCache();  // stage the gyro/accel/setpoint filter chain
   initNrfStatusLeds();
 
   // ---- Nav status LED (4 blinks on first GPS fix and on origin lock) ------

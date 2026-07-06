@@ -491,6 +491,36 @@ canvas{display:block;width:100%;background:#0a0d12;border-radius:8px;border:1px 
  <!-- ===== FILTERS & NOTCH ===== -->
  <section class="tab" id="t_notch">
   <div class="grid wide">
+   <div class="card span2"><h3>Gyro / Accel / Setpoint filters <span class="tag" id="ft_tag">--</span></h3>
+    <div class="note">The full chain the rate PIDs see: dynamic notch (below) &rarr; <b>gyro LPF1</b> &rarr; <b>gyro LPF2</b>.
+     Changes apply atomically between flight ticks and persist immediately. Loop <b id="ft_loop">--</b> Hz —
+     filters derive from the measured dt, but <b>PID behavior still changes if the loop rate changes</b>; retune after altering loop timing.</div>
+    <div class="grid" style="margin-top:8px">
+     <div>
+      <div class="row"><label>Gyro LPF1 type</label><select id="ft_g1t"><option value="0">Off</option><option value="1">PT1</option><option value="2">Biquad</option></select></div>
+      <div class="row"><label>Gyro LPF1 Hz</label><input type="number" id="ft_g1h" min="10" max="500" step="5" style="max-width:90px"></div>
+      <div class="row"><label>Dyn min Hz (0=static)</label><input type="number" id="ft_gdmin" min="0" max="500" step="5" style="max-width:90px"></div>
+      <div class="row"><label>Dyn max Hz</label><input type="number" id="ft_gdmax" min="0" max="750" step="5" style="max-width:90px"></div>
+      <div class="row"><label>Dyn expo (0-10)</label><input type="number" id="ft_gdexp" min="0" max="10" step="1" style="max-width:90px"></div>
+      <div class="row"><label>Gyro LPF2 type</label><select id="ft_g2t"><option value="0">Off</option><option value="1">PT1</option><option value="2">Biquad</option></select></div>
+      <div class="row"><label>Gyro LPF2 Hz</label><input type="number" id="ft_g2h" min="10" max="500" step="5" style="max-width:90px"></div>
+     </div>
+     <div>
+      <div class="row"><label>Accel LPF type</label><select id="ft_at"><option value="1">PT1</option><option value="2">Biquad</option></select></div>
+      <div class="row"><label>Accel LPF Hz</label><input type="number" id="ft_ah" min="1" max="200" step="1" style="max-width:90px"></div>
+      <div class="row"><label>Accel notch Hz (0=off)</label><input type="number" id="ft_anh" min="0" max="400" step="5" style="max-width:90px"></div>
+      <div class="row"><label>Accel notch Q</label><input type="number" id="ft_anq" min="0.5" max="10" step="0.5" style="max-width:90px"></div>
+      <div class="row"><label>D-term LPF Hz (0=off)</label><input type="number" id="ft_dh" min="0" max="400" step="5" style="max-width:90px"></div>
+      <div class="row"><label>Setpoint LPF Hz (0=off)</label><input type="number" id="ft_sh" min="0" max="200" step="5" style="max-width:90px"></div>
+     </div>
+    </div>
+    <div class="warnbox" id="ft_dynnote" style="display:none">Dynamic cutoff requires the PT1 type — a biquad here runs static at the base cutoff.</div>
+    <div class="btns" style="margin-top:8px">
+     <button class="btn pri" onclick="ftApply()">Apply &amp; Save filters</button>
+     <button class="btn" onclick="ftLoad(true)">Reload saved</button>
+    </div>
+    <div class="note mono" id="ft_live">raw vs filtered: --</div>
+   </div>
    <div class="card span2"><h3>FFT spectrum <span class="small dim" id="nt_status">idle</span></h3>
     <div class="toolbar">
      <button class="btn pri" id="nt_run" onclick="notchRun()">Run Live Notch Analysis</button>
@@ -1413,6 +1443,45 @@ async function capClear(){if(confirm('Clear diagnostic capture?')&&await act('/a
 function capDownload(){window.location.href='/api/capture.csv';}
 STAGE.capture=()=>{capPoll();if(!capTimer)capTimer=setInterval(()=>{if(activeTab==='capture')capPoll();else{clearInterval(capTimer);capTimer=null;}},500);};
 (function(){const prev=window.onRender;window.onRender=m=>{if(prev)prev(m);if(activeTab==='vibe')renderVibe(m);if(activeTab==='pid')renderYawCard(m);};})();
+// ===== Filter chain card (Filters & Notch tab) ===============================
+let FT_LOADED=false;
+async function ftLoad(showToast){
+ try{const r=await fetch('/api/config');if(!r.ok)return;const j=await r.json();
+  const map={};(j.params||[]).forEach(p=>map[p.n]=p.v);
+  const set=(id,v)=>{const el=document.getElementById(id);if(el&&v!=null)el.value=v;};
+  set('ft_g1t',map.gyro_lpf_type);set('ft_g1h',map.gyro_lpf_hz);
+  set('ft_gdmin',map.gyro_lpf_dyn_min_hz);set('ft_gdmax',map.gyro_lpf_dyn_max_hz);
+  set('ft_gdexp',map.gyro_lpf_dyn_expo);set('ft_g2t',map.gyro_lpf2_type);set('ft_g2h',map.gyro_lpf2_hz);
+  set('ft_at',map.accel_lpf_type);set('ft_ah',map.accel_lpf_hz);
+  set('ft_anh',map.accel_notch_hz);set('ft_anq',map.accel_notch_q);
+  set('ft_dh',map.dterm_lpf_hz);set('ft_sh',map.setpoint_lpf_hz);
+  FT_LOADED=true;const t=document.getElementById('ft_tag');t.className='tag ok';t.textContent='loaded';
+  if(showToast)toast('Filter settings reloaded');
+ }catch(e){}
+}
+async function ftApply(){
+ const g=id=>+document.getElementById(id).value||0;
+ const body={gyro_lpf_type:g('ft_g1t'),gyro_lpf_hz:g('ft_g1h')||90,
+  gyro_lpf_dyn_min_hz:g('ft_gdmin'),gyro_lpf_dyn_max_hz:g('ft_gdmax'),gyro_lpf_dyn_expo:g('ft_gdexp'),
+  gyro_lpf2_type:g('ft_g2t'),gyro_lpf2_hz:g('ft_g2h')||150,
+  accel_lpf_type:g('ft_at')||2,accel_lpf_hz:g('ft_ah')||15,
+  accel_notch_hz:g('ft_anh'),accel_notch_q:g('ft_anq')||3,
+  dterm_lpf_hz:g('ft_dh'),setpoint_lpf_hz:g('ft_sh')};
+ if(body.gyro_lpf_dyn_min_hz>0&&body.gyro_lpf_dyn_max_hz<=body.gyro_lpf_dyn_min_hz){
+  toast('Dyn max must exceed dyn min',true);return;}
+ await act('/api/filters/apply','Filters applied & saved',body);
+}
+function renderFilterCard(m){
+ const el=document.getElementById('ft_live');if(!el)return;
+ const g=m.imu.g||[0,0,0],gr=m.imu.graw||[0,0,0];
+ el.textContent='raw vs filtered (dps)  X '+f(gr[0],1)+' → '+f(g[0],1)
+  +'   Y '+f(gr[1],1)+' → '+f(g[1],1)+'   Z '+f(gr[2],1)+' → '+f(g[2],1);
+ const lp=document.getElementById('ft_loop');if(lp)lp.textContent=m.sys.loop;
+ const dyn=document.getElementById('ft_dynnote');
+ if(dyn)dyn.style.display=(+document.getElementById('ft_gdmin').value>0&&+document.getElementById('ft_g1t').value===2)?'block':'none';
+}
+(function(){const prev=STAGE.notch;STAGE.notch=()=>{if(prev)prev();if(!FT_LOADED)ftLoad();};})();
+(function(){const prev=window.onRender;window.onRender=m=>{if(prev)prev(m);if(activeTab==='notch')renderFilterCard(m);};})();
 // ===== GPS tab ===============================================================
 // Status rides the WS frame; config loads once from /api/config and saves via
 // /api/gps/save; "Apply to receiver" schedules the disarmed-only UBX push.

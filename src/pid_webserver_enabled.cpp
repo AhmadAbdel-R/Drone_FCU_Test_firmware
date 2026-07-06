@@ -1557,6 +1557,18 @@ esp_err_t handleGpsSetHome(httpd_req_t* req) {
   return sendJson(req, "{\"ok\":true,\"homeSet\":true}");
 }
 
+// POST /api/filters/apply — persist + apply the filter chain settings (flat
+// param object; staged into the flight task between ticks).
+esp_err_t handleFiltersApply(httpd_req_t* req) {
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
+  static char body[1024];
+  const int n = recvBody(req, body, sizeof(body));
+  if (n < 0) return sendError(req, 400, "bad_body");
+  const auto res = fcu_config::applyJsonObject(body, static_cast<size_t>(n));
+  return sendImportResult(req, res);
+}
+
 esp_err_t handleReboot(httpd_req_t* req) {
   if (!gCb.requestReboot) return sendError(req, 500, "no_callback");
   if (!authorized(req)) return sendError(req, 401, "unauthorized");
@@ -1712,6 +1724,7 @@ bool startHttpServer() {
   registerUri(gServer, "/api/gps/configure",    HTTP_POST, handleGpsConfigure);
   registerUri(gServer, "/api/gps/save",         HTTP_POST, handleGpsSave);
   registerUri(gServer, "/api/gps/sethome",      HTTP_POST, handleGpsSetHome);
+  registerUri(gServer, "/api/filters/apply",    HTTP_POST, handleFiltersApply);
   // ---- Config registry (fcu_config) ----
   registerUri(gServer, "/api/config",           HTTP_GET,  handleGetConfig);
   registerUri(gServer, "/api/config",           HTTP_POST, handlePostConfig);
