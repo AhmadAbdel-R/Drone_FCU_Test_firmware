@@ -168,6 +168,7 @@
 #include "gain_schedule.h"
 #include "sensor_calibration.h"
 #include "mag_calibration.h"
+#include "accel_calibration.h"      // six-position accel zero+gain wizard
 #include "external_mag.h"
 #include "led_blinker.h"
 
@@ -2359,6 +2360,12 @@ struct LiveSensorCalibration {
   std::atomic<float> accel_off_y{0.0f};
   std::atomic<float> accel_off_z{0.0f};
   std::atomic<bool>  accel_valid{false};
+  // Per-axis accel gain, multiplied AFTER offset subtraction. 1.0 (exact
+  // no-op) unless a six-position calibration is loaded.
+  std::atomic<float> accel_gain_x{1.0f};
+  std::atomic<float> accel_gain_y{1.0f};
+  std::atomic<float> accel_gain_z{1.0f};
+  std::atomic<bool>  accel_cal6_valid{false};
   // Mag hard-iron offset in µT, subtracted from raw body-frame reading.
   std::atomic<float> mag_hard_x{0.0f};
   std::atomic<float> mag_hard_y{0.0f};
@@ -2378,6 +2385,13 @@ struct LiveSensorCalibration {
   std::atomic<bool>    gps_origin_valid{false};
 };
 LiveSensorCalibration gCal;
+
+// [ACCEL CAL 6] six-position calibrator. The calibrator object is guarded by
+// gFlightMux (its methods are a few flops); the flight task ticks it, the web
+// task drives session/capture/finish. gAccelCal6Active gates the per-tick
+// service call so an idle session costs one atomic load.
+gnc::SixFaceAccelCalibrator gAccelCal6;
+std::atomic<bool> gAccelCal6Active{false};
 // Mag calibration mode latch — set by the stick gesture, cleared on
 // completion / cancel. While true, the IMU read forwards raw mag samples
 // to gMagCal.addSample().
@@ -3420,12 +3434,16 @@ bool readImuSample(ImuSample& out) {
     out.gy_dps -= gGyroBias.gy_dps;
     out.gz_dps -= gGyroBias.gz_dps;
   }
-  // [CALIBRATION] subtract NVS-stored accel offset captured by BootCalibration.
-  // Applied AFTER axis remap so the offset is in body frame (g units).
+  // [CALIBRATION] corrected = (raw − zero) · gain, applied AFTER axis remap so
+  // both are body-frame. Gain is 1.0 (exact no-op) unless a six-position
+  // calibration is loaded; the legacy one-pose offset uses the same path.
   if (gCal.accel_valid.load(std::memory_order_relaxed)) {
-    out.ax_g -= gCal.accel_off_x.load(std::memory_order_relaxed);
-    out.ay_g -= gCal.accel_off_y.load(std::memory_order_relaxed);
-    out.az_g -= gCal.accel_off_z.load(std::memory_order_relaxed);
+    out.ax_g = (out.ax_g - gCal.accel_off_x.load(std::memory_order_relaxed)) *
+               gCal.accel_gain_x.load(std::memory_order_relaxed);
+    out.ay_g = (out.ay_g - gCal.accel_off_y.load(std::memory_order_relaxed)) *
+               gCal.accel_gain_y.load(std::memory_order_relaxed);
+    out.az_g = (out.az_g - gCal.accel_off_z.load(std::memory_order_relaxed)) *
+               gCal.accel_gain_z.load(std::memory_order_relaxed);
   }
 
   // ---- Mag: capture RAW (pre-correction) for the mag-cal capture loop ----
@@ -3900,6 +3918,29 @@ void serviceLevelCalibration(const ImuSample& sample, uint32_t nowMs) {
 // smoothed value, which is strictly cleaner). Wrap-safe EMA on heading, EMA +
 // innovation spike-gate on field, N-sample debounce on the trusted flag. State is
 // function-local static; seeded on the first call after boot.
+// [ACCEL CAL 6] flight-task service: feed RAW accel to the six-face
+// calibrator while a session runs. The sample arrives corrected+filtered, so
+// reconstruct raw = corrected/gain + zero — exact inverse of readImuSample's
+// correction (filtering only shifts noise, not the per-face mean).
+void serviceAccelCal6(const ImuSample& sample, uint32_t nowMs) {
+  if (!gAccelCal6Active.load(std::memory_order_relaxed)) return;
+  float raw[3] = {sample.ax_g, sample.ay_g, sample.az_g};
+  if (gCal.accel_valid.load(std::memory_order_relaxed)) {
+    const float gx = gCal.accel_gain_x.load(std::memory_order_relaxed);
+    const float gy = gCal.accel_gain_y.load(std::memory_order_relaxed);
+    const float gz = gCal.accel_gain_z.load(std::memory_order_relaxed);
+    raw[0] = raw[0] / ((gx != 0.0f) ? gx : 1.0f) + gCal.accel_off_x.load(std::memory_order_relaxed);
+    raw[1] = raw[1] / ((gy != 0.0f) ? gy : 1.0f) + gCal.accel_off_y.load(std::memory_order_relaxed);
+    raw[2] = raw[2] / ((gz != 0.0f) ? gz : 1.0f) + gCal.accel_off_z.load(std::memory_order_relaxed);
+  }
+  const float gyroMag = sqrtf(sample.gx_dps * sample.gx_dps +
+                              sample.gy_dps * sample.gy_dps +
+                              sample.gz_dps * sample.gz_dps);
+  portENTER_CRITICAL(&gFlightMux);
+  gAccelCal6.tick(raw[0], raw[1], raw[2], gyroMag, nowMs);
+  portEXIT_CRITICAL(&gFlightMux);
+}
+
 void applyMagDisplayFilter(float& headingDeg, float& fieldUt, bool& trusted, float dt) {
   static bool s_init = false;
   static float s_hdg = 0.0f, s_field = 0.0f;
@@ -7588,6 +7629,94 @@ void pidWebGetDash(pid_webserver::DashTelemetry& d) {
 #endif
 }
 
+// ---- Six-position accel calibration callbacks --------------------------------
+bool pidWebAccelCal6Start() {
+  if (!pidWebWriteSafe()) return false;
+  portENTER_CRITICAL(&gFlightMux);
+  gAccelCal6.beginSession();
+  portEXIT_CRITICAL(&gFlightMux);
+  gAccelCal6Active.store(true, std::memory_order_relaxed);
+  fcu_log::logf(fcu_log::Level::Info, "[ACAL6] session started\n");
+  return true;
+}
+
+bool pidWebAccelCal6Capture() {
+  if (!gAccelCal6Active.load(std::memory_order_relaxed) || !pidWebWriteSafe()) return false;
+  bool ok = false;
+  portENTER_CRITICAL(&gFlightMux);
+  ok = gAccelCal6.requestCapture(millis());
+  portEXIT_CRITICAL(&gFlightMux);
+  return ok;
+}
+
+bool pidWebAccelCal6Finish() {
+  if (!gAccelCal6Active.load(std::memory_order_relaxed) || !pidWebWriteSafe()) return false;
+  gnc::SixFaceAccelCalibrator::Result r;
+  bool ok = false;
+  portENTER_CRITICAL(&gFlightMux);
+  ok = gAccelCal6.finish(r);
+  portEXIT_CRITICAL(&gFlightMux);
+  if (!ok) return false;
+
+  // Apply live, then persist. The record supersedes the one-pose offset at
+  // the next boot (loadCalibrationFromNvs prefers it).
+  gCal.accel_off_x.store(r.zero[0], std::memory_order_relaxed);
+  gCal.accel_off_y.store(r.zero[1], std::memory_order_relaxed);
+  gCal.accel_off_z.store(r.zero[2], std::memory_order_relaxed);
+  gCal.accel_gain_x.store(r.gain[0], std::memory_order_relaxed);
+  gCal.accel_gain_y.store(r.gain[1], std::memory_order_relaxed);
+  gCal.accel_gain_z.store(r.gain[2], std::memory_order_relaxed);
+  gCal.accel_valid.store(true, std::memory_order_relaxed);
+  gCal.accel_cal6_valid.store(true, std::memory_order_relaxed);
+
+  fcu_nvs::FcuPidNvs::AccelCal6 rec;
+  for (int i = 0; i < 3; ++i) {
+    rec.zero[i] = r.zero[i];
+    rec.gain[i] = r.gain[i];
+  }
+  rec.valid = true;
+  const bool saved = gPidNvs.ready() && gPidNvs.saveAccelCal6(rec);
+  gAccelCal6Active.store(false, std::memory_order_relaxed);
+  fcu_log::logf(fcu_log::Level::Info,
+                "[ACAL6] finished zero=%.3f/%.3f/%.3f gain=%.3f/%.3f/%.3f saved=%u\n",
+                (double)r.zero[0], (double)r.zero[1], (double)r.zero[2],
+                (double)r.gain[0], (double)r.gain[1], (double)r.gain[2],
+                (unsigned)saved);
+  return saved;
+}
+
+bool pidWebAccelCal6Cancel() {
+  portENTER_CRITICAL(&gFlightMux);
+  gAccelCal6.cancel();
+  portEXIT_CRITICAL(&gFlightMux);
+  gAccelCal6Active.store(false, std::memory_order_relaxed);
+  return true;
+}
+
+void pidWebGetAccelCal6(pid_webserver::AccelCalStatus& s) {
+  portENTER_CRITICAL(&gFlightMux);
+  s.state = static_cast<uint8_t>(gAccelCal6.state());
+  s.facesDoneMask = gAccelCal6.facesDoneMask();
+  s.activeFace = gAccelCal6.activeFace();
+  s.sampleCount = gAccelCal6.sampleCount();
+  s.samplesPerFace = gAccelCal6.samplesPerFace();
+  strncpy(s.lastError, gAccelCal6.lastError(), sizeof(s.lastError) - 1);
+  s.lastError[sizeof(s.lastError) - 1] = '\0';
+  const float ax = gState.imuSample.ax_g, ay = gState.imuSample.ay_g,
+              az = gState.imuSample.az_g;
+  portEXIT_CRITICAL(&gFlightMux);
+  s.accelMagG = sqrtf(ax * ax + ay * ay + az * az);
+  s.zero[0] = gCal.accel_off_x.load(std::memory_order_relaxed);
+  s.zero[1] = gCal.accel_off_y.load(std::memory_order_relaxed);
+  s.zero[2] = gCal.accel_off_z.load(std::memory_order_relaxed);
+  s.gain[0] = gCal.accel_gain_x.load(std::memory_order_relaxed);
+  s.gain[1] = gCal.accel_gain_y.load(std::memory_order_relaxed);
+  s.gain[2] = gCal.accel_gain_z.load(std::memory_order_relaxed);
+  s.cal6Valid = gCal.accel_cal6_valid.load(std::memory_order_relaxed);
+  s.sessionActive = gAccelCal6Active.load(std::memory_order_relaxed);
+  s.safe = pidWebWriteSafe();
+}
+
 // ---- GPS page callbacks -----------------------------------------------------
 bool pidWebGpsConfigure() {
   if (!pidWebWriteSafe()) return false;
@@ -8282,6 +8411,11 @@ pid_webserver::Callbacks buildConfiguratorCallbacks() {
   cbs.restoreLevelPrev = pidWebRestoreLevelPrev;
   cbs.saveAccelOffset = pidWebSaveAccelOffset;
   cbs.clearAccelOffset = pidWebClearAccelOffset;
+  cbs.accelCalStart = pidWebAccelCal6Start;
+  cbs.accelCalCapture = pidWebAccelCal6Capture;
+  cbs.accelCalFinish = pidWebAccelCal6Finish;
+  cbs.accelCalCancel = pidWebAccelCal6Cancel;
+  cbs.getAccelCal = pidWebGetAccelCal6;
   cbs.startMagCalibration = pidWebStartMagCalibration;
   cbs.finishMagCalibration = pidWebFinishMagCalibration;
   cbs.getMagConfig = pidWebGetMagConfig;
@@ -11091,6 +11225,7 @@ void updateControlLoop(uint32_t nowMs) {
         gNotchAnalyzer.tick(rawG, finG, micros());
       }
       serviceGyroCalibration(sample, nowMs);
+      serviceAccelCal6(sample, nowMs);  // six-face wizard capture (idle: 1 load)
       portENTER_CRITICAL(&gFlightMux);
       gState.pid.gyroPreFilterDps[0] = dbgGxRaw;
       gState.pid.gyroPreFilterDps[1] = dbgGyRaw;
@@ -12368,8 +12503,24 @@ void loadCalibrationFromNvs() {
     Serial.println("[CAL] NVS not ready; calibration disabled this boot");
     return;
   }
+  // Six-position calibration (zero + gain) supersedes the legacy one-pose
+  // offset when a valid record exists — both feed the same correction path.
+  // The legacy record is still loaded for the summary log below.
   const auto a = gPidNvs.loadAccelOffset();
-  if (a.valid) {
+  const auto c6 = gPidNvs.loadAccelCal6();
+  if (c6.valid) {
+    gCal.accel_off_x.store(c6.zero[0], std::memory_order_relaxed);
+    gCal.accel_off_y.store(c6.zero[1], std::memory_order_relaxed);
+    gCal.accel_off_z.store(c6.zero[2], std::memory_order_relaxed);
+    gCal.accel_gain_x.store(c6.gain[0], std::memory_order_relaxed);
+    gCal.accel_gain_y.store(c6.gain[1], std::memory_order_relaxed);
+    gCal.accel_gain_z.store(c6.gain[2], std::memory_order_relaxed);
+    gCal.accel_valid.store(true, std::memory_order_relaxed);
+    gCal.accel_cal6_valid.store(true, std::memory_order_relaxed);
+    Serial.printf("[CAL] 6-pos accel cal loaded zero=%.3f/%.3f/%.3f gain=%.3f/%.3f/%.3f\n",
+                  (double)c6.zero[0], (double)c6.zero[1], (double)c6.zero[2],
+                  (double)c6.gain[0], (double)c6.gain[1], (double)c6.gain[2]);
+  } else if (a.valid) {
     gCal.accel_off_x.store(a.x, std::memory_order_relaxed);
     gCal.accel_off_y.store(a.y, std::memory_order_relaxed);
     gCal.accel_off_z.store(a.z, std::memory_order_relaxed);

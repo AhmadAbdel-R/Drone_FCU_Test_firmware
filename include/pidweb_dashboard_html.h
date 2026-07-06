@@ -353,6 +353,21 @@ canvas{display:block;width:100%;background:#0a0d12;border-radius:8px;border:1px 
     <div class="note">Corrected = raw &minus; level offset &minus; trim. A physically level frame should read corrected &asymp; 0. The <b>error</b> row is what the outer loop drives to zero.</div>
    </div>
    <div class="card"><h3>IMU</h3><div id="a_imu"></div></div>
+   <div class="card span2"><h3>Six-position accel calibration <span class="tag" id="ac_tag">idle</span></h3>
+    <div class="note">Solves accelerometer <b>zero AND gain</b> per axis from six poses (each face of the craft
+     pointing up: level, inverted, nose up, nose down, left side, right side — any order, the face is
+     auto-detected). Better than the boot-time one-pose offset and supersedes it once saved.
+     Keep the craft perfectly still on a firm surface for each capture.</div>
+    <div id="ac_faces" style="display:flex;gap:8px;flex-wrap:wrap;margin:10px 0"></div>
+    <div id="ac_state" class="note">--</div>
+    <div class="btns" style="margin-top:8px">
+     <button class="btn pri" onclick="acStart()">Start session</button>
+     <button class="btn" id="ac_capbtn" onclick="acCapture()">Capture this pose</button>
+     <button class="btn pri" id="ac_finbtn" onclick="acFinish()">Finish &amp; save</button>
+     <button class="btn danger" onclick="acCancel()">Cancel</button>
+    </div>
+    <div class="note mono" id="ac_result">--</div>
+   </div>
    <div class="card span2"><h3>Level calibration <span class="tag" id="a_lvltag">--</span></h3>
     <div class="note">Place the frame on a known-level surface, keep it still, then calibrate. Disarmed only. The result persists in NVS and is <b>not</b> overwritten at the next boot.</div>
     <div id="a_lvlinfo" style="margin:8px 0"></div>
@@ -1443,6 +1458,38 @@ async function capClear(){if(confirm('Clear diagnostic capture?')&&await act('/a
 function capDownload(){window.location.href='/api/capture.csv';}
 STAGE.capture=()=>{capPoll();if(!capTimer)capTimer=setInterval(()=>{if(activeTab==='capture')capPoll();else{clearInterval(capTimer);capTimer=null;}},500);};
 (function(){const prev=window.onRender;window.onRender=m=>{if(prev)prev(m);if(activeTab==='vibe')renderVibe(m);if(activeTab==='pid')renderYawCard(m);};})();
+// ===== Six-position accel calibration (Attitude & Level tab) =================
+const AC_FACES=['+X','-X','+Y','-Y','+Z','-Z'];
+const AC_STATES=['idle','waiting for stillness…','sampling…','face captured','face FAILED'];
+let acTimer=null;
+async function acPoll(){
+ try{const r=await fetch('/api/calibration/accel');if(!r.ok)return;const s=await r.json();
+  const tag=document.getElementById('ac_tag');
+  tag.textContent=s.active?(AC_STATES[s.state]||s.state):(s.cal6Valid?'calibrated':'idle');
+  tag.className='tag '+(s.active?'warn':(s.cal6Valid?'ok':''));
+  document.getElementById('ac_faces').innerHTML=AC_FACES.map((n,i)=>{
+   const done=s.facesDone&(1<<i),act=s.activeFace===i&&s.active;
+   return '<span class="tag '+(done?'ok':(act?'warn':''))+'" style="padding:6px 12px">'+n+(done?' ✓':'')+'</span>';
+  }).join('');
+  let st=AC_STATES[s.state]||'';
+  if(s.state===2)st+=' '+s.samples+'/'+s.samplesPerFace;
+  if(s.state===4&&s.error)st+=' — '+s.error;
+  document.getElementById('ac_state').textContent=(s.active?st:'No session.')+
+   '  ·  |accel| = '+f(s.accelMag,3)+' g (should read ≈1.000 when still)';
+  document.getElementById('ac_result').textContent=
+   'applied  zero '+s.zero.map(v=>f(v,3)).join('/')+'  gain '+s.gain.map(v=>f(v,3)).join('/')
+   +(s.cal6Valid?'  (6-pos)':'  (one-pose or none)');
+  const allDone=(s.facesDone&63)===63;
+  document.getElementById('ac_finbtn').disabled=!(s.active&&allDone);
+  document.getElementById('ac_capbtn').disabled=!s.active||s.state===1||s.state===2;
+ }catch(e){}
+}
+async function acStart(){if(await act('/api/calibration/accel/start','Session started — set the craft level'))acPoll();}
+async function acCapture(){if(await act('/api/calibration/accel/capture-face','Hold still…'))acPoll();}
+async function acFinish(){if(await act('/api/calibration/accel/finish','Accel calibration saved'))acPoll();}
+async function acCancel(){if(await act('/api/calibration/accel/cancel','Cancelled'))acPoll();}
+(function(){const prev=STAGE.attitude;STAGE.attitude=()=>{if(prev)prev();acPoll();
+ if(!acTimer)acTimer=setInterval(()=>{if(activeTab==='attitude')acPoll();else{clearInterval(acTimer);acTimer=null;}},400);};})();
 // ===== Filter chain card (Filters & Notch tab) ===============================
 let FT_LOADED=false;
 async function ftLoad(showToast){

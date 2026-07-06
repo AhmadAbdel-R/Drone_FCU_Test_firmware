@@ -328,6 +328,22 @@ struct SensorsLiveSnapshot {
   uint16_t loopHz = 0;
 };
 
+// Six-position accel calibration status (Attitude & Level tab wizard).
+struct AccelCalStatus {
+  uint8_t state = 0;          // SixFaceAccelCalibrator::State
+  uint8_t facesDoneMask = 0;  // bit0..5 = +X,-X,+Y,-Y,+Z,-Z captured
+  uint8_t activeFace = 0xFF;
+  uint16_t sampleCount = 0;
+  uint16_t samplesPerFace = 0;
+  char lastError[64] = {};
+  float zero[3] = {0, 0, 0};  // applied correction (live)
+  float gain[3] = {1, 1, 1};
+  bool cal6Valid = false;
+  float accelMagG = 0.0f;     // corrected |a| — should read ~1.0 when still
+  bool sessionActive = false;
+  bool safe = false;
+};
+
 // Motors-page snapshot: deadman test session + motor order/direction config.
 struct MotorTestState {
   uint8_t activeMotor = 0;     // 1..4 physical output under test; 0 = idle
@@ -490,6 +506,12 @@ struct Callbacks {
   bool (*restoreLevelPrev)() = nullptr;
   bool (*saveAccelOffset)() = nullptr;                // persist current accel offset
   bool (*clearAccelOffset)() = nullptr;               // wipe persisted accel offset
+  // ---- Six-position accel calibration ---------------------------------------
+  bool (*accelCalStart)() = nullptr;      // begin a session (clears face bins)
+  bool (*accelCalCapture)() = nullptr;    // capture the current pose (auto face)
+  bool (*accelCalFinish)() = nullptr;     // solve + apply + persist
+  bool (*accelCalCancel)() = nullptr;
+  void (*getAccelCal)(AccelCalStatus& s) = nullptr;
   bool (*startMagCalibration)() = nullptr;            // begin mag min/max capture
   bool (*finishMagCalibration)() = nullptr;           // finish + persist mag capture
 

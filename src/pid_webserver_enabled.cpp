@@ -1527,6 +1527,42 @@ esp_err_t handlePostModes(httpd_req_t* req) {
   return sendImportResult(req, res);
 }
 
+// ============================================================================
+// Six-position accel calibration endpoints.
+// ============================================================================
+esp_err_t handleAccelCalStatus(httpd_req_t* req) {
+  if (!gCb.getAccelCal) return sendError(req, 500, "no_callback");
+  AccelCalStatus s;
+  gCb.getAccelCal(s);
+  char body[512];
+  const int n = snprintf(body, sizeof(body),
+      "{\"state\":%u,\"facesDone\":%u,\"activeFace\":%u,\"samples\":%u,\"samplesPerFace\":%u,"
+      "\"error\":\"%s\",\"zero\":[%.4f,%.4f,%.4f],\"gain\":[%.4f,%.4f,%.4f],"
+      "\"cal6Valid\":%s,\"accelMag\":%.4f,\"active\":%s,\"safe\":%s}",
+      s.state, s.facesDoneMask, s.activeFace, s.sampleCount, s.samplesPerFace,
+      s.lastError, (double)s.zero[0], (double)s.zero[1], (double)s.zero[2],
+      (double)s.gain[0], (double)s.gain[1], (double)s.gain[2],
+      s.cal6Valid ? "true" : "false", (double)s.accelMagG,
+      s.sessionActive ? "true" : "false", s.safe ? "true" : "false");
+  if (n < 0 || n >= (int)sizeof(body)) return sendError(req, 500, "fmt");
+  return sendJson(req, body);
+}
+esp_err_t handleAccelCalStart(httpd_req_t* req) {
+  return doBoolAction(req, gCb.accelCalStart, "{\"ok\":true,\"active\":true}");
+}
+esp_err_t handleAccelCalCapture(httpd_req_t* req) {
+  return doBoolAction(req, gCb.accelCalCapture, "{\"ok\":true,\"capturing\":true}");
+}
+esp_err_t handleAccelCalFinish(httpd_req_t* req) {
+  return doBoolAction(req, gCb.accelCalFinish, "{\"ok\":true,\"persisted\":true}");
+}
+esp_err_t handleAccelCalCancel(httpd_req_t* req) {
+  if (!gCb.accelCalCancel) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  (void)gCb.accelCalCancel();
+  return sendJson(req, "{\"ok\":true,\"cancelled\":true}");
+}
+
 // POST /api/gps/configure — push the configured UBX settings to the receiver
 // (scheduled; the sensor task executes it disarmed-only).
 esp_err_t handleGpsConfigure(httpd_req_t* req) {
@@ -1725,6 +1761,12 @@ bool startHttpServer() {
   registerUri(gServer, "/api/gps/save",         HTTP_POST, handleGpsSave);
   registerUri(gServer, "/api/gps/sethome",      HTTP_POST, handleGpsSetHome);
   registerUri(gServer, "/api/filters/apply",    HTTP_POST, handleFiltersApply);
+  // ---- Six-position accel calibration ----
+  registerUri(gServer, "/api/calibration/accel",              HTTP_GET,  handleAccelCalStatus);
+  registerUri(gServer, "/api/calibration/accel/start",        HTTP_POST, handleAccelCalStart);
+  registerUri(gServer, "/api/calibration/accel/capture-face", HTTP_POST, handleAccelCalCapture);
+  registerUri(gServer, "/api/calibration/accel/finish",       HTTP_POST, handleAccelCalFinish);
+  registerUri(gServer, "/api/calibration/accel/cancel",       HTTP_POST, handleAccelCalCancel);
   // ---- Config registry (fcu_config) ----
   registerUri(gServer, "/api/config",           HTTP_GET,  handleGetConfig);
   registerUri(gServer, "/api/config",           HTTP_POST, handlePostConfig);

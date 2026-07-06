@@ -339,6 +339,64 @@ class FcuPidNvs {
     return true;
   }
 
+  // ---- Six-position accel calibration (zero + gain per axis) ----------------
+  // SEPARATE record from the one-pose AccelOffset above: the six-face wizard
+  // solves both bias and scale; when valid it supersedes the one-pose offset
+  // at load (see loadCalibrationFromNvs). Versioned + range-validated so a
+  // corrupt record is rejected, never flown.
+  static constexpr uint16_t kAccelCal6Version = 1;
+  struct AccelCal6 {
+    uint16_t version = 0;
+    float zero[3] = {0.0f, 0.0f, 0.0f};   // g, subtract from raw
+    float gain[3] = {1.0f, 1.0f, 1.0f};   // multiply after subtraction
+    bool valid = false;
+  };
+  static bool accelCal6LooksSane(const AccelCal6& c) {
+    for (int i = 0; i < 3; ++i) {
+      if (!isfinite(c.zero[i]) || !isfinite(c.gain[i])) return false;
+      if (fabsf(c.zero[i]) > 0.5f) return false;
+      if (c.gain[i] < 0.8f || c.gain[i] > 1.2f) return false;
+    }
+    return true;
+  }
+  AccelCal6 loadAccelCal6() {
+    AccelCal6 c;
+    if (!ready_) return c;
+    if (prefs_.getUShort("a6Ver", 0) != kAccelCal6Version) return c;
+    static constexpr const char* kZ[3] = {"a6zX", "a6zY", "a6zZ"};
+    static constexpr const char* kG[3] = {"a6gX", "a6gY", "a6gZ"};
+    for (int i = 0; i < 3; ++i) {
+      c.zero[i] = prefs_.getFloat(kZ[i], 0.0f);
+      c.gain[i] = prefs_.getFloat(kG[i], 1.0f);
+    }
+    c.valid = prefs_.getUChar("a6V", 0) != 0;
+    if (!accelCal6LooksSane(c)) return AccelCal6{};  // reject corrupt record
+    c.version = kAccelCal6Version;
+    return c;
+  }
+  bool saveAccelCal6(const AccelCal6& in) {
+    if (!ready_) return false;
+    AccelCal6 c = in;
+    c.version = kAccelCal6Version;
+    if (!accelCal6LooksSane(c)) return false;  // range-check before any write
+    static constexpr const char* kZ[3] = {"a6zX", "a6zY", "a6zZ"};
+    static constexpr const char* kG[3] = {"a6gX", "a6gY", "a6gZ"};
+    bool ok = true;
+    ok &= prefs_.putUShort("a6Ver", kAccelCal6Version) > 0;
+    for (int i = 0; i < 3; ++i) {
+      ok &= prefs_.putFloat(kZ[i], c.zero[i]) > 0;
+      ok &= prefs_.putFloat(kG[i], c.gain[i]) > 0;
+    }
+    ok &= prefs_.putUChar("a6V", c.valid ? 1 : 0) > 0;
+    return ok;
+  }
+  bool clearAccelCal6() {
+    if (!ready_) return false;
+    prefs_.remove("a6Ver");
+    prefs_.remove("a6V");
+    return true;
+  }
+
   // ---- Magnetometer hard-iron + per-axis scale ------------------------------
   struct MagCalibration {
     // Hard iron offset (µT) — subtract from raw.
