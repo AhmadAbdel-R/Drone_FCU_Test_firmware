@@ -522,11 +522,15 @@ int formatDashJson(char* out, size_t cap, const DashTelemetry& d,
       d.motorRaw[0], d.motorRaw[1], d.motorRaw[2], d.motorRaw[3], jf(d.mixBias),
       jf(d.motorTrim[0]), jf(d.motorTrim[1]), jf(d.motorTrim[2]), jf(d.motorTrim[3]));
   j.f(",\"rc\":{\"comp\":%d,\"up\":%d,\"fs\":%d,\"lq\":%u,\"rssi\":%d,\"fr\":%u,\"age\":%lu,"
-      "\"loss\":%u,\"pps\":%u,\"ch\":[%u,%u,%u,%u,%u,%u,%u,%u]}",
+      "\"loss\":%u,\"pps\":%u,\"ch\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u],"
+      "\"modes\":{\"act\":%u,\"asg\":%u,\"kill\":%d}}",
       d.crsfCompiled ? 1 : 0, d.rcLinkUp ? 1 : 0, d.rcFailsafe ? 1 : 0, d.rcLq, d.rcRssiDbm,
       d.rcFrameRateHz, (unsigned long)d.rcFrameAgeMs, d.rcLossPercent, d.rcPacketsPerSec,
       d.rcChannelsUs[0], d.rcChannelsUs[1], d.rcChannelsUs[2], d.rcChannelsUs[3],
-      d.rcChannelsUs[4], d.rcChannelsUs[5], d.rcChannelsUs[6], d.rcChannelsUs[7]);
+      d.rcChannelsUs[4], d.rcChannelsUs[5], d.rcChannelsUs[6], d.rcChannelsUs[7],
+      d.rcChannelsUs[8], d.rcChannelsUs[9], d.rcChannelsUs[10], d.rcChannelsUs[11],
+      d.rcChannelsUs[12], d.rcChannelsUs[13], d.rcChannelsUs[14], d.rcChannelsUs[15],
+      d.modeActiveMask, d.modeAssignedMask, d.killSwitchActive ? 1 : 0);
   j.f(",\"sen\":{\"baro\":{\"r\":%d,\"v\":%d,\"pa\":%.1f,\"alt\":%.2f,\"t\":%.1f,\"age\":%lu},"
       "\"tof\":{\"comp\":%d,\"r\":%d,\"rng\":%d,\"mm\":%u,\"age\":%lu},"
       "\"gps\":{\"comp\":%d,\"r\":%d,\"fix\":%d,\"sats\":%u,\"q\":%u,\"hdop\":%.1f,\"hdv\":%d,"
@@ -1507,6 +1511,19 @@ esp_err_t handlePostConfigReset(httpd_req_t* req) {
   return sendJson(req, "{\"ok\":true,\"defaults\":true}");
 }
 
+// POST /api/modes — save the aux mode-range table. Accepts the flat param
+// object form {"mode1_func":1,"mode1_channel":5,...}; delegates to the config
+// registry (validate-all-then-apply + persistence + CRSF-task restage).
+esp_err_t handlePostModes(httpd_req_t* req) {
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
+  static char body[2048];
+  const int n = recvBody(req, body, sizeof(body));
+  if (n < 0) return sendError(req, 400, "bad_body");
+  const auto res = fcu_config::applyJsonObject(body, static_cast<size_t>(n));
+  return sendImportResult(req, res);
+}
+
 esp_err_t handleReboot(httpd_req_t* req) {
   if (!gCb.requestReboot) return sendError(req, 500, "no_callback");
   if (!authorized(req)) return sendError(req, 401, "unauthorized");
@@ -1656,6 +1673,8 @@ bool startHttpServer() {
   registerUri(gServer, "/api/motors/stop",          HTTP_POST, handleMotorsStop);
   registerUri(gServer, "/api/motors/save-order",    HTTP_POST, handleMotorsSaveOrder);
   registerUri(gServer, "/api/motors/save-direction", HTTP_POST, handleMotorsSaveDirection);
+  // ---- Modes ----
+  registerUri(gServer, "/api/modes",            HTTP_POST, handlePostModes);
   // ---- Config registry (fcu_config) ----
   registerUri(gServer, "/api/config",           HTTP_GET,  handleGetConfig);
   registerUri(gServer, "/api/config",           HTTP_POST, handlePostConfig);

@@ -204,8 +204,12 @@ struct DashTelemetry {
   uint32_t rcFrameAgeMs = 0;
   uint16_t rcLossPercent = 0;
   uint16_t rcPacketsPerSec = 0;
-  uint16_t rcChannelsUs[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  uint16_t rcChannelsUs[16] = {0};
   bool crsfCompiled = false;            // CRSF control compiled in
+  // ---- Mode slots (INAV-style aux ranges) ----
+  uint16_t modeActiveMask = 0;    // bit (1 << ModeFunc), see modes docs
+  uint16_t modeAssignedMask = 0;  // functions with a configured slot
+  bool killSwitchActive = false;
 
   // ---- Sensors ----
   bool baroReady = false, baroValid = false;

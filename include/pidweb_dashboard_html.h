@@ -280,6 +280,31 @@ canvas{display:block;width:100%;background:#0a0d12;border-radius:8px;border:1px 
   </div>
  </section>
 
+ <!-- ===== MODES (aux-range assignment) ===== -->
+ <section class="tab" id="t_modes">
+  <div class="grid wide">
+   <div class="card span2"><h3>Receiver channels <span class="small dim">live µs</span></h3>
+    <div id="md_channels"></div>
+   </div>
+   <div class="card span2"><h3>Mode slots <span class="tag" id="md_tag">--</span></h3>
+    <div class="note">Each slot binds a function to a channel range. A mode is ACTIVE while the
+     channel sits inside [min, max]. <b>ARM</b> replaces the fixed CH5 switch (default slot 1
+     reproduces it); removing every ARM slot makes arming impossible. <b>KILL</b> stops motors
+     instantly and blocks arming while held. ANGLE/ACRO/BEEPER are evaluated and displayed but
+     carry no authority yet (this FCU always flies angle-stabilized; no ESC beacon support).</div>
+    <table style="margin-top:8px"><thead><tr><th>#</th><th>Function</th><th>Channel</th><th>Min µs</th><th>Max µs</th><th>Live</th><th>State</th></tr></thead>
+     <tbody id="md_slots"></tbody></table>
+    <div id="md_conflicts" style="margin-top:8px"></div>
+    <div class="btns" style="margin-top:8px">
+     <button class="btn pri" onclick="mdSave()">Save modes</button>
+     <button class="btn" onclick="mdLoad(true)">Reload saved</button>
+    </div>
+   </div>
+   <div class="card"><h3>Active modes</h3><div id="md_active"></div></div>
+   <div class="card"><h3>Arming status</h3><div id="md_arm"></div></div>
+  </div>
+ </section>
+
  <!-- ===== ATTITUDE & LEVEL ===== -->
  <section class="tab" id="t_attitude">
   <div class="grid wide">
@@ -616,7 +641,7 @@ async function put(url,okMsg,body){
  }catch(e){toast('Network error',true);return false;}
 }
 // ---------- tabs ----------
-const TABS=[['overview','Overview'],['setup','Setup'],['motors','Motors'],['attitude','Attitude & Level'],['pid','PID Tuning'],
+const TABS=[['overview','Overview'],['setup','Setup'],['motors','Motors'],['modes','Modes'],['attitude','Attitude & Level'],['pid','PID Tuning'],
  ['diag','PID Diagnostics'],['mixer','Motor Mixer'],['sensors','Sensors'],['radio','Radio & Links'],
  ['vibe','Vibration & FFT'],['notch','Filters & Notch'],['servo','Pan/Tilt'],['capture','Capture'],['config','Config']];
 let activeTab='overview';
@@ -716,6 +741,7 @@ function render(m){
  setDroneTarget(m.att,m.sen&&m.sen.mag);renderOvHeading(m);drawMix(document.getElementById('ov_mix'),m,true);
  // active tab content
  if(activeTab==='setup')renderSetup(m);
+ else if(activeTab==='modes')renderModes(m);
  else if(activeTab==='attitude')renderAttitude(m);
  else if(activeTab==='diag')renderDiag(m);
  else if(activeTab==='mixer')renderMixer(m);
@@ -1352,6 +1378,110 @@ async function capClear(){if(confirm('Clear diagnostic capture?')&&await act('/a
 function capDownload(){window.location.href='/api/capture.csv';}
 STAGE.capture=()=>{capPoll();if(!capTimer)capTimer=setInterval(()=>{if(activeTab==='capture')capPoll();else{clearInterval(capTimer);capTimer=null;}},500);};
 (function(){const prev=window.onRender;window.onRender=m=>{if(prev)prev(m);if(activeTab==='vibe')renderVibe(m);if(activeTab==='pid')renderYawCard(m);};})();
+// ===== Modes tab (aux-range assignment) ======================================
+// Slot config loads/saves through /api/modes (flat param object); live channel
+// values + the active/assigned masks ride the WS frame at 25 Hz.
+const MD_FUNCS=['NONE','ARM','ANGLE','ACRO','ALT HOLD','POS HOLD','RTH','KILL SWITCH','BEEPER','BLACKBOX'];
+let MD_LOADED=false,MD_SLOTS=[];
+function mdBuild(){
+ const tb=document.getElementById('md_slots');if(!tb||tb.childElementCount)return;
+ let h='';
+ for(let n=0;n<8;n++){
+  h+='<tr><td>'+(n+1)+'</td>'
+   +'<td><select id="md_f'+n+'" onchange="mdEdited()">'+MD_FUNCS.map((f,i)=>'<option value="'+i+'">'+f+'</option>').join('')+'</select></td>'
+   +'<td><select id="md_c'+n+'" onchange="mdEdited()"><option value="0">--</option>'+Array.from({length:16},(_,i)=>'<option value="'+(i+1)+'">CH'+(i+1)+'</option>').join('')+'</select></td>'
+   +'<td><input type="number" id="md_l'+n+'" min="900" max="2100" step="25" style="max-width:80px" oninput="mdEdited()"></td>'
+   +'<td><input type="number" id="md_h'+n+'" min="900" max="2100" step="25" style="max-width:80px" oninput="mdEdited()"></td>'
+   +'<td class="mono" id="md_us'+n+'">--</td>'
+   +'<td id="md_st'+n+'"><span class="tag">--</span></td></tr>';
+ }
+ tb.innerHTML=h;
+}
+async function mdLoad(showToast){
+ mdBuild();
+ try{const r=await fetch('/api/config');if(!r.ok)return;const j=await r.json();
+  const map={};(j.params||[]).forEach(p=>map[p.n]=p.v);
+  for(let n=0;n<8;n++){
+   document.getElementById('md_f'+n).value=map['mode'+(n+1)+'_func']??0;
+   document.getElementById('md_c'+n).value=map['mode'+(n+1)+'_channel']??0;
+   document.getElementById('md_l'+n).value=map['mode'+(n+1)+'_min_us']??1300;
+   document.getElementById('md_h'+n).value=map['mode'+(n+1)+'_max_us']??1700;
+  }
+  MD_LOADED=true;mdConflicts();
+  if(showToast)toast('Modes reloaded');
+ }catch(e){}
+}
+function mdEdited(){mdConflicts();document.getElementById('md_tag').textContent='unsaved edits';document.getElementById('md_tag').className='tag warn';}
+function mdCollect(){
+ const s=[];
+ for(let n=0;n<8;n++)s.push({f:+document.getElementById('md_f'+n).value,c:+document.getElementById('md_c'+n).value,
+  l:+document.getElementById('md_l'+n).value||1300,h:+document.getElementById('md_h'+n).value||1700});
+ return s;
+}
+function mdConflicts(){
+ const el=document.getElementById('md_conflicts');if(!el)return;
+ const s=mdCollect(),w=[];
+ const armSlots=s.filter(x=>x.f===1&&x.c>0);
+ if(!armSlots.length)w.push(['err','No ARM slot assigned — arming will be IMPOSSIBLE.']);
+ const seen={};
+ s.forEach((x,i)=>{if(x.f&&x.c){if(seen[x.f]!=null)w.push(['warn',MD_FUNCS[x.f]+' assigned in slots '+(seen[x.f]+1)+' and '+(i+1)+' (either activates it)']);else seen[x.f]=i;}});
+ s.forEach((x,i)=>{if(x.f&&x.c&&x.l>=x.h)w.push(['err','Slot '+(i+1)+': min ≥ max']);});
+ const arm=s.find(x=>x.f===1&&x.c),kill=s.find(x=>x.f===7&&x.c);
+ if(arm&&kill&&arm.c===kill.c&&arm.l<kill.h&&kill.l<arm.h)w.push(['err','ARM and KILL ranges OVERLAP on CH'+arm.c]);
+ s.forEach((x,i)=>{if(x.f&&x.c>=1&&x.c<=4)w.push(['warn','Slot '+(i+1)+' uses CH'+x.c+' (a stick channel)']);});
+ el.innerHTML=w.length?w.map(x=>'<div class="warnbox '+(x[0]==='err'?'err':'')+'">'+x[1]+'</div>').join('')
+  :'<div class="warnbox ok">No conflicts.</div>';
+ return w;
+}
+async function mdSave(){
+ const s=mdCollect(),w=mdConflicts()||[];
+ if(w.some(x=>x[0]==='err')&&!confirm('There are ERROR-level conflicts (see list). Save anyway?'))return;
+ const body={};
+ s.forEach((x,n)=>{body['mode'+(n+1)+'_func']=x.f;body['mode'+(n+1)+'_channel']=x.c;
+  body['mode'+(n+1)+'_min_us']=x.l;body['mode'+(n+1)+'_max_us']=x.h;});
+ if(await act('/api/modes','Modes saved & applied',body)){
+  document.getElementById('md_tag').textContent='saved';document.getElementById('md_tag').className='tag ok';}
+}
+function renderModes(m){
+ if(!MD_LOADED)return;
+ const rc=m.rc,ch=rc.ch||[],md=rc.modes||{act:0,asg:0};
+ // channel bars
+ const el=document.getElementById('md_channels');
+ let h='';
+ for(let i=0;i<16;i++){
+  const us=ch[i]||0,pct=Math.max(0,Math.min(100,(us-900)/1200*100));
+  h+='<div style="display:flex;align-items:center;gap:8px;margin:2px 0"><span class="dim small" style="flex:0 0 38px">CH'+(i+1)+'</span>'
+   +'<div style="flex:1;height:12px;background:#0b0e13;border-radius:6px;overflow:hidden"><div style="height:100%;width:'+pct+'%;background:'+(i<4?'#3fa9ff':'#7c5cff')+'"></div></div>'
+   +'<span class="mono small" style="flex:0 0 46px;text-align:right">'+(us||'--')+'</span></div>';
+ }
+ el.innerHTML=h;
+ // per-slot live state
+ const s=mdCollect();
+ s.forEach((x,n)=>{
+  const us=x.c>=1?ch[x.c-1]||0:0;
+  document.getElementById('md_us'+n).textContent=x.c?us:'--';
+  const active=x.f&&x.c&&us>=x.l&&us<=x.h&&us>0;
+  document.getElementById('md_st'+n).innerHTML=x.f&&x.c?('<span class="tag '+(active?'ok':'')+'">'+(active?'ACTIVE':'inactive')+'</span>'):'<span class="tag">unused</span>';
+ });
+ // active modes card (firmware-evaluated mask, not the local check)
+ let ah='';
+ for(let f=1;f<MD_FUNCS.length;f++){
+  const assigned=md.asg&(1<<f),active=md.act&(1<<f);
+  if(!assigned)continue;
+  ah+=kv(MD_FUNCS[f],active?'<span class="tag ok">ACTIVE</span>':'<span class="tag">inactive</span>');
+ }
+ if(md.kill)ah='<div class="warnbox err">KILL SWITCH ACTIVE — motors stopped, arming blocked.</div>'+ah;
+ document.getElementById('md_active').innerHTML=ah||'<div class="dim small">No modes assigned.</div>';
+ // arming card (reuse setup-tab reasons list)
+ const st=m.sys,flags=+st.armf||0;
+ let arm='';
+ if(st.armed)arm='<div class="warnbox err">ARMED</div>';
+ else if(flags===0)arm='<div class="warnbox ok">Ready to arm.</div>';
+ else{arm='<div class="dim small" style="margin-bottom:6px">Arming disabled because:</div>';
+  for(let b=0;b<AF_NAMES.length;b++)if(flags&(1<<b))arm+='<div class="warnbox">'+AF_NAMES[b]+'</div>';}
+ document.getElementById('md_arm').innerHTML=arm;
+}
+STAGE.modes=()=>{if(!MD_LOADED)mdLoad();};
 // ===== Mixer table editor ====================================================
 // Reads/writes the 16 mix_m*_{throttle,roll,pitch,yaw} params through
 // /api/config (validated + persisted firmware-side; staged atomically into
@@ -1566,7 +1696,7 @@ STAGE.motors=()=>{moBindHold();moPoll();
 const AF_NAMES=['THROTTLE_HIGH','KILL_SWITCH','RX_INVALID','GYRO_NOT_CAL','GYRO_UNSTABLE',
  'ACCEL_NOT_CAL','MAG_NOT_CAL','GPS_NO_FIX','GPS_SATS_LOW','GPS_HDOP_HIGH','BARO_MISSING',
  'BATTERY','MOTOR_TEST','CONFIG_WRITE','FAILSAFE','BOARD_TILT','SAFE_BOOT','IMU_INVALID',
- 'ESC_NOT_READY','ARM_SWITCH_CYCLE_REQUIRED'];
+ 'ESC_NOT_READY','ARM_SWITCH_CYCLE_REQUIRED','NAV_MODE_UNSAFE'];
 const AF_HINT={THROTTLE_HIGH:'lower the throttle stick',RX_INVALID:'no RC link',
  GYRO_NOT_CAL:'run gyro calibration',GYRO_UNSTABLE:'keep the craft still',
  ACCEL_NOT_CAL:'run accel calibration',MAG_NOT_CAL:'calibrate the compass',
@@ -1576,7 +1706,8 @@ const AF_HINT={THROTTLE_HIGH:'lower the throttle stick',RX_INVALID:'no RC link',
  CONFIG_WRITE:'config write in progress',FAILSAFE:'clear the failsafe',
  BOARD_TILT:'level the craft',SAFE_BOOT:'hold throttle low after boot',
  IMU_INVALID:'IMU not ready',ESC_NOT_READY:'ESC init incomplete',
- ARM_SWITCH_CYCLE_REQUIRED:'cycle the arm switch OFF then ON'};
+ ARM_SWITCH_CYCLE_REQUIRED:'cycle the arm switch OFF then ON',
+ NAV_MODE_UNSAFE:'nav mode selected without GPS/compass quality'};
 function headingSource(m){
  const g=m.sen&&m.sen.mag,e=g&&g.ext||{};
  if(g&&g.v===1&&g.src===2)return{deg:+(e.hdg??g.hdg)||0,src:'mag'};

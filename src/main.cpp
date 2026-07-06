@@ -6318,6 +6318,61 @@ float gMixerPendingTable[16] = {
 };
 std::atomic<bool> gMixerTableDirty{false};
 
+// =============================================================================
+// [MODES] — aux-range mode slots (fcu_config GROUP_MODES).
+//
+// INAV-style: each of 8 slots binds a FUNCTION to a channel µs range. The
+// CRSF task evaluates the table against live channels every control frame
+// and publishes a function bitmask. Consumers:
+//   * ARM      — replaces the hard-coded CH5 switch in the CRSF bridge (the
+//                default slot reproduces it exactly: CH5, 1700..2100).
+//   * KILL     — force-disarm: strips the arm flag AND forceMotorStop() on
+//                the rising edge; blocks arming while held.
+//   * ALT_HOLD — drives gAltHoldSwitchOn when a slot is assigned (otherwise
+//                the legacy FCU_ALT_HOLD_AUX_CHANNEL compile flag applies).
+//   * POS_HOLD / RTH / BLACKBOX — evaluated + published; consumed by the nav
+//                scaffold / blackbox stages. Their selection while GPS/
+//                heading requirements are unmet raises NAV_MODE_UNSAFE.
+//   * ANGLE/ACRO/BEEPER — evaluated + surfaced in the UI; this firmware
+//                currently always flies angle-stabilized and has no ESC
+//                beacon support, so they carry no authority yet.
+// =============================================================================
+enum ModeFunc : uint8_t {
+  MODE_NONE = 0, MODE_ARM, MODE_ANGLE, MODE_ACRO, MODE_ALT_HOLD,
+  MODE_POS_HOLD, MODE_RTH, MODE_KILL, MODE_BEEPER, MODE_BLACKBOX,
+  MODE_FUNC_COUNT,
+};
+constexpr uint8_t kModeSlotCount = 8;
+// Slot config packed per-slot: A = func | (channel << 8); B = min | (max << 16).
+std::atomic<uint32_t> gModeSlotA[kModeSlotCount];
+std::atomic<uint32_t> gModeSlotB[kModeSlotCount];
+std::atomic<uint16_t> gModeActiveMask{0};     // bit (1 << ModeFunc)
+std::atomic<uint16_t> gModeAssignedFuncs{0};  // which functions have a slot
+std::atomic<bool> gKillSwitchActive{false};
+
+void refreshModesConfigCache() {
+  uint16_t assigned = 0;
+  for (int n = 0; n < kModeSlotCount; ++n) {
+    char name[16];
+    snprintf(name, sizeof(name), "mode%d_func", n + 1);
+    const uint8_t func = static_cast<uint8_t>(fcuCfgReadByName(name, 0.0f));
+    snprintf(name, sizeof(name), "mode%d_channel", n + 1);
+    const uint8_t ch = static_cast<uint8_t>(fcuCfgReadByName(name, 0.0f));
+    snprintf(name, sizeof(name), "mode%d_min_us", n + 1);
+    const uint16_t lo = static_cast<uint16_t>(fcuCfgReadByName(name, 1300.0f));
+    snprintf(name, sizeof(name), "mode%d_max_us", n + 1);
+    const uint16_t hi = static_cast<uint16_t>(fcuCfgReadByName(name, 1700.0f));
+    gModeSlotA[n].store(static_cast<uint32_t>(func) | (static_cast<uint32_t>(ch) << 8),
+                        std::memory_order_relaxed);
+    gModeSlotB[n].store(static_cast<uint32_t>(lo) | (static_cast<uint32_t>(hi) << 16),
+                        std::memory_order_relaxed);
+    if (func != MODE_NONE && func < MODE_FUNC_COUNT && ch >= 1 && ch <= 16 && lo < hi) {
+      assigned |= static_cast<uint16_t>(1U << func);
+    }
+  }
+  gModeAssignedFuncs.store(assigned, std::memory_order_relaxed);
+}
+
 void refreshMixerConfigCache() {
   static const char* kAxis[4] = {"throttle", "roll", "pitch", "yaw"};
   float table[16];
@@ -6350,6 +6405,11 @@ struct ArmingConfigCache {
   std::atomic<float> maxHdop{2.5f};
   std::atomic<float> maxAngleDeg{25.0f};
   std::atomic<float> minBattVolts{10.5f};
+  // Nav-mode-at-arm gate (GROUP_NAV): selecting POS_HOLD/RTH on the switch
+  // while these are unmet blocks arming unless allowArmUnsafe.
+  std::atomic<bool> navAllowArmUnsafe{false};
+  std::atomic<float> navMinSats{8.0f};
+  std::atomic<float> navMaxHdop{2.0f};
 };
 ArmingConfigCache gArmCfg;
 
@@ -6377,6 +6437,10 @@ void refreshArmingConfigCache() {
                             std::memory_order_relaxed);
   gArmCfg.minBattVolts.store(fcuCfgReadByName("arm_min_batt_volts", 10.5f),
                              std::memory_order_relaxed);
+  gArmCfg.navAllowArmUnsafe.store(fcuCfgReadByName("nav_allow_arm_unsafe", 0.0f) > 0.5f,
+                                  std::memory_order_relaxed);
+  gArmCfg.navMinSats.store(fcuCfgReadByName("nav_min_sats", 8.0f), std::memory_order_relaxed);
+  gArmCfg.navMaxHdop.store(fcuCfgReadByName("nav_max_hdop", 2.0f), std::memory_order_relaxed);
 }
 
 // Disarmed craft should be still before arming; this catches being carried /
@@ -6490,6 +6554,38 @@ void updateArmingDisableFlags(uint32_t nowMs) {
     f |= arming::FLAG_ARM_BLOCKED_LATCH;
   }
 
+  // ---- Mode-switch gates ----------------------------------------------------
+  if (gKillSwitchActive.load(std::memory_order_relaxed)) f |= arming::FLAG_KILL_SWITCH;
+  // Nav mode selected on the switch while its GPS/heading requirements are
+  // unmet: block arming (a pilot arming straight into POSHOLD with 3 sats is
+  // an immediate flyaway risk) unless explicitly allowed by config.
+  {
+    const uint16_t modeMask = gModeActiveMask.load(std::memory_order_relaxed);
+    const bool navSelected =
+        (modeMask & ((1U << MODE_POS_HOLD) | (1U << MODE_RTH))) != 0;
+    if (navSelected && !gArmCfg.navAllowArmUnsafe.load(std::memory_order_relaxed)) {
+      bool fix = false, hdopValid = false;
+      uint8_t sats = 0;
+      float hdop = 99.9f;
+      portENTER_CRITICAL(&gSensorMux);
+      fix = gState.gps.hasFix;
+      sats = gState.gps.satellites;
+      hdop = gState.gps.hdop;
+      hdopValid = gState.gps.hdopValid;
+      portEXIT_CRITICAL(&gSensorMux);
+      bool magOk = false;
+#if FCU_ENABLE_EXTERNAL_MAG
+      magOk = (gActiveMagSource.load(std::memory_order_relaxed) == MAG_SOURCE_EXTERNAL) &&
+              gExtCal.valid.load(std::memory_order_relaxed);
+#endif
+      const bool navOk =
+          fix &&
+          static_cast<float>(sats) >= gArmCfg.navMinSats.load(std::memory_order_relaxed) &&
+          hdopValid && hdop <= gArmCfg.navMaxHdop.load(std::memory_order_relaxed) && magOk;
+      if (!navOk) f |= arming::FLAG_NAV_UNSAFE;
+    }
+  }
+
   gArmingDisableFlags.store(f, std::memory_order_relaxed);
 }
 
@@ -6563,6 +6659,12 @@ void fcuConfigGroupChanged(uint8_t group) {
       break;
     case fcu_config::GROUP_MIXER:
       refreshMixerConfigCache();
+      break;
+    case fcu_config::GROUP_MODES:
+      refreshModesConfigCache();
+      break;
+    case fcu_config::GROUP_NAV:
+      refreshArmingConfigCache();  // nav quality gates live in the arming cache
       break;
     default:
       break;
@@ -7291,10 +7393,13 @@ void pidWebGetDash(pid_webserver::DashTelemetry& d) {
   d.rcRssiDbm = gCrsf.uplinkRssiDbm();
   d.rcFrameRateHz = gCrsf.frameRateHz();
   d.rcFrameAgeMs = gCrsf.frameAgeMs(now);
-  for (uint8_t i = 0; i < 8; ++i) d.rcChannelsUs[i] = gCrsf.channelMicros(i);
+  for (uint8_t i = 0; i < 16; ++i) d.rcChannelsUs[i] = gCrsf.channelMicros(i);
 #else
   d.crsfCompiled = false;
 #endif
+  d.modeActiveMask = gModeActiveMask.load(std::memory_order_relaxed);
+  d.modeAssignedMask = gModeAssignedFuncs.load(std::memory_order_relaxed);
+  d.killSwitchActive = gKillSwitchActive.load(std::memory_order_relaxed);
 
 #if ENABLE_EXPERIMENTAL_EKF
   EkfDiagSnapshot ekfSnap;
@@ -9744,15 +9849,81 @@ static bool serviceManualAltHold(uint8_t stickThrottlePct, const AltitudeState& 
 }
 #endif  // FCU_ENABLE_ALTITUDE_HOLD
 
-// Translate aux switches into flight state. Currently: a 2-position switch on
-// FCU_ALT_HOLD_AUX_CHANNEL (1-based; 0 = feature disabled) requests manual
-// altitude hold, with hysteresis so channel noise near the threshold can't
-// chatter engage/disengage. Runs on the CRSF task; the flight loop owns the
-// actual throttle takeover. POS_HOLD / RTH stay unmapped — they need a GPS fix
-// and their own validation before they're wired to a switch.
+// =============================================================================
+// [MODES EVALUATION] — runs on the CRSF task once per dispatched frame.
+// Evaluates the 8 config mode slots against live channel values and publishes
+// gModeActiveMask. ±25 µs hysteresis on the range edges once a slot is active
+// so channel noise at a boundary can't chatter a mode (matches the intent of
+// the old crsfSwitchIsHigh 1300/1700 hysteresis for the default ARM slot).
+// =============================================================================
+void updateModesFromChannels(uint32_t nowMs) {
+  static bool slotActive[kModeSlotCount] = {false};
+  static uint16_t prevMask = 0;
+  constexpr uint16_t kHystUs = 25;
+
+  uint16_t mask = 0;
+  for (int n = 0; n < kModeSlotCount; ++n) {
+    const uint32_t a = gModeSlotA[n].load(std::memory_order_relaxed);
+    const uint32_t b = gModeSlotB[n].load(std::memory_order_relaxed);
+    const uint8_t func = static_cast<uint8_t>(a & 0xFF);
+    const uint8_t ch = static_cast<uint8_t>((a >> 8) & 0xFF);
+    uint16_t lo = static_cast<uint16_t>(b & 0xFFFF);
+    uint16_t hi = static_cast<uint16_t>((b >> 16) & 0xFFFF);
+    if (func == MODE_NONE || func >= MODE_FUNC_COUNT || ch < 1 || ch > 16 || lo >= hi) {
+      slotActive[n] = false;
+      continue;
+    }
+    const uint16_t us = gCrsf.channelMicros(static_cast<uint8_t>(ch - 1));
+    if (us == 0) {  // no channel data => every mode fails safe to OFF
+      slotActive[n] = false;
+      continue;
+    }
+    if (slotActive[n]) {  // widen the window while active (hysteresis)
+      lo = (lo > kHystUs) ? static_cast<uint16_t>(lo - kHystUs) : 0;
+      hi = static_cast<uint16_t>(hi + kHystUs);
+    }
+    slotActive[n] = (us >= lo && us <= hi);
+    if (slotActive[n]) mask |= static_cast<uint16_t>(1U << func);
+  }
+
+  gModeActiveMask.store(mask, std::memory_order_relaxed);
+
+  // ---- KILL switch: immediate motor cut on the rising edge ------------------
+  const bool kill = (mask & (1U << MODE_KILL)) != 0;
+  const bool killWas = gKillSwitchActive.exchange(kill, std::memory_order_relaxed);
+  if (kill && !killWas) {
+    fcu_log::logf(fcu_log::Level::Warn, "[MODES] KILL SWITCH — stopping motors\n");
+    forceMotorStop("kill_switch");
+  }
+
+  // ---- ALT_HOLD: a config slot takes precedence over the legacy compile-time
+  // ---- channel; when no slot assigns ALT_HOLD the legacy path below runs.
+  if (gModeAssignedFuncs.load(std::memory_order_relaxed) & (1U << MODE_ALT_HOLD)) {
+    const bool ah = (mask & (1U << MODE_ALT_HOLD)) != 0;
+    const bool was = gAltHoldSwitchOn.load(std::memory_order_relaxed);
+    if (ah != was) {
+      gAltHoldSwitchOn.store(ah, std::memory_order_relaxed);
+      fcu_log::logf(fcu_log::Level::Warn, "[ALTHOLD] mode slot %s\n", ah ? "ON" : "OFF");
+    }
+  }
+
+  // ---- Transition log (1 line per change; masks are small) ------------------
+  if (mask != prevMask) {
+    fcu_log::logf(fcu_log::Level::Info, "[MODES] active mask 0x%03X -> 0x%03X (t=%lu)\n",
+                  static_cast<unsigned>(prevMask), static_cast<unsigned>(mask),
+                  static_cast<unsigned long>(nowMs));
+    prevMask = mask;
+  }
+}
+
+// Legacy compile-time ALT_HOLD switch (FCU_ALT_HOLD_AUX_CHANNEL). Skipped when
+// a config mode slot assigns ALT_HOLD — the slot is authoritative then.
 void updateFlightModeFromAuxChannels(uint32_t nowMs) {
   (void)nowMs;
 #if FCU_ALT_HOLD_AUX_CHANNEL > 0
+  if (gModeAssignedFuncs.load(std::memory_order_relaxed) & (1U << MODE_ALT_HOLD)) {
+    return;
+  }
   const uint16_t us = gCrsf.channelMicros(FCU_ALT_HOLD_AUX_CHANNEL - 1);
   const bool was = gAltHoldSwitchOn.load(std::memory_order_relaxed);
   bool now = was;
@@ -9848,9 +10019,19 @@ void buildAndDispatchCrsfControlPacket(uint32_t nowMs) {
       static_cast<int8_t>(crsfApplyDeadband(crsfMicrosToSignedPercent(yawUs))),
       std::memory_order_relaxed);
 
-  // CH5 arm with hysteresis — MINIMAL bring-up mapping (final layout TBD in
-  // updateFlightModeFromAuxChannels). Below high threshold: motors held quiet.
-  gCrsfBridge.armSwitchHigh = crsfSwitchIsHigh(armUs, gCrsfBridge.armSwitchHigh);
+  // [MODES] Evaluate the aux mode-range table first: ARM, KILL and ALT_HOLD
+  // authority all come from it. The default table reproduces the old
+  // hard-coded CH5 1700+ arm switch exactly; deleting the ARM slot makes
+  // arming impossible (explicit, INAV-style). KILL always wins over ARM.
+  updateModesFromChannels(nowMs);
+  {
+    const uint16_t modeMask = gModeActiveMask.load(std::memory_order_relaxed);
+    const bool armAssigned =
+        (gModeAssignedFuncs.load(std::memory_order_relaxed) & (1U << MODE_ARM)) != 0;
+    bool armRequested = armAssigned && (modeMask & (1U << MODE_ARM)) != 0;
+    if (gKillSwitchActive.load(std::memory_order_relaxed)) armRequested = false;
+    gCrsfBridge.armSwitchHigh = armRequested;
+  }
 
   // Safe-boot: throttle held near zero for kCrsfSafeBootHoldMs after first valid
   // frames latches kFlagSafeBootComplete for the session. Enforces the
@@ -12623,6 +12804,7 @@ void setup() {
   refreshArmingConfigCache();  // arming gates read config through atomics
   refreshMotorConfigCache();   // motor map / armed idle / test limits likewise
   refreshMixerConfigCache();   // stage the custom mixer table for the flight task
+  refreshModesConfigCache();   // aux-range mode slots for the CRSF task
   initNrfStatusLeds();
 
   // ---- Nav status LED (4 blinks on first GPS fix and on origin lock) ------

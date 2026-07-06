@@ -46,9 +46,10 @@ enum : uint32_t {
   FLAG_IMU_INVALID     = 1UL << 17,  // IMU not ready / samples invalid
   FLAG_ESC_NOT_READY   = 1UL << 18,  // ESC init/settle not complete
   FLAG_ARM_BLOCKED_LATCH = 1UL << 19,  // arm refused earlier; cycle the switch
+  FLAG_NAV_UNSAFE      = 1UL << 20,  // nav mode selected but GPS/heading unmet
 };
 
-constexpr uint8_t kFlagCount = 20;
+constexpr uint8_t kFlagCount = 21;
 
 // Short stable identifiers (used by /api/status + the UI list).
 inline const char* flagName(uint8_t bit) {
@@ -73,6 +74,7 @@ inline const char* flagName(uint8_t bit) {
     case FLAG_IMU_INVALID:    return "IMU_INVALID";
     case FLAG_ESC_NOT_READY:  return "ESC_NOT_READY";
     case FLAG_ARM_BLOCKED_LATCH: return "ARM_SWITCH_CYCLE_REQUIRED";
+    case FLAG_NAV_UNSAFE:     return "NAV_MODE_UNSAFE";
     default:                  return "?";
   }
 }

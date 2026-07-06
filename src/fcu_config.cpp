@@ -182,6 +182,9 @@ constexpr ParamDef kParams[] = {
     {"nav_gps_loss_action",   "navLoss", 0.0f, 2.0f,   0.0f, 0, GROUP_NAV, EXT_NONE},
     {"nav_stick_override_pct", "navOvr", 5.0f, 80.0f, 20.0f, 0, GROUP_NAV, EXT_NONE},
     {"nav_vel_i_clamp",       "navIcl",  0.0f, 1.0f,   0.3f, 2, GROUP_NAV, EXT_NONE},
+    // Allow arming while a nav mode (POS_HOLD/RTH) is selected but its GPS/
+    // heading requirements are unmet. OFF = arming blocked (NAV_UNSAFE flag).
+    {"nav_allow_arm_unsafe",  "navAAU",  0.0f, 1.0f,   0.0f, 0, GROUP_NAV, EXT_NONE},
 
     // ---- ALT source / rangefinder --------------------------------------------
     // 0 = auto (ToF near ground > baro > GPS reference), 1 = baro only, 2 = ToF only
