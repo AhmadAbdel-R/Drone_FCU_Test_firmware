@@ -535,6 +535,7 @@ int formatDashJson(char* out, size_t cap, const DashTelemetry& d,
       "\"tof\":{\"comp\":%d,\"r\":%d,\"rng\":%d,\"mm\":%u,\"age\":%lu},"
       "\"gps\":{\"comp\":%d,\"r\":%d,\"fix\":%d,\"sats\":%u,\"q\":%u,\"hdop\":%.1f,\"hdv\":%d,"
       "\"lat\":%ld,\"lon\":%ld,\"age\":%lu,"
+      "\"home\":{\"set\":%d,\"lat\":%ld,\"lon\":%ld,\"dist\":%.1f,\"brg\":%.1f},"
       "\"gsv\":%d,\"cv\":%d,\"vv\":%d,\"sp\":%u,\"spd\":%.2f,\"cog\":%u,\"vn\":%.2f,\"ve\":%.2f,\"rmc\":%lu},"
       "\"mag\":{\"v\":%d,\"hdg\":%.1f,\"f\":%.1f,\"cal\":%d,\"src\":%u,\"gain\":%.3f,"
       "\"trim\":%.1f,\"dec\":%.1f,"
@@ -549,6 +550,8 @@ int formatDashJson(char* out, size_t cap, const DashTelemetry& d,
       d.tofMm, (unsigned long)d.tofAgeMs, d.gpsCompiled ? 1 : 0, d.gpsReady ? 1 : 0, d.gpsFix ? 1 : 0,
       d.gpsSats, d.gpsFixQual, jf(d.gpsHdop), d.gpsHdopValid ? 1 : 0,
       (long)d.gpsLatE7, (long)d.gpsLonE7, (unsigned long)d.gpsAgeMs,
+      d.homeSet ? 1 : 0, (long)d.homeLatE7, (long)d.homeLonE7,
+      jf(d.homeDistM), jf(d.homeBrgDeg),
       d.gpsGroundSpeedValid ? 1 : 0, d.gpsCourseValid ? 1 : 0, d.gpsVelocityValid ? 1 : 0,
       d.gpsGroundSpeedKmh10, jf(d.gpsGroundSpeedMs), d.gpsCourseCentiDeg,
       jf(d.gpsVelNorthMs), jf(d.gpsVelEastMs), (unsigned long)d.gpsRmcAgeMs,
@@ -1524,6 +1527,36 @@ esp_err_t handlePostModes(httpd_req_t* req) {
   return sendImportResult(req, res);
 }
 
+// POST /api/gps/configure — push the configured UBX settings to the receiver
+// (scheduled; the sensor task executes it disarmed-only).
+esp_err_t handleGpsConfigure(httpd_req_t* req) {
+  if (!gCb.gpsConfigure) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
+  if (!gCb.gpsConfigure()) return sendError(req, 409, "refused");
+  return sendJson(req, "{\"ok\":true,\"scheduled\":true}");
+}
+
+// POST /api/gps/save — persist GPS settings (flat param object).
+esp_err_t handleGpsSave(httpd_req_t* req) {
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
+  static char body[1024];
+  const int n = recvBody(req, body, sizeof(body));
+  if (n < 0) return sendError(req, 400, "bad_body");
+  const auto res = fcu_config::applyJsonObject(body, static_cast<size_t>(n));
+  return sendImportResult(req, res);
+}
+
+// POST /api/gps/sethome — re-capture home from the current fix (quality-gated).
+esp_err_t handleGpsSetHome(httpd_req_t* req) {
+  if (!gCb.gpsSetHome) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  if (!gSafeToWrite.load()) return sendError(req, 409, "armed_or_throttle_nonzero");
+  if (!gCb.gpsSetHome()) return sendError(req, 409, "gps_quality_insufficient");
+  return sendJson(req, "{\"ok\":true,\"homeSet\":true}");
+}
+
 esp_err_t handleReboot(httpd_req_t* req) {
   if (!gCb.requestReboot) return sendError(req, 500, "no_callback");
   if (!authorized(req)) return sendError(req, 401, "unauthorized");
@@ -1675,6 +1708,10 @@ bool startHttpServer() {
   registerUri(gServer, "/api/motors/save-direction", HTTP_POST, handleMotorsSaveDirection);
   // ---- Modes ----
   registerUri(gServer, "/api/modes",            HTTP_POST, handlePostModes);
+  // ---- GPS page ----
+  registerUri(gServer, "/api/gps/configure",    HTTP_POST, handleGpsConfigure);
+  registerUri(gServer, "/api/gps/save",         HTTP_POST, handleGpsSave);
+  registerUri(gServer, "/api/gps/sethome",      HTTP_POST, handleGpsSetHome);
   // ---- Config registry (fcu_config) ----
   registerUri(gServer, "/api/config",           HTTP_GET,  handleGetConfig);
   registerUri(gServer, "/api/config",           HTTP_POST, handlePostConfig);

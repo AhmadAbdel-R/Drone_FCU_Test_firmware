@@ -116,6 +116,7 @@
 #include "fcu_nvs.h"
 #include "fcu_config.h"     // INAV-style versioned param registry + JSON export/import
 #include "arming_flags.h"   // central arming-disable bitmask (flags + names)
+#include "gps_ublox.h"      // clean-room UBX config frame builders (GPS page)
 #include "DynamicNotchFilter.h"
 #include "notch_analysis.h"
 #include "diag_capture.h"
@@ -5468,6 +5469,72 @@ void parseGpsLine(const char* line, uint32_t nowMs) {
   }
 }
 
+// =============================================================================
+// [GPS CONFIG] — push UBX configuration to a u-blox receiver (GPS page).
+//
+// The webserver (or boot auto-config) only SCHEDULES the apply via an atomic
+// timestamp; the sensor task — the sole owner of UART1 — executes it, so a
+// baud change can never race pollGps() mid-read. Disarmed-only at execution.
+// =============================================================================
+std::atomic<uint32_t> gGpsCfgApplyAtMs{0};  // 0 = idle; else run when millis() >= value
+
+float fcuCfgReadByName(const char* name, float fallback);  // defined below
+
+void serviceGpsConfigure(uint32_t nowMs) {
+#if FCU_ENABLE_GPS
+  static uint32_t sLinkBaud = GPS_BAUD;  // sensorTask-owned current UART baud
+  const uint32_t at = gGpsCfgApplyAtMs.load(std::memory_order_relaxed);
+  if (at == 0U || static_cast<int32_t>(nowMs - at) < 0) return;
+  gGpsCfgApplyAtMs.store(0, std::memory_order_relaxed);
+
+  if (gFlightStatePublished.load(std::memory_order_relaxed) != flight_state::State::IDLE) {
+    fcu_log::logf(fcu_log::Level::Warn, "[GPS-CFG] apply dropped: not disarmed/idle\n");
+    return;
+  }
+  if (static_cast<uint8_t>(fcuCfgReadByName("gps_provider", 1.0f)) != 1) {
+    fcu_log::logf(fcu_log::Level::Info, "[GPS-CFG] provider is generic NMEA — listen-only\n");
+    return;
+  }
+
+  static const uint32_t kBaudTable[5] = {9600, 19200, 38400, 57600, 115200};
+  const uint8_t baudIdx = static_cast<uint8_t>(
+      constrain(fcuCfgReadByName("gps_baud", 0.0f), 0.0f, 4.0f));
+  const uint32_t targetBaud = kBaudTable[baudIdx];
+  const float rateHz = constrain(fcuCfgReadByName("gps_rate_hz", 5.0f), 1.0f, 10.0f);
+  const uint16_t measMs = static_cast<uint16_t>(constrain(1000.0f / rateHz, 100.0f, 1000.0f));
+  const uint8_t dynCfg = static_cast<uint8_t>(fcuCfgReadByName("gps_dyn_model", 3.0f));
+  const bool sbas = fcuCfgReadByName("gps_sbas", 1.0f) > 0.5f;
+
+  uint8_t frame[gps_ublox::kMaxFrame];
+  size_t n;
+  // Baud first (sent at the CURRENT baud, then the local UART re-baubs). The
+  // receiver switches immediately after the frame; flush() guarantees the
+  // last byte left the wire before we change our side.
+  if (targetBaud != sLinkBaud) {
+    n = gps_ublox::buildCfgPrtBaud(frame, targetBaud);
+    gGpsSerial.write(frame, n);
+    gGpsSerial.flush();
+    vTaskDelay(pdMS_TO_TICKS(60));  // receiver-side port re-init grace
+    gGpsSerial.updateBaudRate(targetBaud);
+    sLinkBaud = targetBaud;
+  }
+  n = gps_ublox::buildCfgRate(frame, measMs);
+  gGpsSerial.write(frame, n);
+  n = gps_ublox::buildCfgNav5DynModel(frame, gps_ublox::dynModelFromConfig(dynCfg));
+  gGpsSerial.write(frame, n);
+  n = gps_ublox::buildCfgSbas(frame, sbas);
+  gGpsSerial.write(frame, n);
+  gGpsSerial.flush();
+  fcu_log::logf(fcu_log::Level::Info,
+                "[GPS-CFG] UBX applied: baud=%lu rate=%.0fHz (meas %ums) dyn=%u sbas=%u\n",
+                static_cast<unsigned long>(targetBaud), static_cast<double>(rateHz),
+                static_cast<unsigned>(measMs), static_cast<unsigned>(dynCfg),
+                static_cast<unsigned>(sbas));
+#else
+  (void)nowMs;
+#endif
+}
+
 // [GPS MODULE] — declared in include/gps_module.h
 void pollGps(uint32_t nowMs) {
 #if !FCU_ENABLE_GPS
@@ -7378,6 +7445,28 @@ void pidWebGetDash(pid_webserver::DashTelemetry& d) {
   d.gpsAgeMs = ageMsSafe(now, gpsMs);
   d.gpsRmcAgeMs = ageMsSafe(now, gpsRmcMs);
 
+  // ---- Home (RTH) + distance/bearing from the current fix -------------------
+  // Equirectangular approximation, adequate at RTH ranges (<< 10 km): scale
+  // longitude by cos(lat) and treat the grid as flat.
+  d.homeSet = gRth.homeCaptured();
+  if (d.homeSet) {
+    const auto& h = gRth.home();
+    d.homeLatE7 = h.latE7;
+    d.homeLonE7 = h.lonE7;
+    if (d.gpsFix) {
+      constexpr float kMetersPerDegLat = 111319.5f;
+      const float latRad = static_cast<float>(h.latE7) * 1e-7f * 0.0174532925f;
+      const float dLatM =
+          static_cast<float>(h.latE7 - d.gpsLatE7) * 1e-7f * kMetersPerDegLat;
+      const float dLonM = static_cast<float>(h.lonE7 - d.gpsLonE7) * 1e-7f *
+                          kMetersPerDegLat * cosf(latRad);
+      d.homeDistM = sqrtf(dLatM * dLatM + dLonM * dLonM);
+      float brg = atan2f(dLonM, dLatM) * 57.29578f;  // deg from north, toward home
+      if (brg < 0.0f) brg += 360.0f;
+      d.homeBrgDeg = brg;
+    }
+  }
+
   // ---- Compiled-in feature flags ----
   d.tofCompiled = (FCU_ENABLE_TOF != 0);
   d.gpsCompiled = (FCU_ENABLE_GPS != 0);
@@ -7438,6 +7527,44 @@ void pidWebGetDash(pid_webserver::DashTelemetry& d) {
   d.panTargetUs = gCameraGimbal.panTargetMicros();
   d.tiltTargetUs = gCameraGimbal.tiltTargetMicros();
 #endif
+}
+
+// ---- GPS page callbacks -----------------------------------------------------
+bool pidWebGpsConfigure() {
+  if (!pidWebWriteSafe()) return false;
+  gGpsCfgApplyAtMs.store(millis() | 1U, std::memory_order_relaxed);  // |1: never 0
+  return true;
+}
+
+bool pidWebGpsSetHome() {
+  if (!pidWebWriteSafe()) return false;
+  bool fix = false, hdopValid = false;
+  uint8_t sats = 0;
+  float hdop = 99.9f;
+  int32_t lat = 0, lon = 0;
+  portENTER_CRITICAL(&gSensorMux);
+  fix = gState.gps.hasFix;
+  sats = gState.gps.satellites;
+  hdop = gState.gps.hdop;
+  hdopValid = gState.gps.hdopValid;
+  lat = gState.gps.latE7;
+  lon = gState.gps.lonE7;
+  portEXIT_CRITICAL(&gSensorMux);
+  const bool qualityOk =
+      fix && static_cast<float>(sats) >= gArmCfg.navMinSats.load(std::memory_order_relaxed) &&
+      hdopValid && hdop <= gArmCfg.navMaxHdop.load(std::memory_order_relaxed);
+  if (!qualityOk) {
+    fcu_log::logf(fcu_log::Level::Warn,
+                  "[GPS] set-home refused: fix=%u sats=%u hdop=%.1f\n",
+                  static_cast<unsigned>(fix), static_cast<unsigned>(sats),
+                  static_cast<double>(hdop));
+    return false;
+  }
+  gRth.clearHome();
+  (void)gRth.captureHomeIfNeeded(lat, lon, true);
+  fcu_log::logf(fcu_log::Level::Info, "[GPS] home re-captured from web lat=%.7f lon=%.7f\n",
+                static_cast<double>(lat) * 1e-7, static_cast<double>(lon) * 1e-7);
+  return true;
 }
 
 // GET /api/status backend — craft summary + arming-disable flags.
@@ -8065,6 +8192,8 @@ pid_webserver::Callbacks buildConfiguratorCallbacks() {
   cbs.motorTestRun = requestMotorTest;
   cbs.motorTestStop = requestMotorTestStop;
   cbs.getMotorTest = pidWebGetMotorTest;
+  cbs.gpsConfigure = pidWebGpsConfigure;
+  cbs.gpsSetHome = pidWebGpsSetHome;
   cbs.getMixPitchFrontBias = pidWebGetMixBias;
   cbs.setMixPitchFrontBias = pidWebSetMixBias;
   cbs.saveMixPitchFrontBiasToNvs = pidWebSaveMixBiasToNvs;
@@ -12481,6 +12610,7 @@ void sensorTask(void* /*arg*/) {
     pollExternalMag(nowMs);  // external MMC5603 (shares the BMP Wire bus)
 #endif
     pollGps(nowMs);
+    serviceGpsConfigure(nowMs);  // one-shot UBX config apply (GPS page / boot)
     pollPiAutonomy(nowMs);
 #if FCU_ESC_TELEM
     pollEscUartTelemetry(nowMs);  // KISS TLM round-robin (UART2 owner when enabled)
@@ -13029,6 +13159,13 @@ void setup() {
   serviceBootMotorZeroHeartbeat();
   gTofFilter.reset();
   gState.gps.uartReady = initGpsUart();
+  // Optional boot-time UBX push (gps_auto_config, default OFF): schedule the
+  // apply 3 s out so the receiver finishes its own boot first. Executed by
+  // the sensor task (UART1 owner) and only while disarmed.
+  if (gState.gps.uartReady && fcuCfgReadByName("gps_auto_config", 0.0f) > 0.5f) {
+    gGpsCfgApplyAtMs.store(millis() + 3000U, std::memory_order_relaxed);
+    Serial.println("[GPS-CFG] auto-config scheduled (+3 s)");
+  }
   serviceBootMotorZeroHeartbeat();
   gState.pi.uartReady = initPiUart();
   serviceBootMotorZeroHeartbeat();

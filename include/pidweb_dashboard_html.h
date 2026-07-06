@@ -305,6 +305,40 @@ canvas{display:block;width:100%;background:#0a0d12;border-radius:8px;border:1px 
   </div>
  </section>
 
+ <!-- ===== GPS ===== -->
+ <section class="tab" id="t_gps">
+  <div class="grid wide">
+   <div class="card"><h3>Fix status</h3><div id="gp_status"></div></div>
+   <div class="card"><h3>Home <span class="tag" id="gp_hometag">--</span></h3>
+    <div id="gp_home"></div>
+    <div class="btns" style="margin-top:8px">
+     <button class="btn pri" onclick="act('/api/gps/sethome','Home re-captured')">Set home here</button>
+    </div>
+    <div class="note">Refused unless fix + minimum satellites + HDOP pass the nav quality gates below. Home also auto-captures at boot after the origin debouncer locks.</div>
+   </div>
+   <div class="card span2"><h3>Receiver configuration <span class="tag" id="gp_cfgtag">--</span></h3>
+    <div class="note">UBLOX provider pushes UBX config frames to the module (disarmed only). Generic NMEA is listen-only. Baud changes take effect immediately on Apply; the FCU re-baubs its UART in the same step.</div>
+    <div class="row"><label>Provider</label><select id="gp_prov"><option value="0">Generic NMEA (listen only)</option><option value="1">UBLOX</option></select></div>
+    <div class="row"><label>Baud</label><select id="gp_baud"><option value="0">9600</option><option value="1">19200</option><option value="2">38400</option><option value="3">57600</option><option value="4">115200</option></select></div>
+    <div class="row"><label>Update rate (Hz)</label><input type="number" id="gp_rate" min="1" max="10" step="1" style="max-width:90px"></div>
+    <div class="row"><label>Dynamic model</label><select id="gp_dyn"><option value="0">Portable</option><option value="1">Pedestrian</option><option value="2">Automotive</option><option value="3">Airborne &lt;1g</option><option value="4">Airborne &lt;2g</option><option value="5">Airborne &lt;4g</option></select></div>
+    <div class="row"><label>SBAS</label><input type="checkbox" id="gp_sbas" style="width:18px;height:18px"></div>
+    <div class="row"><label>Auto-config at boot</label><input type="checkbox" id="gp_auto" style="width:18px;height:18px"></div>
+    <div class="btns" style="margin-top:8px">
+     <button class="btn pri" onclick="gpSave()">Save settings</button>
+     <button class="btn" onclick="gpApply()">Apply to receiver now</button>
+    </div>
+   </div>
+   <div class="card span2"><h3>Nav / arming quality gates</h3>
+    <div class="note">POSHOLD/RTH selection while these are unmet blocks arming (NAV_MODE_UNSAFE) and gates Set-home. Arming-time GPS requirements live under <b>arm_require_gps</b> on the Config tab.</div>
+    <div class="row"><label>Nav min satellites</label><input type="number" id="gp_navsat" min="5" max="20" step="1" style="max-width:90px"></div>
+    <div class="row"><label>Nav max HDOP</label><input type="number" id="gp_navhdop" min="1" max="5" step="0.1" style="max-width:90px"></div>
+    <div class="row"><label>Allow arming into unsafe nav mode</label><input type="checkbox" id="gp_navaau" style="width:18px;height:18px"></div>
+    <div class="btns"><button class="btn pri" onclick="gpSaveGates()">Save gates</button></div>
+   </div>
+  </div>
+ </section>
+
  <!-- ===== ATTITUDE & LEVEL ===== -->
  <section class="tab" id="t_attitude">
   <div class="grid wide">
@@ -641,7 +675,7 @@ async function put(url,okMsg,body){
  }catch(e){toast('Network error',true);return false;}
 }
 // ---------- tabs ----------
-const TABS=[['overview','Overview'],['setup','Setup'],['motors','Motors'],['modes','Modes'],['attitude','Attitude & Level'],['pid','PID Tuning'],
+const TABS=[['overview','Overview'],['setup','Setup'],['motors','Motors'],['modes','Modes'],['gps','GPS'],['attitude','Attitude & Level'],['pid','PID Tuning'],
  ['diag','PID Diagnostics'],['mixer','Motor Mixer'],['sensors','Sensors'],['radio','Radio & Links'],
  ['vibe','Vibration & FFT'],['notch','Filters & Notch'],['servo','Pan/Tilt'],['capture','Capture'],['config','Config']];
 let activeTab='overview';
@@ -742,6 +776,7 @@ function render(m){
  // active tab content
  if(activeTab==='setup')renderSetup(m);
  else if(activeTab==='modes')renderModes(m);
+ else if(activeTab==='gps')renderGps(m);
  else if(activeTab==='attitude')renderAttitude(m);
  else if(activeTab==='diag')renderDiag(m);
  else if(activeTab==='mixer')renderMixer(m);
@@ -1378,6 +1413,66 @@ async function capClear(){if(confirm('Clear diagnostic capture?')&&await act('/a
 function capDownload(){window.location.href='/api/capture.csv';}
 STAGE.capture=()=>{capPoll();if(!capTimer)capTimer=setInterval(()=>{if(activeTab==='capture')capPoll();else{clearInterval(capTimer);capTimer=null;}},500);};
 (function(){const prev=window.onRender;window.onRender=m=>{if(prev)prev(m);if(activeTab==='vibe')renderVibe(m);if(activeTab==='pid')renderYawCard(m);};})();
+// ===== GPS tab ===============================================================
+// Status rides the WS frame; config loads once from /api/config and saves via
+// /api/gps/save; "Apply to receiver" schedules the disarmed-only UBX push.
+let GP_LOADED=false;
+async function gpLoad(){
+ try{const r=await fetch('/api/config');if(!r.ok)return;const j=await r.json();
+  const map={};(j.params||[]).forEach(p=>map[p.n]=p.v);
+  document.getElementById('gp_prov').value=map.gps_provider??1;
+  document.getElementById('gp_baud').value=map.gps_baud??0;
+  document.getElementById('gp_rate').value=map.gps_rate_hz??5;
+  document.getElementById('gp_dyn').value=map.gps_dyn_model??3;
+  document.getElementById('gp_sbas').checked=(map.gps_sbas??1)>0.5;
+  document.getElementById('gp_auto').checked=(map.gps_auto_config??0)>0.5;
+  document.getElementById('gp_navsat').value=map.nav_min_sats??8;
+  document.getElementById('gp_navhdop').value=map.nav_max_hdop??2;
+  document.getElementById('gp_navaau').checked=(map.nav_allow_arm_unsafe??0)>0.5;
+  GP_LOADED=true;
+ }catch(e){}
+}
+function gpBody(){
+ return{gps_provider:+document.getElementById('gp_prov').value,
+  gps_baud:+document.getElementById('gp_baud').value,
+  gps_rate_hz:+document.getElementById('gp_rate').value||5,
+  gps_dyn_model:+document.getElementById('gp_dyn').value,
+  gps_sbas:document.getElementById('gp_sbas').checked?1:0,
+  gps_auto_config:document.getElementById('gp_auto').checked?1:0};
+}
+async function gpSave(){await act('/api/gps/save','GPS settings saved',gpBody());}
+async function gpApply(){
+ if(!await act('/api/gps/save','Settings saved',gpBody()))return;
+ await act('/api/gps/configure','UBX config scheduled (watch fix status)');
+}
+async function gpSaveGates(){
+ await act('/api/gps/save','Nav gates saved',{nav_min_sats:+document.getElementById('gp_navsat').value||8,
+  nav_max_hdop:+document.getElementById('gp_navhdop').value||2,
+  nav_allow_arm_unsafe:document.getElementById('gp_navaau').checked?1:0});
+}
+function renderGps(m){
+ const g=m.sen.gps,el=document.getElementById('gp_status');
+ if(!g.comp){el.innerHTML='<div class="dim small">GPS not compiled in this build.</div>';return;}
+ const fixNames={0:'no fix',1:'GPS',2:'DGPS'};
+ el.innerHTML=
+  kv('Fix',(g.fix?led('ok'):led('err'))+(fixNames[g.q]||('q'+g.q)))
+ +kv('Satellites',g.sats)
+ +kv('HDOP',g.hdv?f(g.hdop,1):'--')
+ +kv('Position',g.fix?(g.lat/1e7).toFixed(6)+', '+(g.lon/1e7).toFixed(6):'--')
+ +kv('Ground speed',g.gsv?f(g.spd,1)+' m/s':'--')
+ +kv('Course',g.cv?f(g.cog/100,0)+'°':'--')
+ +kv('Sentence age',ageTxt(g.age));
+ const h=g.home||{},ht=document.getElementById('gp_hometag');
+ ht.className='tag '+(h.set?'ok':'warn');ht.textContent=h.set?'SET':'not set';
+ document.getElementById('gp_home').innerHTML=h.set?
+  kv('Home',(h.lat/1e7).toFixed(6)+', '+(h.lon/1e7).toFixed(6))
+  +kv('Distance',g.fix?f(h.dist,1)+' m':'--')
+  +kv('Bearing to home',g.fix?f(h.brg,0)+'°':'--')
+  :'<div class="dim small">Waiting for the origin debouncer (stable fix, ≥6 sats, 10 s) or a manual capture.</div>';
+ const ct=document.getElementById('gp_cfgtag');
+ if(GP_LOADED){ct.className='tag ok';ct.textContent='loaded';}
+}
+STAGE.gps=()=>{if(!GP_LOADED)gpLoad();};
 // ===== Modes tab (aux-range assignment) ======================================
 // Slot config loads/saves through /api/modes (flat param object); live channel
 // values + the active/assigned masks ride the WS frame at 25 Hz.

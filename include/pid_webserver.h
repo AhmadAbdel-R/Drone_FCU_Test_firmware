@@ -224,6 +224,10 @@ struct DashTelemetry {
   uint32_t gpsAgeMs = 0xFFFFFFFF;
   float gpsHdop = 99.9f;
   bool gpsHdopValid = false;
+  bool homeSet = false;                 // RTH home captured
+  int32_t homeLatE7 = 0, homeLonE7 = 0;
+  float homeDistM = 0.0f;               // current fix -> home
+  float homeBrgDeg = 0.0f;              // bearing to home, deg true
   bool gpsGroundSpeedValid = false, gpsCourseValid = false, gpsVelocityValid = false;
   uint16_t gpsGroundSpeedKmh10 = 0, gpsCourseCentiDeg = 0;
   float gpsGroundSpeedMs = 0.0f, gpsCourseDeg = 0.0f;
@@ -438,6 +442,12 @@ struct Callbacks {
   // Immediate stop — never gated.
   bool (*motorTestStop)() = nullptr;
   void (*getMotorTest)(MotorTestState& s) = nullptr;
+  // ---- GPS page --------------------------------------------------------------
+  // Schedule a UBX config push (executed by the sensor task, disarmed only).
+  bool (*gpsConfigure)() = nullptr;
+  // Re-capture home from the current fix; refused unless GPS quality passes
+  // the nav gates (fix + min sats + max HDOP).
+  bool (*gpsSetHome)() = nullptr;
   // ---- Mixer front-pitch bias (forward-CG compensation) -------------------
   // Read the live runtime value. Range [1.0, 2.0]; default usually 1.0 (off).
   void (*getMixPitchFrontBias)(float& out) = nullptr;
