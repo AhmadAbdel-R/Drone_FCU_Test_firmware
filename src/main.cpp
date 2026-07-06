@@ -6293,6 +6293,52 @@ inline void motorMapUnpack(uint8_t out[4]) {
   out[3] = static_cast<uint8_t>((p >> 24) & 0xFF);
 }
 
+// =============================================================================
+// [MIXER TABLE] — staged custom motor mixer (fcu_config GROUP_MIXER).
+//
+// Row-major [motor][throttle, roll, pitch, yaw] for logical slots M1..M4.
+// The defaults reproduce the verified hard-coded Quad-X mix bit-for-bit.
+// Same double-buffer + dirty-flag hand-off as the dynamic-notch config: the
+// web/config side writes the pending copy under gFlightMux; the flight task
+// swaps it into its private working copy at the top of the mixer section, so
+// coefficients never change mid-mix.
+// =============================================================================
+constexpr float kMixerDefaultTable[16] = {
+    // thr   roll   pitch  yaw
+    1.0f, -1.0f, -1.0f, -1.0f,  // M1 front-right (CW)
+    1.0f, -1.0f,  1.0f,  1.0f,  // M2 rear-right  (CCW)
+    1.0f,  1.0f, -1.0f,  1.0f,  // M3 front-left  (CCW)
+    1.0f,  1.0f,  1.0f, -1.0f,  // M4 rear-left   (CW)
+};
+float gMixerPendingTable[16] = {
+    1.0f, -1.0f, -1.0f, -1.0f,
+    1.0f, -1.0f,  1.0f,  1.0f,
+    1.0f,  1.0f, -1.0f,  1.0f,
+    1.0f,  1.0f,  1.0f, -1.0f,
+};
+std::atomic<bool> gMixerTableDirty{false};
+
+void refreshMixerConfigCache() {
+  static const char* kAxis[4] = {"throttle", "roll", "pitch", "yaw"};
+  float table[16];
+  for (int m = 0; m < 4; ++m) {
+    for (int a = 0; a < 4; ++a) {
+      char name[24];
+      snprintf(name, sizeof(name), "mix_m%d_%s", m + 1, kAxis[a]);
+      float v = fcuCfgReadByName(name, kMixerDefaultTable[m * 4 + a]);
+      // Registry range-validates on write; this re-check guards a corrupt NVS
+      // record that predates validation. Out-of-range => default coefficient.
+      const float lo = (a == 0) ? 0.0f : -2.0f;
+      if (!isfinite(v) || v < lo || v > 2.0f) v = kMixerDefaultTable[m * 4 + a];
+      table[m * 4 + a] = v;
+    }
+  }
+  portENTER_CRITICAL(&gFlightMux);
+  memcpy(gMixerPendingTable, table, sizeof(gMixerPendingTable));
+  gMixerTableDirty.store(true, std::memory_order_release);
+  portEXIT_CRITICAL(&gFlightMux);
+}
+
 // Config-dependent gates, cached in atomics so the 50 Hz evaluation never
 // touches fcu_config's mutex (an import holds it across NVS writes).
 struct ArmingConfigCache {
@@ -6514,6 +6560,9 @@ void fcuConfigGroupChanged(uint8_t group) {
       break;
     case fcu_config::GROUP_MOTOR:
       refreshMotorConfigCache();
+      break;
+    case fcu_config::GROUP_MIXER:
+      refreshMixerConfigCache();
       break;
     default:
       break;
@@ -11334,12 +11383,40 @@ void updateControlLoop(uint32_t nowMs) {
   //      to introduce untested. TODO(airmode): consider lower-bound base shift
   //      after armed-idle + desat are flight-proven.
   // All saturation flags feed the integrator gate on the next tick.
-  const float corr[4] = {
-      -roll - pitchFront - yaw,   // M1 front-right (CW)
-      -roll + pitchRear  + yaw,   // M2 rear-right  (CCW)
-      roll - pitchFront + yaw,    // M3 front-left  (CCW)
-      roll + pitchRear  - yaw,    // M4 rear-left   (CW)
+  //
+  // [MIXER TABLE] The mix is table-driven (fcu_config GROUP_MIXER); the
+  // default table reproduces the verified hard-coded Quad-X exactly:
+  //   corr[i] = roll*R_i + pitch*P_i*(P_i<0 ? frontBias : 1) + yaw*Y_i
+  //             + base*(T_i - 1)
+  // * The pitch-front bias multiplies the pitch term of motors with a
+  //   NEGATIVE pitch coefficient (the front motors in the default geometry),
+  //   which is precisely the old pitchFront/pitchRear split.
+  // * base*(T_i - 1) folds a non-unity throttle coefficient into the
+  //   "correction" so the desaturation logic below — which assumes a uniform
+  //   base — keeps preserving moment ratios. With the default T_i = 1 this
+  //   term is exactly zero.
+  // Coefficients swap in atomically between mixes via the pending/dirty pair.
+  static float mixTable[16] = {
+      1.0f, -1.0f, -1.0f, -1.0f,
+      1.0f, -1.0f,  1.0f,  1.0f,
+      1.0f,  1.0f, -1.0f,  1.0f,
+      1.0f,  1.0f,  1.0f, -1.0f,
   };
+  if (gMixerTableDirty.load(std::memory_order_acquire)) {
+    portENTER_CRITICAL(&gFlightMux);
+    memcpy(mixTable, gMixerPendingTable, sizeof(mixTable));
+    gMixerTableDirty.store(false, std::memory_order_relaxed);
+    portEXIT_CRITICAL(&gFlightMux);
+  }
+  float corr[4];
+  for (size_t i = 0; i < 4; ++i) {
+    const float tThr = mixTable[i * 4 + 0];
+    const float tRoll = mixTable[i * 4 + 1];
+    const float tPitch = mixTable[i * 4 + 2];
+    const float tYaw = mixTable[i * 4 + 3];
+    const float pitchTerm = (tPitch < 0.0f) ? (pitchFront * tPitch) : (pitchRear * tPitch);
+    corr[i] = roll * tRoll + pitchTerm + yaw * tYaw + base * (tThr - 1.0f);
+  }
   float corrMin = corr[0];
   float corrMax = corr[0];
   for (size_t i = 1; i < 4; ++i) {
@@ -12545,6 +12622,7 @@ void setup() {
 #endif
   refreshArmingConfigCache();  // arming gates read config through atomics
   refreshMotorConfigCache();   // motor map / armed idle / test limits likewise
+  refreshMixerConfigCache();   // stage the custom mixer table for the flight task
   initNrfStatusLeds();
 
   // ---- Nav status LED (4 blinks on first GPS fix and on origin lock) ------

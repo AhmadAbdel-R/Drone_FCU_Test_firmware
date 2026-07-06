@@ -369,6 +369,21 @@ canvas{display:block;width:100%;background:#0a0d12;border-radius:8px;border:1px 
      <tbody id="mix_tbody"></tbody></table>
     <div id="mix_expl" class="warnbox ok" style="margin-top:10px">--</div>
    </div>
+   <div class="card span2"><h3>Custom mixer table <span class="tag warn">advanced</span></h3>
+    <div class="note">Per-motor coefficients the flight mixer applies:
+     <span class="mono">out = base·T + roll·R + pitch·P + yaw·Y</span>.
+     Defaults are the flown Quad-X geometry. The pitch-front bias (below in PID/Mixer
+     settings) multiplies the pitch term of motors with a <b>negative</b> P coefficient
+     (the front motors). Values apply atomically between mixer ticks and persist in config.</div>
+    <table style="margin-top:8px"><thead><tr><th>Motor</th><th>Throttle (0..2)</th><th>Roll (−2..2)</th><th>Pitch (−2..2)</th><th>Yaw (−2..2)</th></tr></thead>
+     <tbody id="mixt_body"></tbody></table>
+    <div class="btns" style="margin-top:10px">
+     <button class="btn pri" onclick="mixtSave()">Validate &amp; Save</button>
+     <button class="btn" onclick="mixtLoad(true)">Reload saved</button>
+     <button class="btn danger" onclick="mixtReset()">Reset to Quad-X</button>
+    </div>
+    <div class="note" id="mixt_note">--</div>
+   </div>
    <div class="card span2"><h3>Per-motor thrust trim <span class="tag warn">advanced</span></h3>
     <div class="note">Multiplicative gain on each motor's command <b>above idle</b>. Range 0.900–1.100; 1.000 is off. Armed-idle remains equal. Use only after motor order/direction and level calibration are correct.</div>
     <div class="grid" style="margin-top:10px">
@@ -1337,6 +1352,67 @@ async function capClear(){if(confirm('Clear diagnostic capture?')&&await act('/a
 function capDownload(){window.location.href='/api/capture.csv';}
 STAGE.capture=()=>{capPoll();if(!capTimer)capTimer=setInterval(()=>{if(activeTab==='capture')capPoll();else{clearInterval(capTimer);capTimer=null;}},500);};
 (function(){const prev=window.onRender;window.onRender=m=>{if(prev)prev(m);if(activeTab==='vibe')renderVibe(m);if(activeTab==='pid')renderYawCard(m);};})();
+// ===== Mixer table editor ====================================================
+// Reads/writes the 16 mix_m*_{throttle,roll,pitch,yaw} params through
+// /api/config (validated + persisted firmware-side; staged atomically into
+// the flight mixer). Live outputs are already on this tab via the WS frame.
+const MIXT_DEF=[1,-1,-1,-1, 1,-1,1,1, 1,1,-1,1, 1,1,1,-1];
+const MIXT_NAMES=['M1 front-right','M2 rear-right','M3 front-left','M4 rear-left'];
+let MIXT_LOADED=false;
+function mixtBuild(){
+ const tb=document.getElementById('mixt_body');if(!tb||tb.childElementCount)return;
+ tb.innerHTML=MIXT_NAMES.map((n,m)=>'<tr><td>'+n+'</td>'+[0,1,2,3].map(a=>
+  '<td><input type="number" id="mixt_'+(m*4+a)+'" step="0.05" min="'+(a===0?0:-2)+'" max="2" style="max-width:90px"></td>').join('')+'</tr>').join('');
+}
+async function mixtLoad(showToast){
+ mixtBuild();
+ try{const r=await fetch('/api/config');if(!r.ok)return;const j=await r.json();
+  const map={};(j.params||[]).forEach(p=>map[p.n]=p.v);
+  const ax=['throttle','roll','pitch','yaw'];
+  for(let m=0;m<4;m++)for(let a=0;a<4;a++){
+   const v=map['mix_m'+(m+1)+'_'+ax[a]];
+   const el=document.getElementById('mixt_'+(m*4+a));
+   if(el&&v!=null)el.value=v;}
+  MIXT_LOADED=true;
+  if(showToast)toast('Mixer table reloaded');
+ }catch(e){}
+}
+function mixtCollect(){
+ const t=[];
+ for(let i=0;i<16;i++){const v=parseFloat(document.getElementById('mixt_'+i).value);
+  if(isNaN(v))return null;t.push(v);}
+ return t;
+}
+function mixtWarnings(t){
+ const w=[];
+ for(let i=0;i<16;i+=4)if(t[i]<0||t[i]>2)return{err:'Throttle coefficients must be 0..2'};
+ for(let i=0;i<16;i++)if(t[i]<-2||t[i]>2)return{err:'Coefficients must be within ±2'};
+ const ax=['roll','pitch','yaw'];
+ for(let a=1;a<4;a++){
+  const col=[t[a],t[4+a],t[8+a],t[12+a]];
+  if(!col.some(v=>v>0.05)||!col.some(v=>v<-0.05))w.push('No differential '+ax[a-1]+' authority (need + and − entries)');
+  const sum=col.reduce((s,v)=>s+v,0);
+  if(Math.abs(sum)>0.5)w.push(ax[a-1]+' column sum '+sum.toFixed(2)+' ≠ 0 (couples into collective)');
+ }
+ return{warn:w};
+}
+async function mixtSave(){
+ const t=mixtCollect();
+ if(!t){toast('Fill every coefficient first',true);return;}
+ const v=mixtWarnings(t);
+ if(v.err){toast(v.err,true);return;}
+ if(v.warn.length&&!confirm('Mixer sanity warnings:\n\n- '+v.warn.join('\n- ')+'\n\nSave anyway?'))return;
+ const ax=['throttle','roll','pitch','yaw'];const body={};
+ for(let m=0;m<4;m++)for(let a=0;a<4;a++)body['mix_m'+(m+1)+'_'+ax[a]]=t[m*4+a];
+ if(await act('/api/config','Mixer table saved & applied',body))
+  document.getElementById('mixt_note').textContent=v.warn.length?('Saved with warnings: '+v.warn.join(' · ')):'Saved. Default Quad-X geometry = throttle 1, roll/pitch/yaw ±1.';
+}
+function mixtReset(){
+ if(!confirm('Reset the mixer table to the default Quad-X geometry?'))return;
+ for(let i=0;i<16;i++)document.getElementById('mixt_'+i).value=MIXT_DEF[i];
+ mixtSave();
+}
+STAGE.mixer=()=>{if(!MIXT_LOADED)mixtLoad();};
 // ===== Motors tab (deadman test + order wizard) =============================
 // SAFETY MODEL: a motor spins only while a hold-button is down. The browser
 // re-POSTs /api/motors/test every 150 ms with a 400 ms deadman; the firmware
