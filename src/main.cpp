@@ -2386,6 +2386,22 @@ struct LiveSensorCalibration {
 };
 LiveSensorCalibration gCal;
 
+// =============================================================================
+// [ALT SOURCES] — runtime altitude-source config + unified-altitude arbiter.
+//
+// Priority (alt_source = 0/auto): ToF while usable (ranging, 0.03–3.5 m),
+// rebased baro when the rangefinder drops out (a slow EMA tracks the
+// baro-vs-ToF offset while both agree, so the hand-off is continuous), GPS
+// MSL altitude as a last-resort reference. 1 = baro only, 2 = ToF only.
+// The arbiter output feeds telemetry and the nav scaffold; the flight
+// altitude-hold controller keeps its proven direct-ToF path unchanged.
+// =============================================================================
+std::atomic<bool> gTofMedianEnable{true};
+std::atomic<uint8_t> gAltSourceCfg{0};        // 0 auto, 1 baro only, 2 tof only
+std::atomic<uint8_t> gBaroZeroSamplesLeft{0}; // >0: pollBmp is averaging a re-zero
+std::atomic<float> gAltUnifiedM{0.0f};
+std::atomic<uint8_t> gAltUnifiedSrc{0};       // 0 none, 1 tof, 2 baro, 3 gps
+
 // [ACCEL CAL 6] six-position calibrator. The calibrator object is guarded by
 // gFlightMux (its methods are a few flops); the flight task ticks it, the web
 // task drives session/capture/finish. gAccelCal6Active gates the per-tick
@@ -4917,6 +4933,38 @@ void pollBmp(uint32_t nowMs) {
     return;
   }
 
+  // [BARO ZERO] web-requested ground re-reference: average N fresh samples
+  // then commit as the new ground pressure + persist. Runs here because the
+  // sensor task owns the baro; the webserver only sets the counter.
+  {
+    const uint8_t left = gBaroZeroSamplesLeft.load(std::memory_order_relaxed);
+    if (left > 0U) {
+      static float zeroSumPa = 0.0f;
+      static uint8_t zeroCount = 0;
+      zeroSumPa += pressurePa;
+      ++zeroCount;
+      gBaroZeroSamplesLeft.store(static_cast<uint8_t>(left - 1U), std::memory_order_relaxed);
+      if (left == 1U) {
+        const float ground = zeroSumPa / static_cast<float>(zeroCount);
+        zeroSumPa = 0.0f;
+        zeroCount = 0;
+        portENTER_CRITICAL(&gSensorMux);
+        gState.baro.groundPressurePa = ground;
+        gState.baro.emaRelativeAltM = 0.0f;
+        portEXIT_CRITICAL(&gSensorMux);
+        gCal.baro_ground_pa.store(ground, std::memory_order_relaxed);
+        gCal.baro_valid.store(true, std::memory_order_relaxed);
+        fcu_nvs::FcuPidNvs::BaroGround bg;
+        bg.pressure_pa = ground;
+        bg.valid = true;
+        const bool saved = gPidNvs.ready() && gPidNvs.saveBaroGround(bg);
+        fcu_log::logf(fcu_log::Level::Info,
+                      "[BARO] altitude zeroed: ground=%.1fPa (avg of %u) saved=%u\n",
+                      static_cast<double>(ground), 10U, static_cast<unsigned>(saved));
+      }
+    }
+  }
+
   const float relativeAltM =
       44330.0f * (1.0f - powf(pressurePa / gState.baro.groundPressurePa, 0.19029495f));
   if (!isfinite(relativeAltM) || fabsf(relativeAltM) > 1000.0f) {
@@ -5048,6 +5096,32 @@ void pollTof(uint32_t nowMs) {
     return;
   }
   (void)gTof.VL53L1X_ClearInterrupt();
+
+  // [TOF MEDIAN] optional 5-tap median pre-filter (tof_median_filter config).
+  // Kills single-sample glints/glitches before the EMA+spike-reject filter;
+  // adds two sample periods (~100 ms) of latency, so it is a config choice.
+  if (rangeStatus == 0U && gTofMedianEnable.load(std::memory_order_relaxed)) {
+    static uint16_t ring[5] = {0};
+    static uint8_t fill = 0, idx = 0;
+    ring[idx] = distance;
+    idx = (idx + 1) % 5;
+    if (fill < 5) ++fill;
+    if (fill == 5) {
+      uint16_t s[5];
+      memcpy(s, ring, sizeof(s));
+      // 5-element insertion sort; median = s[2]
+      for (int i = 1; i < 5; ++i) {
+        const uint16_t v = s[i];
+        int j = i - 1;
+        while (j >= 0 && s[j] > v) {
+          s[j + 1] = s[j];
+          --j;
+        }
+        s[j + 1] = v;
+      }
+      distance = s[2];
+    }
+  }
 
   // Always record the raw distance for diagnostics. Whether we trust it is up
   // to the filter, which the flight task reads.
@@ -5856,6 +5930,57 @@ uint8_t estimateBatteryPercent4s(float packVolts) {
     }
   }
   return 0xFF;
+}
+
+// [ALT SOURCES] unified-altitude arbiter — see the block comment at the
+// atomics. Runs on the sensor task after the baro/ToF/GPS polls.
+void updateAltitudeArbiter(uint32_t nowMs) {
+  (void)nowMs;
+  const uint8_t cfg = gAltSourceCfg.load(std::memory_order_relaxed);
+  bool tofOk = false, baroOk = false, gpsFix = false;
+  uint16_t tofMm = 0;
+  float baroM = 0.0f, gpsAltM = 0.0f;
+  portENTER_CRITICAL(&gSensorMux);
+  tofOk = gState.tof.ready && gState.tof.ranging;
+  tofMm = gState.tof.distanceMm;
+  baroOk = gState.baro.ready && gState.baro.valid;
+  baroM = gState.baro.relativeAltM;
+  gpsFix = gState.gps.hasFix;
+  gpsAltM = static_cast<float>(gState.gps.altDm) * 0.1f;
+  portEXIT_CRITICAL(&gSensorMux);
+
+  const bool tofUsable = tofOk && tofMm >= 30U && tofMm <= 3500U;
+  const float tofM = static_cast<float>(tofMm) * 0.001f;
+  // Slow EMA of (baro − ToF) while both agree, so the ToF→baro hand-off is
+  // continuous instead of stepping by the ground-zero mismatch.
+  static float tofBaroOffsetM = 0.0f;
+  static bool offsetInit = false;
+
+  uint8_t src = 0;
+  float alt = 0.0f;
+  if (cfg == 2U) {  // ToF only
+    if (tofUsable) { src = 1; alt = tofM; }
+  } else if (cfg == 1U) {  // baro only
+    if (baroOk) { src = 2; alt = baroM; }
+  } else {  // auto: ToF near ground > rebased baro > GPS reference
+    if (tofUsable) {
+      src = 1;
+      alt = tofM;
+      if (baroOk) {
+        const float off = baroM - tofM;
+        tofBaroOffsetM = offsetInit ? (0.95f * tofBaroOffsetM + 0.05f * off) : off;
+        offsetInit = true;
+      }
+    } else if (baroOk) {
+      src = 2;
+      alt = baroM - (offsetInit ? tofBaroOffsetM : 0.0f);
+    } else if (gpsFix) {
+      src = 3;          // absolute MSL — reference only, noted in the UI
+      alt = gpsAltM;
+    }
+  }
+  gAltUnifiedM.store(alt, std::memory_order_relaxed);
+  gAltUnifiedSrc.store(src, std::memory_order_relaxed);
 }
 
 // [BATTERY MODULE] — declared in include/battery_module.h
@@ -6960,6 +7085,12 @@ void fcuConfigGroupChanged(uint8_t group) {
       gMagAlign.store(static_cast<uint8_t>(fcuCfgReadByName("mag_align", 0.0f)),
                       std::memory_order_relaxed);
       break;
+    case fcu_config::GROUP_ALT:
+      gAltSourceCfg.store(static_cast<uint8_t>(fcuCfgReadByName("alt_source", 0.0f)),
+                          std::memory_order_relaxed);
+      gTofMedianEnable.store(fcuCfgReadByName("tof_median_filter", 1.0f) > 0.5f,
+                             std::memory_order_relaxed);
+      break;
     case fcu_config::GROUP_NAV:
       refreshArmingConfigCache();  // nav quality gates live in the arming cache
       break;
@@ -7674,6 +7805,8 @@ void pidWebGetDash(pid_webserver::DashTelemetry& d) {
   d.tofAgeMs = ageMsSafe(now, tofMs);
   d.gpsAgeMs = ageMsSafe(now, gpsMs);
   d.gpsRmcAgeMs = ageMsSafe(now, gpsRmcMs);
+  d.altUnifiedM = gAltUnifiedM.load(std::memory_order_relaxed);
+  d.altUnifiedSrc = gAltUnifiedSrc.load(std::memory_order_relaxed);
 
   // ---- Home (RTH) + distance/bearing from the current fix -------------------
   // Equirectangular approximation, adequate at RTH ranges (<< 10 km): scale
@@ -7757,6 +7890,18 @@ void pidWebGetDash(pid_webserver::DashTelemetry& d) {
   d.panTargetUs = gCameraGimbal.panTargetMicros();
   d.tiltTargetUs = gCameraGimbal.tiltTargetMicros();
 #endif
+}
+
+// ---- Baro zero (altitude re-reference) ---------------------------------------
+bool pidWebBaroZero() {
+  if (!pidWebWriteSafe()) return false;
+  bool baroOk = false;
+  portENTER_CRITICAL(&gSensorMux);
+  baroOk = gState.baro.ready;
+  portEXIT_CRITICAL(&gSensorMux);
+  if (!baroOk) return false;
+  gBaroZeroSamplesLeft.store(10, std::memory_order_relaxed);  // ~10 polls averaged
+  return true;
 }
 
 // ---- Compass calibration wizard callbacks ------------------------------------
@@ -8589,6 +8734,7 @@ pid_webserver::Callbacks buildConfiguratorCallbacks() {
   cbs.finishMagCalibration = pidWebFinishMagCalibration;
   cbs.cancelMagCalibration = pidWebCancelMagCalibration;
   cbs.getMagCal = pidWebGetMagCal;
+  cbs.baroZero = pidWebBaroZero;
   cbs.getMagConfig = pidWebGetMagConfig;
   cbs.setMagConfig = pidWebSetMagConfig;
   cbs.saveMagConfigToNvs = pidWebSaveMagConfigToNvs;
@@ -13038,6 +13184,7 @@ void sensorTask(void* /*arg*/) {
 #endif
     emitPiTelemetry(nowMs);   // FCU -> Pi: GPS + FCU_STATE @ ~5 Hz, self-throttled
     pollBattery(nowMs);
+    updateAltitudeArbiter(nowMs);     // unified altitude (ToF > baro > GPS)
     updateFlightStateMachine(nowMs);  // observer-mode FSM, ~50 Hz
     updateArmingDisableFlags(nowMs);  // central "why can't I arm" bitmask
     // [LED] Pick the desired continuous pattern then advance the blinker.
@@ -13359,6 +13506,10 @@ void setup() {
   refreshFilterConfigCache();  // stage the gyro/accel/setpoint filter chain
   gMagAlign.store(static_cast<uint8_t>(fcuCfgReadByName("mag_align", 0.0f)),
                   std::memory_order_relaxed);
+  gAltSourceCfg.store(static_cast<uint8_t>(fcuCfgReadByName("alt_source", 0.0f)),
+                      std::memory_order_relaxed);
+  gTofMedianEnable.store(fcuCfgReadByName("tof_median_filter", 1.0f) > 0.5f,
+                         std::memory_order_relaxed);
   initNrfStatusLeds();
 
   // ---- Nav status LED (4 blinks on first GPS fix and on origin lock) ------

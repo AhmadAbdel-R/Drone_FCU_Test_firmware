@@ -499,6 +499,22 @@ canvas{display:block;width:100%;background:#0a0d12;border-radius:8px;border:1px 
    </div>
    <div id="mc_warn"></div>
   </div>
+  <div class="card span2" style="margin-bottom:12px"><h3>Altitude sources <span class="tag" id="al_tag">--</span></h3>
+   <div style="display:flex;gap:16px;flex-wrap:wrap">
+    <div style="flex:1;min-width:220px" id="al_baro"></div>
+    <div style="flex:1;min-width:220px" id="al_tof"></div>
+   </div>
+   <div class="btns" style="margin-top:10px">
+    <button class="btn pri" onclick="act('/api/baro/zero','Zeroing altitude (averaging 10 samples)…')">Zero altitude here</button>
+    <label class="dim small" style="display:flex;align-items:center;gap:6px">Priority
+     <select id="al_src" onchange="alSaveCfg()"><option value="0">Auto (ToF &gt; baro &gt; GPS)</option><option value="1">Baro only</option><option value="2">Rangefinder only</option></select></label>
+    <label class="dim small" style="display:flex;align-items:center;gap:6px">
+     <input type="checkbox" id="al_med" onchange="alSaveCfg()" style="width:16px;height:16px"> ToF median filter</label>
+   </div>
+   <div class="note">Unified altitude feeds telemetry and the navigation scaffold; the flight altitude-hold
+    controller keeps its proven direct-ToF path. GPS altitude is absolute MSL and used as a reference only.
+    Baro temperature-drift compensation is not implemented yet — re-zero after large temperature changes.</div>
+  </div>
   <div class="card"><h3>Detected subsystems</h3>
    <table><thead><tr><th>Device</th><th>Bus</th><th>State</th><th>Value</th><th>Age</th></tr></thead>
     <tbody id="sens_tbody"></tbody></table>
@@ -1482,6 +1498,37 @@ async function capClear(){if(confirm('Clear diagnostic capture?')&&await act('/a
 function capDownload(){window.location.href='/api/capture.csv';}
 STAGE.capture=()=>{capPoll();if(!capTimer)capTimer=setInterval(()=>{if(activeTab==='capture')capPoll();else{clearInterval(capTimer);capTimer=null;}},500);};
 (function(){const prev=window.onRender;window.onRender=m=>{if(prev)prev(m);if(activeTab==='vibe')renderVibe(m);if(activeTab==='pid')renderYawCard(m);};})();
+// ===== Altitude sources card (Sensors tab) ===================================
+let alCfgLoaded=false;
+async function alLoadCfg(){
+ try{const r=await fetch('/api/config');if(!r.ok)return;const j=await r.json();
+  const map={};(j.params||[]).forEach(p=>map[p.n]=p.v);
+  document.getElementById('al_src').value=map.alt_source??0;
+  document.getElementById('al_med').checked=(map.tof_median_filter??1)>0.5;
+  alCfgLoaded=true;
+ }catch(e){}
+}
+function alSaveCfg(){
+ act('/api/config','Altitude source config saved',{alt_source:+document.getElementById('al_src').value,
+  tof_median_filter:document.getElementById('al_med').checked?1:0});
+}
+function renderAltCard(m){
+ const sen=m.sen,alt=sen.alt||{m:0,src:0};
+ const srcNames=['none','rangefinder','baro','GPS (MSL ref)'];
+ const tag=document.getElementById('al_tag');if(!tag)return;
+ tag.textContent=f(alt.m,2)+' m · '+srcNames[alt.src];
+ tag.className='tag '+(alt.src?'ok':'err');
+ document.getElementById('al_baro').innerHTML='<div class="dim small" style="margin-bottom:4px">BAROMETER</div>'
+  +kv('Status',(sen.baro.v?led('ok'):led('err'))+(sen.baro.v?'healthy':'invalid'))
+  +kv('Altitude',f(sen.baro.alt,2)+' m')+kv('Pressure',f(sen.baro.pa,0)+' Pa')
+  +kv('Temperature',f(sen.baro.t,1)+' °C')+kv('Age',ageTxt(sen.baro.age));
+ document.getElementById('al_tof').innerHTML='<div class="dim small" style="margin-bottom:4px">RANGEFINDER (ToF)</div>'
+  +kv('Status',(sen.tof.comp?(sen.tof.rng?led('ok'):led('warn')):led('grey'))+(sen.tof.comp?(sen.tof.rng?'ranging':'not ranging'):'not compiled'))
+  +kv('Distance',sen.tof.rng?sen.tof.mm+' mm':'--')+kv('Age',ageTxt(sen.tof.age))
+  +kv('Usable band','0.03 – 3.5 m');
+}
+(function(){const prev=STAGE.sensors;STAGE.sensors=()=>{if(prev)prev();if(!alCfgLoaded)alLoadCfg();};})();
+(function(){const prev=window.onRender;window.onRender=m=>{if(prev)prev(m);if(activeTab==='sensors')renderAltCard(m);};})();
 // ===== Compass calibration wizard (Sensors tab) ==============================
 let mcTimer=null,mcAlignTouched=false;
 async function mcPoll(){

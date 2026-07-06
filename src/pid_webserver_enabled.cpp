@@ -533,6 +533,7 @@ int formatDashJson(char* out, size_t cap, const DashTelemetry& d,
       d.modeActiveMask, d.modeAssignedMask, d.killSwitchActive ? 1 : 0);
   j.f(",\"sen\":{\"baro\":{\"r\":%d,\"v\":%d,\"pa\":%.1f,\"alt\":%.2f,\"t\":%.1f,\"age\":%lu},"
       "\"tof\":{\"comp\":%d,\"r\":%d,\"rng\":%d,\"mm\":%u,\"age\":%lu},"
+      "\"alt\":{\"m\":%.2f,\"src\":%u},"
       "\"gps\":{\"comp\":%d,\"r\":%d,\"fix\":%d,\"sats\":%u,\"q\":%u,\"hdop\":%.1f,\"hdv\":%d,"
       "\"lat\":%ld,\"lon\":%ld,\"age\":%lu,"
       "\"home\":{\"set\":%d,\"lat\":%ld,\"lon\":%ld,\"dist\":%.1f,\"brg\":%.1f},"
@@ -547,7 +548,9 @@ int formatDashJson(char* out, size_t cap, const DashTelemetry& d,
       "\"mi\":%.1f,\"gps\":[%lu,%lu],\"mag\":[%lu,%lu],\"drop\":%lu}}",
       d.baroReady ? 1 : 0, d.baroValid ? 1 : 0, jf(d.baroPa), jf(d.baroAltM), jf(d.baroTempC),
       (unsigned long)d.baroAgeMs, d.tofCompiled ? 1 : 0, d.tofReady ? 1 : 0, d.tofRanging ? 1 : 0,
-      d.tofMm, (unsigned long)d.tofAgeMs, d.gpsCompiled ? 1 : 0, d.gpsReady ? 1 : 0, d.gpsFix ? 1 : 0,
+      d.tofMm, (unsigned long)d.tofAgeMs,
+      jf(d.altUnifiedM), d.altUnifiedSrc,
+      d.gpsCompiled ? 1 : 0, d.gpsReady ? 1 : 0, d.gpsFix ? 1 : 0,
       d.gpsSats, d.gpsFixQual, jf(d.gpsHdop), d.gpsHdopValid ? 1 : 0,
       (long)d.gpsLatE7, (long)d.gpsLonE7, (unsigned long)d.gpsAgeMs,
       d.homeSet ? 1 : 0, (long)d.homeLatE7, (long)d.homeLonE7,
@@ -1559,6 +1562,11 @@ esp_err_t handleMagCalCancel(httpd_req_t* req) {
   return sendJson(req, "{\"ok\":true,\"cancelled\":true}");
 }
 
+// POST /api/baro/zero — averaged ground re-reference (persisted).
+esp_err_t handleBaroZero(httpd_req_t* req) {
+  return doBoolAction(req, gCb.baroZero, "{\"ok\":true,\"zeroing\":true}");
+}
+
 // ============================================================================
 // Six-position accel calibration endpoints.
 // ============================================================================
@@ -1804,6 +1812,7 @@ bool startHttpServer() {
   registerUri(gServer, "/api/calibration/mag/start",  HTTP_POST, handleMagStart);
   registerUri(gServer, "/api/calibration/mag/finish", HTTP_POST, handleMagFinish);
   registerUri(gServer, "/api/calibration/mag/cancel", HTTP_POST, handleMagCalCancel);
+  registerUri(gServer, "/api/baro/zero",              HTTP_POST, handleBaroZero);
   // ---- Config registry (fcu_config) ----
   registerUri(gServer, "/api/config",           HTTP_GET,  handleGetConfig);
   registerUri(gServer, "/api/config",           HTTP_POST, handlePostConfig);

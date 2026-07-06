@@ -218,6 +218,8 @@ struct DashTelemetry {
   bool tofReady = false, tofRanging = false, tofCompiled = false;
   uint16_t tofMm = 0;
   uint32_t tofAgeMs = 0xFFFFFFFF;
+  float altUnifiedM = 0.0f;   // arbiter output (ToF > rebased baro > GPS)
+  uint8_t altUnifiedSrc = 0;  // 0 none 1 tof 2 baro 3 gps
   bool gpsReady = false, gpsFix = false, gpsCompiled = false;
   uint8_t gpsSats = 0, gpsFixQual = 0;
   int32_t gpsLatE7 = 0, gpsLonE7 = 0;
@@ -533,6 +535,8 @@ struct Callbacks {
   bool (*finishMagCalibration)() = nullptr;           // finish + persist mag capture
   bool (*cancelMagCalibration)() = nullptr;           // abandon without persisting
   void (*getMagCal)(MagCalStatus& s) = nullptr;       // live wizard status
+  // Re-reference baro altitude to the current ground (averaged; persisted).
+  bool (*baroZero)() = nullptr;
 
   // ---- Magnetometer heading trim (deg, added to the compass heading) --------
   // Constant residual/declination offset applied after a good hard-iron cal.
