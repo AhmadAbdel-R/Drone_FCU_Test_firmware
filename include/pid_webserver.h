@@ -328,6 +328,23 @@ struct SensorsLiveSnapshot {
   uint16_t loopHz = 0;
 };
 
+// Compass calibration live status (Sensors-tab wizard).
+struct MagCalStatus {
+  bool active = false;
+  bool targetExternal = true;
+  uint16_t samples = 0;
+  uint32_t elapsedMs = 0;
+  uint32_t windowMs = 30000;
+  float rangeUt[3] = {0, 0, 0};   // per-axis min/max span so far
+  uint8_t octantMask = 0;         // orientation coverage (8 sign-octants)
+  uint8_t pointCount = 0;         // valid sphere-plot points
+  int8_t pts[96][3] = {{0}};      // unit directions ×100
+  float fieldUt = 0.0f;           // live corrected field magnitude
+  bool calValid = false;          // a stored calibration is applied
+  uint8_t magAlign = 0;           // mounting-rotation enum
+  bool safe = false;
+};
+
 // Six-position accel calibration status (Attitude & Level tab wizard).
 struct AccelCalStatus {
   uint8_t state = 0;          // SixFaceAccelCalibrator::State
@@ -514,6 +531,8 @@ struct Callbacks {
   void (*getAccelCal)(AccelCalStatus& s) = nullptr;
   bool (*startMagCalibration)() = nullptr;            // begin mag min/max capture
   bool (*finishMagCalibration)() = nullptr;           // finish + persist mag capture
+  bool (*cancelMagCalibration)() = nullptr;           // abandon without persisting
+  void (*getMagCal)(MagCalStatus& s) = nullptr;       // live wizard status
 
   // ---- Magnetometer heading trim (deg, added to the compass heading) --------
   // Constant residual/declination offset applied after a good hard-iron cal.

@@ -1528,6 +1528,38 @@ esp_err_t handlePostModes(httpd_req_t* req) {
 }
 
 // ============================================================================
+// Compass calibration endpoints (wizard status + start/finish/cancel).
+// /api/calibration/mag/* are the spec'd routes; /api/mag/start|finish remain
+// as the older aliases used by the Config tab.
+// ============================================================================
+esp_err_t handleMagCalStatus(httpd_req_t* req) {
+  if (!gCb.getMagCal) return sendError(req, 500, "no_callback");
+  MagCalStatus s;
+  gCb.getMagCal(s);
+  static char body[2048];
+  JsonAppender j{body, sizeof(body), 0};
+  j.f("{\"active\":%s,\"external\":%s,\"samples\":%u,\"elapsedMs\":%lu,\"windowMs\":%lu,"
+      "\"range\":[%.1f,%.1f,%.1f],\"octants\":%u,\"fieldUt\":%.1f,\"calValid\":%s,"
+      "\"align\":%u,\"safe\":%s,\"pts\":[",
+      s.active ? "true" : "false", s.targetExternal ? "true" : "false", s.samples,
+      (unsigned long)s.elapsedMs, (unsigned long)s.windowMs,
+      jf(s.rangeUt[0]), jf(s.rangeUt[1]), jf(s.rangeUt[2]), s.octantMask,
+      jf(s.fieldUt), s.calValid ? "true" : "false", s.magAlign,
+      s.safe ? "true" : "false");
+  for (uint8_t i = 0; i < s.pointCount; ++i) {
+    j.f("%s[%d,%d,%d]", i ? "," : "", s.pts[i][0], s.pts[i][1], s.pts[i][2]);
+  }
+  j.f("]}");
+  return sendJson(req, body);
+}
+esp_err_t handleMagCalCancel(httpd_req_t* req) {
+  if (!gCb.cancelMagCalibration) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  (void)gCb.cancelMagCalibration();
+  return sendJson(req, "{\"ok\":true,\"cancelled\":true}");
+}
+
+// ============================================================================
 // Six-position accel calibration endpoints.
 // ============================================================================
 esp_err_t handleAccelCalStatus(httpd_req_t* req) {
@@ -1767,6 +1799,11 @@ bool startHttpServer() {
   registerUri(gServer, "/api/calibration/accel/capture-face", HTTP_POST, handleAccelCalCapture);
   registerUri(gServer, "/api/calibration/accel/finish",       HTTP_POST, handleAccelCalFinish);
   registerUri(gServer, "/api/calibration/accel/cancel",       HTTP_POST, handleAccelCalCancel);
+  // ---- Compass calibration wizard ----
+  registerUri(gServer, "/api/calibration/mag",        HTTP_GET,  handleMagCalStatus);
+  registerUri(gServer, "/api/calibration/mag/start",  HTTP_POST, handleMagStart);
+  registerUri(gServer, "/api/calibration/mag/finish", HTTP_POST, handleMagFinish);
+  registerUri(gServer, "/api/calibration/mag/cancel", HTTP_POST, handleMagCalCancel);
   // ---- Config registry (fcu_config) ----
   registerUri(gServer, "/api/config",           HTTP_GET,  handleGetConfig);
   registerUri(gServer, "/api/config",           HTTP_POST, handlePostConfig);

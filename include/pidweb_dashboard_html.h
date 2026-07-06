@@ -475,6 +475,30 @@ canvas{display:block;width:100%;background:#0a0d12;border-radius:8px;border:1px 
 
  <!-- ===== SENSORS ===== -->
  <section class="tab" id="t_sensors">
+  <div class="card span2" style="margin-bottom:12px"><h3>Compass calibration <span class="tag" id="mc_tag">idle</span></h3>
+   <div class="note">Timed hard-iron + scale capture on the <b>external MMC5603</b>. Start, then rotate the craft
+    through every orientation — yaw circles while level, nose-up, nose-down and on both sides. Finishing is refused
+    below 6/8 orientation coverage. Keep away from steel benches, chargers and powered ESCs; the battery should be
+    mounted in its flight position.</div>
+   <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start;margin-top:10px">
+    <canvas id="mc_sphere" height="180" style="width:420px;max-width:100%;flex:0 0 auto"></canvas>
+    <div style="flex:1;min-width:220px" id="mc_stats"></div>
+   </div>
+   <div style="height:10px;border-radius:6px;background:#0b0e13;overflow:hidden;margin-top:8px">
+    <div id="mc_prog" style="height:100%;width:0;background:#3fa9ff;transition:width .3s"></div>
+   </div>
+   <div class="btns" style="margin-top:10px">
+    <button class="btn pri" onclick="mcStart()">Start calibration</button>
+    <button class="btn" id="mc_finbtn" onclick="mcFinish()">Finish &amp; save</button>
+    <button class="btn danger" onclick="mcCancel()">Cancel</button>
+    <label class="dim small" style="display:flex;align-items:center;gap:6px;margin-left:8px">Window
+     <input type="number" id="mc_window" min="20" max="120" step="5" style="max-width:70px"> s
+     <button class="btn sm" onclick="mcSaveWindow()">Set</button></label>
+    <label class="dim small" style="display:flex;align-items:center;gap:6px;margin-left:8px">Alignment
+     <select id="mc_align" onchange="mcSaveAlign()"><option value="0">None</option><option value="1">CW 90°</option><option value="2">CW 180°</option><option value="3">CW 270°</option><option value="4">Flip</option><option value="5">Flip + CW 90°</option><option value="6">Flip + CW 180°</option><option value="7">Flip + CW 270°</option></select></label>
+   </div>
+   <div id="mc_warn"></div>
+  </div>
   <div class="card"><h3>Detected subsystems</h3>
    <table><thead><tr><th>Device</th><th>Bus</th><th>State</th><th>Value</th><th>Age</th></tr></thead>
     <tbody id="sens_tbody"></tbody></table>
@@ -1458,6 +1482,64 @@ async function capClear(){if(confirm('Clear diagnostic capture?')&&await act('/a
 function capDownload(){window.location.href='/api/capture.csv';}
 STAGE.capture=()=>{capPoll();if(!capTimer)capTimer=setInterval(()=>{if(activeTab==='capture')capPoll();else{clearInterval(capTimer);capTimer=null;}},500);};
 (function(){const prev=window.onRender;window.onRender=m=>{if(prev)prev(m);if(activeTab==='vibe')renderVibe(m);if(activeTab==='pid')renderYawCard(m);};})();
+// ===== Compass calibration wizard (Sensors tab) ==============================
+let mcTimer=null,mcAlignTouched=false;
+async function mcPoll(){
+ try{const r=await fetch('/api/calibration/mag');if(!r.ok)return;const s=await r.json();
+  const tag=document.getElementById('mc_tag');
+  tag.textContent=s.active?'CAPTURING':(s.calValid?'calibrated':'idle');
+  tag.className='tag '+(s.active?'warn':(s.calValid?'ok':''));
+  const cov=(s.octants||0),covN=cov.toString(2).split('1').length-1;
+  const remain=Math.max(0,((s.windowMs-(s.elapsedMs||0))/1000));
+  document.getElementById('mc_stats').innerHTML=
+   kv('Target',s.external?'external MMC5603':'onboard')
+  +kv('Samples',s.samples)
+  +kv('Coverage',covN+'/8 octants '+(covN>=6?'<span class="tag ok">OK</span>':'<span class="tag warn">rotate more</span>'))
+  +kv('Axis span (µT)',s.range.map(v=>f(v,0)).join(' / ')+' <span class="dim small">need ≥30 each</span>')
+  +kv('Field now',f(s.fieldUt,1)+' µT')
+  +(s.active?kv('Time left',f(remain,0)+' s'):'');
+  document.getElementById('mc_prog').style.width=
+   s.active?Math.min(100,(s.elapsedMs||0)/s.windowMs*100)+'%':'0';
+  const w=document.getElementById('mc_window');
+  if(document.activeElement!==w&&!w.value)w.value=Math.round(s.windowMs/1000);
+  const al=document.getElementById('mc_align');
+  if(!mcAlignTouched&&document.activeElement!==al)al.value=s.align;
+  document.getElementById('mc_finbtn').disabled=!s.active;
+  // warnings: unrealistic field / poor coverage
+  let warn='';
+  if(s.fieldUt>0&&(s.fieldUt<25||s.fieldUt>65))
+   warn+='<div class="warnbox">Field '+f(s.fieldUt,1)+' µT is outside the 25–65 µT earth range — check for nearby current wires, magnets, or a bad scale calibration.</div>';
+  if(s.active&&remain<5&&covN<6)
+   warn+='<div class="warnbox err">Coverage still '+covN+'/8 — keep rotating (nose up/down, knife edge) or Finish will be refused.</div>';
+  document.getElementById('mc_warn').innerHTML=warn;
+  mcDrawSphere(s.pts||[]);
+  if(s.active&&remain<=0){mcFinish();}  // window elapsed -> auto-finish
+ }catch(e){}
+}
+function mcDrawSphere(pts){
+ const cv=document.getElementById('mc_sphere');if(!cv)return;
+ const{ctx:x,W,H}=canvasCtx(cv);
+ // three orthographic projections: XY (top), XZ (front), YZ (side)
+ const panes=[['XY',0,1],['XZ',0,2],['YZ',1,2]];
+ const pw=W/3;
+ panes.forEach((p,i)=>{
+  const cx=pw*i+pw/2,cy=H/2,r=Math.min(pw,H)/2-14;
+  x.strokeStyle='#28303f';x.beginPath();x.arc(cx,cy,r,0,7);x.stroke();
+  x.fillStyle='#8a94a6';x.font='10px system-ui';x.textAlign='center';x.fillText(p[0],cx,12);
+  x.fillStyle='#3fa9ff';
+  pts.forEach(q=>{const a=q[p[1]]/100,b=q[p[2]]/100;
+   x.fillRect(cx+a*r-1.5,cy-b*r-1.5,3,3);});
+ });
+}
+async function mcStart(){if(await act('/api/calibration/mag/start','Rotate the craft through ALL orientations'))mcPoll();}
+async function mcFinish(){if(await act('/api/calibration/mag/finish','Compass calibration saved'))mcPoll();else mcPoll();}
+async function mcCancel(){if(await act('/api/calibration/mag/cancel','Cancelled'))mcPoll();}
+function mcSaveWindow(){const v=Math.max(20,Math.min(120,+document.getElementById('mc_window').value||30));
+ act('/api/config','Calibration window saved',{mag_cal_time_s:v});}
+function mcSaveAlign(){mcAlignTouched=true;
+ act('/api/config','Mag alignment saved — verify with the Setup compass test',{mag_align:+document.getElementById('mc_align').value});}
+(function(){const prev=STAGE.sensors;STAGE.sensors=()=>{if(prev)prev();mcPoll();
+ if(!mcTimer)mcTimer=setInterval(()=>{if(activeTab==='sensors')mcPoll();else{clearInterval(mcTimer);mcTimer=null;}},500);};})();
 // ===== Six-position accel calibration (Attitude & Level tab) =================
 const AC_FACES=['+X','-X','+Y','-Y','+Z','-Z'];
 const AC_STATES=['idle','waiting for stillness…','sampling…','face captured','face FAILED'];

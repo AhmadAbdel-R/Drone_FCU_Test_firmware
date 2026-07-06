@@ -2449,6 +2449,61 @@ LiveExtMagCal gExtCal;
 // Separate capture state machine for the external chip (the onboard chip uses
 // gMagCal). gExtMagCalActive routes raw external samples into gExtMagCal.
 gnc::MagHardIronCalibrator gExtMagCal;
+
+// =============================================================================
+// [MAG CAL COVERAGE] — orientation-coverage tracker + sphere-plot points for
+// the compass calibration page. Updated from the SAME context that feeds the
+// calibrator (sensorTask for the external mag); guarded by gSensorMux.
+//
+// Coverage model: subtract the provisional center (running min/max midpoint)
+// and bin the direction into the 8 sign-octants. A good capture — yaw sweeps
+// at multiple pitch/roll attitudes — visits nearly all octants; finishing is
+// refused below 6/8 so a flat single-plane spin can't lock a bad cal.
+// =============================================================================
+constexpr uint8_t kMagCovMaxPts = 96;
+struct MagCalCoverage {
+  uint8_t octantMask = 0;
+  uint16_t pointCount = 0;              // valid entries in pts[]
+  int8_t pts[kMagCovMaxPts][3];         // unit direction ×100 (sphere plot)
+  uint16_t decim = 0;
+  uint32_t startedMs = 0;
+  uint32_t windowMs = 30000;
+};
+MagCalCoverage gMagCov;
+
+inline uint8_t popcount8(uint8_t v) {
+  uint8_t c = 0;
+  while (v) {
+    v &= static_cast<uint8_t>(v - 1);
+    ++c;
+  }
+  return c;
+}
+
+// [MAG ALIGN] mounting-rotation enum for the EXTERNAL mag (mag_align param):
+// 0 none, 1..3 = CW90/180/270 about Z (viewed from above), 4..7 = FLIP
+// (180° about X: y,z negate) then CW0/90/180/270. Applied to the body-frame
+// vector BEFORE calibration capture and correction, so stored offsets are in
+// the aligned frame. Verify direction with the Setup-tab compass test.
+std::atomic<uint8_t> gMagAlign{0};
+
+inline void applyMagAlign(uint8_t align, float& x, float& y, float& z) {
+  if (align == 0 || align > 7) return;
+  if (align >= 4) {
+    y = -y;
+    z = -z;
+  }
+  const uint8_t rot = (align >= 4) ? (align - 4) : align;  // CW quarter-turns
+  float nx = x, ny = y;
+  switch (rot) {
+    case 1: nx = y;  ny = -x; break;   // CW90:  x'= y, y'=-x
+    case 2: nx = -x; ny = -y; break;   // CW180
+    case 3: nx = -y; ny = x;  break;   // CW270
+    default: break;
+  }
+  x = nx;
+  y = ny;
+}
 std::atomic<bool> gExtMagCalActive{false};
 #endif  // FCU_ENABLE_EXTERNAL_MAG
 
@@ -4527,13 +4582,36 @@ void pollExternalMag(uint32_t nowMs) {
   }
   // Remap the sensor axes into FCU body frame (own map; chip can be mounted
   // in any orientation). selectImuAxis picks one of x/y/z; sign flips it.
-  const float bx = EXTMAG_BODY_X_SIGN * selectImuAxis(EXTMAG_BODY_X_AXIS, rx, ry, rz);
-  const float by = EXTMAG_BODY_Y_SIGN * selectImuAxis(EXTMAG_BODY_Y_AXIS, rx, ry, rz);
-  const float bz = EXTMAG_BODY_Z_SIGN * selectImuAxis(EXTMAG_BODY_Z_AXIS, rx, ry, rz);
+  float bx = EXTMAG_BODY_X_SIGN * selectImuAxis(EXTMAG_BODY_X_AXIS, rx, ry, rz);
+  float by = EXTMAG_BODY_Y_SIGN * selectImuAxis(EXTMAG_BODY_Y_AXIS, rx, ry, rz);
+  float bz = EXTMAG_BODY_Z_SIGN * selectImuAxis(EXTMAG_BODY_Z_AXIS, rx, ry, rz);
+  // Runtime mounting alignment (mag_align) on top of the compile-time remap.
+  applyMagAlign(gMagAlign.load(std::memory_order_relaxed), bx, by, bz);
   // Feed RAW body samples to the calibrator while a capture is active (captured
   // offsets must be in the same body frame the corrected reads produce).
   if (gExtMagCalActive.load(std::memory_order_relaxed)) {
     gExtMagCal.addSample(bx, by, bz, nowMs);
+    // Coverage + sphere plot: provisional center = running min/max midpoint.
+    const auto& r = gExtMagCal.result();
+    const float cx0 = (r.min_uT.x + r.max_uT.x) * 0.5f;
+    const float cy0 = (r.min_uT.y + r.max_uT.y) * 0.5f;
+    const float cz0 = (r.min_uT.z + r.max_uT.z) * 0.5f;
+    const float vx = bx - cx0, vy = by - cy0, vz = bz - cz0;
+    const float n = sqrtf(vx * vx + vy * vy + vz * vz);
+    if (n > 5.0f) {  // ignore near-center noise before the span opens up
+      portENTER_CRITICAL(&gSensorMux);
+      gMagCov.octantMask |= static_cast<uint8_t>(
+          1U << ((vx > 0 ? 1 : 0) | (vy > 0 ? 2 : 0) | (vz > 0 ? 4 : 0)));
+      if (++gMagCov.decim >= 3) {  // ~store every 3rd sample
+        gMagCov.decim = 0;
+        const uint16_t idx = gMagCov.pointCount % kMagCovMaxPts;  // ring
+        gMagCov.pts[idx][0] = static_cast<int8_t>(vx / n * 100.0f);
+        gMagCov.pts[idx][1] = static_cast<int8_t>(vy / n * 100.0f);
+        gMagCov.pts[idx][2] = static_cast<int8_t>(vz / n * 100.0f);
+        if (gMagCov.pointCount < 0xFFFF) ++gMagCov.pointCount;
+      }
+      portEXIT_CRITICAL(&gSensorMux);
+    }
   }
   // Apply hard-iron + diagonal scale, then the 3x3 soft-iron matrix (identity
   // default ⇒ no-op until an ellipsoid fit fills it).
@@ -4579,29 +4657,77 @@ void pollExternalMag(uint32_t nowMs) {
 
 // Shared mag-capture start/finish — routed to the active source (external uses
 // gExtMagCal + the ExtMagCalibration NVS slot; onboard uses gMagCal + gCal).
+float fcuCfgReadByName(const char* name, float fallback);  // defined below
+
 bool magCaptureStart(uint32_t nowMs) {
+  // Timed calibration window from config (mag_cal_time_s, 20..120 s). The
+  // UI drives finish at window end; the calibrator's own hard timeout gets a
+  // +30 s grace so it can't self-abort under the operator's finish click.
+  const uint32_t windowMs = static_cast<uint32_t>(
+      constrain(fcuCfgReadByName("mag_cal_time_s", 30.0f), 20.0f, 120.0f) * 1000.0f);
+  gnc::MagHardIronCalibrator::Config cc;
+  cc.timeout_ms = windowMs + 30000U;
+  portENTER_CRITICAL(&gSensorMux);
+  gMagCov = MagCalCoverage{};
+  gMagCov.startedMs = nowMs;
+  gMagCov.windowMs = windowMs;
+  portEXIT_CRITICAL(&gSensorMux);
 #if FCU_ENABLE_EXTERNAL_MAG
   if (magCaptureTargetIsExternal()) {
-    gExtMagCal.configure({});
+    gExtMagCal.configure(cc);
     gExtMagCal.start(nowMs);
     gExtMagCalActive.store(true, std::memory_order_relaxed);
     fcu_log::logf(fcu_log::Level::Info,
-                  "[CAL][MAG] EXTERNAL capture STARTED — rotate the airframe through all axes\n");
+                  "[CAL][MAG] EXTERNAL capture STARTED (%lus window) — rotate through all axes\n",
+                  static_cast<unsigned long>(windowMs / 1000U));
     return true;
   }
 #endif
-  gMagCal.configure({});
+  gMagCal.configure(cc);
   gMagCal.start(nowMs);
   gMagCalActive.store(true, std::memory_order_relaxed);
   fcu_log::logf(fcu_log::Level::Info,
-                "[CAL][MAG] ONBOARD capture STARTED — rotate the airframe through all axes\n");
+                "[CAL][MAG] ONBOARD capture STARTED (%lus window) — rotate through all axes\n",
+                static_cast<unsigned long>(windowMs / 1000U));
   return true;
+}
+
+// Abandon whichever capture is active without touching the stored cal.
+bool magCaptureCancel() {
+  bool had = false;
+#if FCU_ENABLE_EXTERNAL_MAG
+  if (gExtMagCalActive.exchange(false, std::memory_order_relaxed)) {
+    gExtMagCal.cancel();
+    had = true;
+  }
+#endif
+  if (gMagCalActive.exchange(false, std::memory_order_relaxed)) {
+    gMagCal.cancel();
+    had = true;
+  }
+  if (had) fcu_log::logf(fcu_log::Level::Info, "[CAL][MAG] capture cancelled\n");
+  return had;
 }
 
 bool magCaptureFinish() {
 #if FCU_ENABLE_EXTERNAL_MAG
   if (gExtMagCalActive.load(std::memory_order_relaxed)) {
     gExtMagCalActive.store(false, std::memory_order_relaxed);
+    // Orientation-coverage gate: a flat single-plane spin sweeps a circle,
+    // not a sphere, and would lock a biased Z offset. Require >= 6 of the 8
+    // sign-octants before the min/max fit may persist.
+    uint8_t octants = 0;
+    portENTER_CRITICAL(&gSensorMux);
+    octants = gMagCov.octantMask;
+    portEXIT_CRITICAL(&gSensorMux);
+    if (popcount8(octants) < 6) {
+      gExtMagCal.cancel();
+      fcu_log::logf(fcu_log::Level::Warn,
+                    "[CAL][MAG] EXTERNAL capture REJECTED: coverage %u/8 octants — "
+                    "rotate through nose-up/down and knife-edge attitudes too\n",
+                    static_cast<unsigned>(popcount8(octants)));
+      return false;
+    }
     if (!gExtMagCal.finish()) {
       fcu_log::logf(fcu_log::Level::Warn,
                     "[CAL][MAG] EXTERNAL capture ABORTED samples=%u (need rotation through all axes)\n",
@@ -6830,6 +6956,10 @@ void fcuConfigGroupChanged(uint8_t group) {
     case fcu_config::GROUP_FILTER:
       refreshFilterConfigCache();
       break;
+    case fcu_config::GROUP_MAG:
+      gMagAlign.store(static_cast<uint8_t>(fcuCfgReadByName("mag_align", 0.0f)),
+                      std::memory_order_relaxed);
+      break;
     case fcu_config::GROUP_NAV:
       refreshArmingConfigCache();  // nav quality gates live in the arming cache
       break;
@@ -7629,6 +7759,45 @@ void pidWebGetDash(pid_webserver::DashTelemetry& d) {
 #endif
 }
 
+// ---- Compass calibration wizard callbacks ------------------------------------
+bool pidWebCancelMagCalibration() { return magCaptureCancel(); }
+
+void pidWebGetMagCal(pid_webserver::MagCalStatus& s) {
+  const uint32_t nowMs = millis();
+#if FCU_ENABLE_EXTERNAL_MAG
+  s.targetExternal = magCaptureTargetIsExternal();
+  s.active = gExtMagCalActive.load(std::memory_order_relaxed) ||
+             gMagCalActive.load(std::memory_order_relaxed);
+  const auto& r = s.targetExternal ? gExtMagCal.result() : gMagCal.result();
+#else
+  s.targetExternal = false;
+  s.active = gMagCalActive.load(std::memory_order_relaxed);
+  const auto& r = gMagCal.result();
+#endif
+  s.samples = r.samples;
+  s.rangeUt[0] = r.max_uT.x - r.min_uT.x;
+  s.rangeUt[1] = r.max_uT.y - r.min_uT.y;
+  s.rangeUt[2] = r.max_uT.z - r.min_uT.z;
+  portENTER_CRITICAL(&gSensorMux);
+  s.octantMask = gMagCov.octantMask;
+  s.elapsedMs = (gMagCov.startedMs != 0U) ? (nowMs - gMagCov.startedMs) : 0;
+  s.windowMs = gMagCov.windowMs;
+  const uint16_t n = (gMagCov.pointCount > kMagCovMaxPts) ? kMagCovMaxPts
+                                                          : gMagCov.pointCount;
+  s.pointCount = static_cast<uint8_t>(n);
+  memcpy(s.pts, gMagCov.pts, sizeof(int8_t) * 3 * n);
+  portEXIT_CRITICAL(&gSensorMux);
+#if FCU_ENABLE_EXTERNAL_MAG
+  s.fieldUt = gExtMag.field.load(std::memory_order_relaxed);
+  s.calValid = gExtCal.valid.load(std::memory_order_relaxed);
+#else
+  s.fieldUt = 0.0f;
+  s.calValid = gCal.mag_valid.load(std::memory_order_relaxed);
+#endif
+  s.magAlign = gMagAlign.load(std::memory_order_relaxed);
+  s.safe = pidWebWriteSafe();
+}
+
 // ---- Six-position accel calibration callbacks --------------------------------
 bool pidWebAccelCal6Start() {
   if (!pidWebWriteSafe()) return false;
@@ -8418,6 +8587,8 @@ pid_webserver::Callbacks buildConfiguratorCallbacks() {
   cbs.getAccelCal = pidWebGetAccelCal6;
   cbs.startMagCalibration = pidWebStartMagCalibration;
   cbs.finishMagCalibration = pidWebFinishMagCalibration;
+  cbs.cancelMagCalibration = pidWebCancelMagCalibration;
+  cbs.getMagCal = pidWebGetMagCal;
   cbs.getMagConfig = pidWebGetMagConfig;
   cbs.setMagConfig = pidWebSetMagConfig;
   cbs.saveMagConfigToNvs = pidWebSaveMagConfigToNvs;
@@ -13186,6 +13357,8 @@ void setup() {
   refreshMixerConfigCache();   // stage the custom mixer table for the flight task
   refreshModesConfigCache();   // aux-range mode slots for the CRSF task
   refreshFilterConfigCache();  // stage the gyro/accel/setpoint filter chain
+  gMagAlign.store(static_cast<uint8_t>(fcuCfgReadByName("mag_align", 0.0f)),
+                  std::memory_order_relaxed);
   initNrfStatusLeds();
 
   // ---- Nav status LED (4 blinks on first GPS fix and on origin lock) ------
