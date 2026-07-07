@@ -1568,6 +1568,65 @@ esp_err_t handleBaroZero(httpd_req_t* req) {
 }
 
 // ============================================================================
+// Blackbox flight-log endpoints.
+// ============================================================================
+esp_err_t handleGetBlackbox(httpd_req_t* req) {
+  if (!gCb.getBlackbox) return sendError(req, 500, "no_callback");
+  BlackboxStatus s;
+  gCb.getBlackbox(s);
+  char body[256];
+  const int n = snprintf(body, sizeof(body),
+      "{\"enabled\":%s,\"recording\":%s,\"allocated\":%s,\"manual\":%s,"
+      "\"records\":%u,\"capacity\":%u,\"rateHz\":%u}",
+      s.enabled ? "true" : "false", s.recording ? "true" : "false",
+      s.allocated ? "true" : "false", s.manual ? "true" : "false",
+      s.records, s.capacity, s.rateHz);
+  if (n < 0 || n >= (int)sizeof(body)) return sendError(req, 500, "fmt");
+  return sendJson(req, body);
+}
+esp_err_t handleBbStart(httpd_req_t* req) {
+  if (!gCb.bbStart) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  if (!gCb.bbStart()) return sendError(req, 500, "alloc_failed");
+  return sendJson(req, "{\"ok\":true,\"recording\":true}");
+}
+esp_err_t handleBbStop(httpd_req_t* req) {
+  if (!gCb.bbStop) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  (void)gCb.bbStop();
+  return sendJson(req, "{\"ok\":true}");
+}
+esp_err_t handleBbClear(httpd_req_t* req) {
+  if (!gCb.bbClear) return sendError(req, 500, "no_callback");
+  if (!authorized(req)) return sendError(req, 401, "unauthorized");
+  if (!gCb.bbClear()) return sendError(req, 409, "recording_active");
+  return sendJson(req, "{\"ok\":true,\"cleared\":true}");
+}
+esp_err_t handleBbCsv(httpd_req_t* req) {
+  if (!gCb.bbCsvChunk || !gCb.getBlackbox) return sendError(req, 500, "no_callback");
+  BlackboxStatus s;
+  gCb.getBlackbox(s);
+  if (s.recording) return sendError(req, 409, "recording_active");
+  httpd_resp_set_type(req, "text/csv; charset=utf-8");
+  httpd_resp_set_hdr(req, "Content-Disposition",
+                     "attachment; filename=\"fcu_blackbox.csv\"");
+  static char chunk[2048];
+  uint32_t cursor = 0;
+  for (uint16_t guard = 0; guard < 2048; ++guard) {
+    uint32_t next = 0;
+    const uint32_t n = gCb.bbCsvChunk(cursor, chunk, sizeof(chunk), next);
+    if (n > 0U) {
+      const esp_err_t err = httpd_resp_send_chunk(req, chunk, n);
+      if (err != ESP_OK) return err;
+    }
+    if (next == 0U) break;
+    if (n == 0U && next == cursor) break;
+    cursor = next;
+  }
+  return httpd_resp_send_chunk(req, nullptr, 0);
+}
+
+// ============================================================================
 // Six-position accel calibration endpoints.
 // ============================================================================
 esp_err_t handleAccelCalStatus(httpd_req_t* req) {
@@ -1813,6 +1872,12 @@ bool startHttpServer() {
   registerUri(gServer, "/api/calibration/mag/finish", HTTP_POST, handleMagFinish);
   registerUri(gServer, "/api/calibration/mag/cancel", HTTP_POST, handleMagCalCancel);
   registerUri(gServer, "/api/baro/zero",              HTTP_POST, handleBaroZero);
+  // ---- Blackbox flight log ----
+  registerUri(gServer, "/api/blackbox",        HTTP_GET,  handleGetBlackbox);
+  registerUri(gServer, "/api/blackbox/start",  HTTP_POST, handleBbStart);
+  registerUri(gServer, "/api/blackbox/stop",   HTTP_POST, handleBbStop);
+  registerUri(gServer, "/api/blackbox/clear",  HTTP_POST, handleBbClear);
+  registerUri(gServer, "/api/blackbox.csv",    HTTP_GET,  handleBbCsv);
   // ---- Config registry (fcu_config) ----
   registerUri(gServer, "/api/config",           HTTP_GET,  handleGetConfig);
   registerUri(gServer, "/api/config",           HTTP_POST, handlePostConfig);

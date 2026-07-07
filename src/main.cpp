@@ -118,6 +118,7 @@
 #include "arming_flags.h"   // central arming-disable bitmask (flags + names)
 #include "gps_ublox.h"      // clean-room UBX config frame builders (GPS page)
 #include "flight_filters.h" // modular PT1/biquad gyro+accel+setpoint chains
+#include "blackbox_log.h"   // in-RAM flight log ring + CSV download
 #include "DynamicNotchFilter.h"
 #include "notch_analysis.h"
 #include "diag_capture.h"
@@ -6743,6 +6744,37 @@ void refreshModesConfigCache() {
 // the pending copy + dirty flag (same hand-off as the notch/mixer configs).
 // The D-term LPF rides the existing PID configure path instead (gDtermLpfHz).
 // =============================================================================
+// =============================================================================
+// [BLACKBOX] — in-RAM flight log (blackbox_log.h). Recording gate, evaluated
+// by the flight task each tick:
+//   manual web start  OR  (bb_enable && motors active)  OR
+//   (a BLACKBOX mode slot is assigned && active)
+// The ring keeps the most recent ~capacity/rate seconds; disarm stops
+// recording but keeps the data for download (incident tail).
+// =============================================================================
+bb::BlackboxLog gBlackbox;
+constexpr uint16_t kBlackboxCapacity = 750;  // ~44 kB heap; 15 s @ 50 Hz
+// Nav scaffold error code (the POSHOLD scaffold writes it; logged per record).
+std::atomic<uint8_t> gNavErrorCode{0};
+std::atomic<bool> gBbEnable{false};
+std::atomic<uint16_t> gBbRateHz{50};
+std::atomic<bool> gBbManual{false};     // web start/stop override
+std::atomic<bool> gBbRecording{false};  // live status (flight task writes)
+
+void refreshBlackboxConfigCache() {
+  gBbEnable.store(fcuCfgReadByName("bb_enable", 0.0f) > 0.5f, std::memory_order_relaxed);
+  gBbRateHz.store(static_cast<uint16_t>(
+                      constrain(fcuCfgReadByName("bb_rate_hz", 50.0f), 10.0f, 250.0f)),
+                  std::memory_order_relaxed);
+  // Allocate here (webserver/loop context) so the flight task never mallocs.
+  if (gBbEnable.load(std::memory_order_relaxed) && !gBlackbox.allocated()) {
+    if (!gBlackbox.begin(kBlackboxCapacity)) {
+      fcu_log::logf(fcu_log::Level::Error, "[BB] ring alloc failed (%u records)\n",
+                    kBlackboxCapacity);
+    }
+  }
+}
+
 struct FilterStagedCfg {
   flt::GyroChainConfig gyro;
   flt::AccelChainConfig accel;
@@ -7090,6 +7122,9 @@ void fcuConfigGroupChanged(uint8_t group) {
                           std::memory_order_relaxed);
       gTofMedianEnable.store(fcuCfgReadByName("tof_median_filter", 1.0f) > 0.5f,
                              std::memory_order_relaxed);
+      break;
+    case fcu_config::GROUP_BLACKBOX:
+      refreshBlackboxConfigCache();
       break;
     case fcu_config::GROUP_NAV:
       refreshArmingConfigCache();  // nav quality gates live in the arming cache
@@ -7890,6 +7925,46 @@ void pidWebGetDash(pid_webserver::DashTelemetry& d) {
   d.panTargetUs = gCameraGimbal.panTargetMicros();
   d.tiltTargetUs = gCameraGimbal.tiltTargetMicros();
 #endif
+}
+
+// ---- Blackbox callbacks --------------------------------------------------------
+void pidWebGetBlackbox(pid_webserver::BlackboxStatus& s) {
+  s.enabled = gBbEnable.load(std::memory_order_relaxed);
+  s.recording = gBbRecording.load(std::memory_order_relaxed);
+  s.allocated = gBlackbox.allocated();
+  s.manual = gBbManual.load(std::memory_order_relaxed);
+  s.records = gBlackbox.count();
+  s.capacity = gBlackbox.capacity();
+  s.rateHz = gBbRateHz.load(std::memory_order_relaxed);
+}
+
+bool pidWebBbStart() {
+  if (!gBlackbox.allocated() && !gBlackbox.begin(kBlackboxCapacity)) {
+    fcu_log::logf(fcu_log::Level::Error, "[BB] ring alloc failed\n");
+    return false;
+  }
+  gBbManual.store(true, std::memory_order_relaxed);
+  return true;
+}
+
+bool pidWebBbStop() {
+  gBbManual.store(false, std::memory_order_relaxed);
+  return true;
+}
+
+bool pidWebBbClear() {
+  if (gBbRecording.load(std::memory_order_relaxed)) return false;  // producer live
+  gBlackbox.clear();
+  return true;
+}
+
+uint32_t pidWebBbCsvChunk(uint32_t cursor, char* buf, uint32_t maxLen,
+                          uint32_t& nextCursor) {
+  if (gBbRecording.load(std::memory_order_relaxed)) {
+    nextCursor = 0;  // never stream while the flight task writes the ring
+    return 0;
+  }
+  return gBlackbox.csvChunk(cursor, buf, maxLen, nextCursor);
 }
 
 // ---- Baro zero (altitude re-reference) ---------------------------------------
@@ -8735,6 +8810,11 @@ pid_webserver::Callbacks buildConfiguratorCallbacks() {
   cbs.cancelMagCalibration = pidWebCancelMagCalibration;
   cbs.getMagCal = pidWebGetMagCal;
   cbs.baroZero = pidWebBaroZero;
+  cbs.getBlackbox = pidWebGetBlackbox;
+  cbs.bbStart = pidWebBbStart;
+  cbs.bbStop = pidWebBbStop;
+  cbs.bbClear = pidWebBbClear;
+  cbs.bbCsvChunk = pidWebBbCsvChunk;
   cbs.getMagConfig = pidWebGetMagConfig;
   cbs.setMagConfig = pidWebSetMagConfig;
   cbs.saveMagConfigToNvs = pidWebSaveMagConfigToNvs;
@@ -13060,6 +13140,70 @@ static inline void flightLoopPace(TickType_t& lastWake, TickType_t period) {
   }
 }
 
+// =============================================================================
+// [BLACKBOX] flight-task recorder. Runs after updateControlLoop each tick;
+// decimates to bb_rate_hz and assembles one compact record. Flight-task-owned
+// fields (pid/attitude/motors) are read directly; slow sensors ride atomics or
+// one short sensor-mux section. The ring is pre-allocated from the web/loop
+// context — this function never allocates.
+// =============================================================================
+void serviceBlackbox(uint32_t nowMs) {
+  const uint16_t assigned = gModeAssignedFuncs.load(std::memory_order_relaxed);
+  const uint16_t active = gModeActiveMask.load(std::memory_order_relaxed);
+  const bool modeGate = (assigned & (1U << MODE_BLACKBOX)) &&
+                        (active & (1U << MODE_BLACKBOX));
+  const bool flying =
+      anyMotorOutputActive(gState.motorRaw) || gState.pid.armedIdleActive;
+  bool rec = gBbManual.load(std::memory_order_relaxed) ||
+             (gBbEnable.load(std::memory_order_relaxed) && flying) || modeGate;
+  if (rec && !gBlackbox.allocated()) rec = false;  // alloc failed / not yet done
+  gBbRecording.store(rec, std::memory_order_relaxed);
+  if (!rec) return;
+
+  static uint32_t sNextDueMs = 0;
+  const uint16_t rate = gBbRateHz.load(std::memory_order_relaxed);
+  const uint32_t periodMs = 1000U / ((rate == 0U) ? 50U : rate);
+  if (static_cast<int32_t>(nowMs - sNextDueMs) < 0) return;
+  sNextDueMs = nowMs + periodMs;
+
+  auto i16 = [](float v) {
+    return static_cast<int16_t>(constrain(v, -32000.0f, 32000.0f));
+  };
+  bb::Record r = {};
+  r.tMs = nowMs;
+  r.dtUs = static_cast<uint16_t>((gState.pid.lastDtUs > 0xFFFFU) ? 0xFFFFU
+                                                                 : gState.pid.lastDtUs);
+  for (int i = 0; i < 3; ++i) {
+    r.gyroRaw[i] = i16(gState.pid.gyroPreFilterDps[i] * 10.0f);
+    r.gyroFilt[i] = i16(gState.pid.gyroPidDps[i] * 10.0f);
+  }
+  r.accel[0] = i16(gState.imuSample.ax_g * 1000.0f);
+  r.accel[1] = i16(gState.imuSample.ay_g * 1000.0f);
+  r.accel[2] = i16(gState.imuSample.az_g * 1000.0f);
+  r.att[0] = i16(gState.attitude.rollDeg * 100.0f);
+  r.att[1] = i16(gState.attitude.pitchDeg * 100.0f);
+  r.att[2] = i16(gState.attitude.yawDeg * 100.0f);
+  r.pidOut[0] = i16(gState.pid.rollTerms.output * 10.0f);
+  r.pidOut[1] = i16(gState.pid.pitchTerms.output * 10.0f);
+  r.pidOut[2] = i16(gState.pid.yawTerms.output * 10.0f);
+  for (int i = 0; i < 4; ++i) r.motor[i] = gState.motorRaw[static_cast<size_t>(i)];
+  r.throttlePct = static_cast<uint8_t>(constrain(gState.pid.smoothedThrottlePct, 0.0f, 100.0f));
+  r.mode = gActiveFlightMode.load(std::memory_order_relaxed);
+  r.armFlags = gArmingDisableFlags.load(std::memory_order_relaxed);
+#if FCU_ENABLE_EXTERNAL_MAG
+  r.magFieldUt10 = static_cast<uint16_t>(
+      constrain(gExtMag.field.load(std::memory_order_relaxed) * 10.0f, 0.0f, 65000.0f));
+#endif
+  portENTER_CRITICAL(&gSensorMux);
+  r.gpsSats = gState.gps.satellites;
+  r.gpsFixQ = gState.gps.fixQuality;
+  portEXIT_CRITICAL(&gSensorMux);
+  r.altCm = i16(gAltUnifiedM.load(std::memory_order_relaxed) * 100.0f);
+  r.altSrc = gAltUnifiedSrc.load(std::memory_order_relaxed);
+  r.navErr = gNavErrorCode.load(std::memory_order_relaxed);
+  gBlackbox.record(r);
+}
+
 void flightTask(void* /*arg*/) {
   subscribeCurrentTaskToWatchdog("flight");
   TickType_t lastWake = xTaskGetTickCount();
@@ -13097,6 +13241,7 @@ void flightTask(void* /*arg*/) {
 #endif
     applyFailsafeIfNeeded(nowMs);
     updateControlLoop(nowMs);
+    serviceBlackbox(nowMs);  // decimated flight-log record (no-op when idle)
     emitFlightStateLine(nowMs);
 #if ENABLE_PID_WEBSERVER
     recordPidWebDiagCaptureTick(nowMs);
@@ -13510,6 +13655,7 @@ void setup() {
                       std::memory_order_relaxed);
   gTofMedianEnable.store(fcuCfgReadByName("tof_median_filter", 1.0f) > 0.5f,
                          std::memory_order_relaxed);
+  refreshBlackboxConfigCache();
   initNrfStatusLeds();
 
   // ---- Nav status LED (4 blinks on first GPS fix and on origin lock) ------

@@ -330,6 +330,17 @@ struct SensorsLiveSnapshot {
   uint16_t loopHz = 0;
 };
 
+// Blackbox flight-log status (Capture tab).
+struct BlackboxStatus {
+  bool enabled = false;     // bb_enable config (record while motors active)
+  bool recording = false;   // live
+  bool allocated = false;   // ring buffer present
+  bool manual = false;      // web start override active
+  uint16_t records = 0;
+  uint16_t capacity = 0;
+  uint16_t rateHz = 50;
+};
+
 // Compass calibration live status (Sensors-tab wizard).
 struct MagCalStatus {
   bool active = false;
@@ -537,6 +548,15 @@ struct Callbacks {
   void (*getMagCal)(MagCalStatus& s) = nullptr;       // live wizard status
   // Re-reference baro altitude to the current ground (averaged; persisted).
   bool (*baroZero)() = nullptr;
+
+  // ---- Blackbox flight log ---------------------------------------------------
+  void (*getBlackbox)(BlackboxStatus& s) = nullptr;
+  bool (*bbStart)() = nullptr;   // manual recording (bench; allocates on demand)
+  bool (*bbStop)() = nullptr;    // clears the manual override
+  bool (*bbClear)() = nullptr;   // refused while recording
+  // CSV streaming, same contract as captureCsvChunk.
+  uint32_t (*bbCsvChunk)(uint32_t cursor, char* buf, uint32_t maxLen,
+                         uint32_t& nextCursor) = nullptr;
 
   // ---- Magnetometer heading trim (deg, added to the compass heading) --------
   // Constant residual/declination offset applied after a good hard-iron cal.

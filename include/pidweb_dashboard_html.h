@@ -632,6 +632,23 @@ canvas{display:block;width:100%;background:#0a0d12;border-radius:8px;border:1px 
 
  <!-- ===== CAPTURE ===== -->
  <section class="tab" id="t_capture">
+  <div class="card span2" style="margin-bottom:12px"><h3>Blackbox flight log <span class="tag" id="bb_tag">--</span></h3>
+   <div class="note">Compact ring log of the whole control path (raw/filtered gyro, accel, attitude, PID outputs,
+    motors, mode, arming flags, GPS, mag field, unified altitude) — always keeps the <b>most recent</b>
+    ~15 s at 50 Hz, so the tail survives an incident. Records while motors run when "log in flight" is on,
+    while a BLACKBOX mode switch is active, or during a manual bench recording. Download stops recording first.</div>
+   <div id="bb_stats" style="margin:8px 0"></div>
+   <div class="btns">
+    <button class="btn pri" onclick="bbAct('start','Recording')">Start (bench)</button>
+    <button class="btn" onclick="bbAct('stop','Stopped')">Stop</button>
+    <button class="btn danger" onclick="bbClear()">Clear</button>
+    <button class="btn" onclick="window.location.href='/api/blackbox.csv'">Download CSV</button>
+    <label class="dim small" style="display:flex;align-items:center;gap:6px;margin-left:8px">
+     <input type="checkbox" id="bb_en" onchange="bbSaveCfg()" style="width:16px;height:16px"> log in flight</label>
+    <label class="dim small" style="display:flex;align-items:center;gap:6px">rate
+     <input type="number" id="bb_rate" min="10" max="250" step="10" style="max-width:70px" onchange="bbSaveCfg()"> Hz</label>
+   </div>
+  </div>
   <div class="grid wide">
    <div class="card"><h3>Diagnostic capture</h3>
     <div class="statgrid">
@@ -1498,6 +1515,30 @@ async function capClear(){if(confirm('Clear diagnostic capture?')&&await act('/a
 function capDownload(){window.location.href='/api/capture.csv';}
 STAGE.capture=()=>{capPoll();if(!capTimer)capTimer=setInterval(()=>{if(activeTab==='capture')capPoll();else{clearInterval(capTimer);capTimer=null;}},500);};
 (function(){const prev=window.onRender;window.onRender=m=>{if(prev)prev(m);if(activeTab==='vibe')renderVibe(m);if(activeTab==='pid')renderYawCard(m);};})();
+// ===== Blackbox card (Capture tab) ===========================================
+let bbTimer=null,bbCfgLoaded=false;
+async function bbPoll(){
+ try{const r=await fetch('/api/blackbox');if(!r.ok)return;const s=await r.json();
+  const tag=document.getElementById('bb_tag');
+  tag.textContent=s.recording?'RECORDING':(s.records?'holds '+s.records+' records':'empty');
+  tag.className='tag '+(s.recording?'warn':(s.records?'ok':''));
+  document.getElementById('bb_stats').innerHTML=
+   kv('Buffer',s.records+' / '+s.capacity+' records'+(s.allocated?'':' (not allocated)'))
+  +kv('Rate',s.rateHz+' Hz → ~'+f(s.capacity/s.rateHz,0)+' s of history')
+  +kv('Trigger',(s.manual?'manual':'')+(s.manual&&s.enabled?' + ':'')+(s.enabled?'motors-active':(s.manual?'':'none')));
+  if(!bbCfgLoaded){bbCfgLoaded=true;
+   document.getElementById('bb_en').checked=s.enabled;
+   document.getElementById('bb_rate').value=s.rateHz;}
+ }catch(e){}
+}
+async function bbAct(a,msg){if(await act('/api/blackbox/'+a,msg))bbPoll();}
+async function bbClear(){if(confirm('Clear the blackbox buffer?')&&await act('/api/blackbox/clear','Cleared'))bbPoll();}
+function bbSaveCfg(){
+ act('/api/config','Blackbox config saved',{bb_enable:document.getElementById('bb_en').checked?1:0,
+  bb_rate_hz:Math.max(10,Math.min(250,+document.getElementById('bb_rate').value||50))});
+}
+(function(){const prev=STAGE.capture;STAGE.capture=()=>{if(prev)prev();bbPoll();
+ if(!bbTimer)bbTimer=setInterval(()=>{if(activeTab==='capture')bbPoll();else{clearInterval(bbTimer);bbTimer=null;}},700);};})();
 // ===== Altitude sources card (Sensors tab) ===================================
 let alCfgLoaded=false;
 async function alLoadCfg(){
