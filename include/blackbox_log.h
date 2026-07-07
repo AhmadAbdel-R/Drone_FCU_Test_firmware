@@ -26,7 +26,15 @@
 
 namespace bb {
 
-struct __attribute__((packed)) Record {
+// Packed so the ring density is predictable; MSVC (native tests) needs the
+// pragma form, GCC/Clang (firmware + native) take the attribute.
+#if defined(_MSC_VER)
+#pragma pack(push, 1)
+#define BB_PACKED
+#else
+#define BB_PACKED __attribute__((packed))
+#endif
+struct BB_PACKED Record {
   uint32_t tMs;
   uint16_t dtUs;          // flight-loop dt
   int16_t gyroRaw[3];     // 0.1 dps
@@ -45,6 +53,10 @@ struct __attribute__((packed)) Record {
   uint8_t altSrc;         // 0 none 1 tof 2 baro 3 gps
   uint8_t navErr;         // nav scaffold error code (0 until nav engages)
 };
+#if defined(_MSC_VER)
+#pragma pack(pop)
+#endif
+#undef BB_PACKED
 
 class BlackboxLog {
  public:
