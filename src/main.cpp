@@ -6745,6 +6745,72 @@ void refreshModesConfigCache() {
 // The D-term LPF rides the existing PID configure path instead (gDtermLpfHz).
 // =============================================================================
 // =============================================================================
+// [NAV SCAFFOLD] — POSHOLD/RTH structure (stage 14).
+//
+// The full INAV-style cascade is implemented and running, but in SHADOW:
+//   position error → desired velocity (PositionController, clamped to
+//   nav_max_vel_ms, slew-limited by nav_max_accel_ms2)
+//   → velocity error → tilt command (VelocityController, clamped to
+//   nav_max_tilt_deg) → published to telemetry/blackbox.
+// The commanded tilt has NO motor authority yet — wiring it into the angle
+// loop is the explicit, deliberate next step after the shadow output is
+// bench/flight-validated (same policy as the EKF shadow).
+//
+// The SAFETY layer is live today: quality gates (fix/sats/HDOP/heading/mag/
+// home/alt-source) publish per-mode block codes consumed by the arming gate,
+// the modes UI and the shadow engage logic; a quality drop while engaged
+// executes nav_gps_loss_action (shadow: disengage + log the intent).
+// =============================================================================
+
+// Nav error/block codes (logged in blackbox, shown in the UI).
+enum NavErr : uint8_t {
+  NAVERR_NONE = 0,
+  NAVERR_NO_FIX = 1,
+  NAVERR_LOW_SATS = 2,
+  NAVERR_HIGH_HDOP = 3,
+  NAVERR_NO_HEADING = 4,
+  NAVERR_MAG_UNCAL = 5,
+  NAVERR_NO_HOME = 6,
+  NAVERR_NO_ALT_SOURCE = 7,
+  NAVERR_STICK_OVERRIDE = 8,  // informational while overriding
+};
+
+struct NavConfigCache {
+  std::atomic<float> maxTiltDeg{20.0f};
+  std::atomic<float> maxVelMs{5.0f};
+  std::atomic<float> maxAccelMs2{2.5f};
+  std::atomic<float> stickOverridePct{20.0f};
+  std::atomic<float> velIClamp{0.3f};
+  std::atomic<uint8_t> gpsLossAction{0};  // 0 ALT_HOLD, 1 LAND, 2 FAILSAFE
+};
+NavConfigCache gNavCfg;
+// Per-mode block code (NAVERR_*), NAVERR_NONE = mode available.
+std::atomic<uint8_t> gNavPosHoldBlocked{NAVERR_NO_FIX};
+std::atomic<uint8_t> gNavRthBlocked{NAVERR_NO_FIX};
+// Shadow outputs for telemetry (flight task writes).
+std::atomic<bool> gNavShadowEngaged{false};
+std::atomic<float> gNavCmdRollDeg{0.0f};
+std::atomic<float> gNavCmdPitchDeg{0.0f};
+std::atomic<float> gNavVelSpNMs{0.0f};
+std::atomic<float> gNavVelSpEMs{0.0f};
+std::atomic<float> gNavDistToTargetM{0.0f};
+
+void refreshNavConfigCache() {
+  gNavCfg.maxTiltDeg.store(fcuCfgReadByName("nav_max_tilt_deg", 20.0f),
+                           std::memory_order_relaxed);
+  gNavCfg.maxVelMs.store(fcuCfgReadByName("nav_max_vel_ms", 5.0f), std::memory_order_relaxed);
+  gNavCfg.maxAccelMs2.store(fcuCfgReadByName("nav_max_accel_ms2", 2.5f),
+                            std::memory_order_relaxed);
+  gNavCfg.stickOverridePct.store(fcuCfgReadByName("nav_stick_override_pct", 20.0f),
+                                 std::memory_order_relaxed);
+  gNavCfg.velIClamp.store(fcuCfgReadByName("nav_vel_i_clamp", 0.3f),
+                          std::memory_order_relaxed);
+  gNavCfg.gpsLossAction.store(
+      static_cast<uint8_t>(fcuCfgReadByName("nav_gps_loss_action", 0.0f)),
+      std::memory_order_relaxed);
+}
+
+// =============================================================================
 // [BLACKBOX] — in-RAM flight log (blackbox_log.h). Recording gate, evaluated
 // by the flight task each tick:
 //   manual web start  OR  (bb_enable && motors active)  OR
@@ -7003,37 +7069,61 @@ void updateArmingDisableFlags(uint32_t nowMs) {
 
   // ---- Mode-switch gates ----------------------------------------------------
   if (gKillSwitchActive.load(std::memory_order_relaxed)) f |= arming::FLAG_KILL_SWITCH;
-  // Nav mode selected on the switch while its GPS/heading requirements are
-  // unmet: block arming (a pilot arming straight into POSHOLD with 3 sats is
-  // an immediate flyaway risk) unless explicitly allowed by config.
+  // Nav mode selected on the switch while its requirements are unmet: block
+  // arming (a pilot arming straight into POSHOLD with 3 sats is an immediate
+  // flyaway risk) unless explicitly allowed by config. Uses the block codes
+  // published by updateNavGates(), which runs earlier on this same task.
   {
     const uint16_t modeMask = gModeActiveMask.load(std::memory_order_relaxed);
-    const bool navSelected =
-        (modeMask & ((1U << MODE_POS_HOLD) | (1U << MODE_RTH))) != 0;
-    if (navSelected && !gArmCfg.navAllowArmUnsafe.load(std::memory_order_relaxed)) {
-      bool fix = false, hdopValid = false;
-      uint8_t sats = 0;
-      float hdop = 99.9f;
-      portENTER_CRITICAL(&gSensorMux);
-      fix = gState.gps.hasFix;
-      sats = gState.gps.satellites;
-      hdop = gState.gps.hdop;
-      hdopValid = gState.gps.hdopValid;
-      portEXIT_CRITICAL(&gSensorMux);
-      bool magOk = false;
-#if FCU_ENABLE_EXTERNAL_MAG
-      magOk = (gActiveMagSource.load(std::memory_order_relaxed) == MAG_SOURCE_EXTERNAL) &&
-              gExtCal.valid.load(std::memory_order_relaxed);
-#endif
-      const bool navOk =
-          fix &&
-          static_cast<float>(sats) >= gArmCfg.navMinSats.load(std::memory_order_relaxed) &&
-          hdopValid && hdop <= gArmCfg.navMaxHdop.load(std::memory_order_relaxed) && magOk;
-      if (!navOk) f |= arming::FLAG_NAV_UNSAFE;
+    if (!gArmCfg.navAllowArmUnsafe.load(std::memory_order_relaxed)) {
+      const bool phBad = (modeMask & (1U << MODE_POS_HOLD)) &&
+                         gNavPosHoldBlocked.load(std::memory_order_relaxed) != NAVERR_NONE;
+      const bool rthBad = (modeMask & (1U << MODE_RTH)) &&
+                          gNavRthBlocked.load(std::memory_order_relaxed) != NAVERR_NONE;
+      if (phBad || rthBad) f |= arming::FLAG_NAV_UNSAFE;
     }
   }
 
   gArmingDisableFlags.store(f, std::memory_order_relaxed);
+}
+
+// [NAV SCAFFOLD] sensor-task gate evaluation (~50 Hz): publish why POSHOLD /
+// RTH are blocked (NAVERR_* codes; NAVERR_NONE = available).
+void updateNavGates(uint32_t nowMs) {
+  (void)nowMs;
+  bool fix = false, hdopValid = false;
+  uint8_t sats = 0;
+  float hdop = 99.9f;
+  portENTER_CRITICAL(&gSensorMux);
+  fix = gState.gps.hasFix;
+  sats = gState.gps.satellites;
+  hdop = gState.gps.hdop;
+  hdopValid = gState.gps.hdopValid;
+  portEXIT_CRITICAL(&gSensorMux);
+
+  bool magOk = false;
+#if FCU_ENABLE_EXTERNAL_MAG
+  magOk = (gActiveMagSource.load(std::memory_order_relaxed) == MAG_SOURCE_EXTERNAL) &&
+          gExtCal.valid.load(std::memory_order_relaxed) &&
+          gExtMag.connected.load(std::memory_order_relaxed) &&
+          gExtMag.healthy.load(std::memory_order_relaxed);
+#endif
+  const uint8_t altSrc = gAltUnifiedSrc.load(std::memory_order_relaxed);
+  const bool altOk = altSrc == 1 || altSrc == 2;  // ToF or baro; GPS ref insufficient
+
+  uint8_t ph = NAVERR_NONE;
+  if (!fix) ph = NAVERR_NO_FIX;
+  else if (static_cast<float>(sats) < gArmCfg.navMinSats.load(std::memory_order_relaxed))
+    ph = NAVERR_LOW_SATS;
+  else if (!hdopValid || hdop > gArmCfg.navMaxHdop.load(std::memory_order_relaxed))
+    ph = NAVERR_HIGH_HDOP;
+  else if (!magOk) ph = NAVERR_MAG_UNCAL;   // mag doubles as the heading source
+  else if (!altOk) ph = NAVERR_NO_ALT_SOURCE;
+  gNavPosHoldBlocked.store(ph, std::memory_order_relaxed);
+
+  uint8_t rth = ph;
+  if (rth == NAVERR_NONE && !gRth.homeCaptured()) rth = NAVERR_NO_HOME;
+  gNavRthBlocked.store(rth, std::memory_order_relaxed);
 }
 
 // Called from processControlPacket() on every inbound packet, BEFORE the
@@ -7128,6 +7218,7 @@ void fcuConfigGroupChanged(uint8_t group) {
       break;
     case fcu_config::GROUP_NAV:
       refreshArmingConfigCache();  // nav quality gates live in the arming cache
+      refreshNavConfigCache();     // limits + stick override + loss action
       break;
     default:
       break;
@@ -7842,6 +7933,13 @@ void pidWebGetDash(pid_webserver::DashTelemetry& d) {
   d.gpsRmcAgeMs = ageMsSafe(now, gpsRmcMs);
   d.altUnifiedM = gAltUnifiedM.load(std::memory_order_relaxed);
   d.altUnifiedSrc = gAltUnifiedSrc.load(std::memory_order_relaxed);
+  d.navPosHoldBlocked = gNavPosHoldBlocked.load(std::memory_order_relaxed);
+  d.navRthBlocked = gNavRthBlocked.load(std::memory_order_relaxed);
+  d.navErr = gNavErrorCode.load(std::memory_order_relaxed);
+  d.navShadowEngaged = gNavShadowEngaged.load(std::memory_order_relaxed);
+  d.navCmdRollDeg = gNavCmdRollDeg.load(std::memory_order_relaxed);
+  d.navCmdPitchDeg = gNavCmdPitchDeg.load(std::memory_order_relaxed);
+  d.navDistM = gNavDistToTargetM.load(std::memory_order_relaxed);
 
   // ---- Home (RTH) + distance/bearing from the current fix -------------------
   // Equirectangular approximation, adequate at RTH ranges (<< 10 km): scale
@@ -13204,6 +13302,140 @@ void serviceBlackbox(uint32_t nowMs) {
   gBlackbox.record(r);
 }
 
+// =============================================================================
+// [NAV SCAFFOLD] flight-task shadow POSHOLD service (see the block comment at
+// the nav globals). Runs decimated to 50 Hz after the control loop. Engages
+// when the POS_HOLD mode switch is active, quality gates pass, and the sticks
+// are centered; publishes the commanded tilt to telemetry — NO motor
+// authority yet.
+// =============================================================================
+void serviceNavShadow(uint32_t nowMs) {
+  static bool sEngaged = false;
+  static uint32_t sNextDueMs = 0;
+  static uint32_t sLastRunMs = 0;
+  static float sVelSpN = 0.0f, sVelSpE = 0.0f;  // accel-slew-limited setpoints
+
+  if (static_cast<int32_t>(nowMs - sNextDueMs) < 0) return;
+  sNextDueMs = nowMs + 20U;  // 50 Hz
+  const float dt = (sLastRunMs == 0U)
+                       ? 0.02f
+                       : constrain(static_cast<float>(nowMs - sLastRunMs) * 0.001f,
+                                   0.005f, 0.2f);
+  sLastRunMs = nowMs;
+
+  const bool modeActive =
+      (gModeActiveMask.load(std::memory_order_relaxed) & (1U << MODE_POS_HOLD)) != 0;
+  const uint8_t blocked = gNavPosHoldBlocked.load(std::memory_order_relaxed);
+
+  // Stick override: past the configured deflection the pilot owns the craft.
+  int8_t sx = 0, sy = 0;
+  portENTER_CRITICAL(&gControlMux);
+  sx = gState.control.lastPacket.stickXPercent;
+  sy = gState.control.lastPacket.stickYPercent;
+  portEXIT_CRITICAL(&gControlMux);
+  const float ovr = gNavCfg.stickOverridePct.load(std::memory_order_relaxed);
+  const bool stickOverride =
+      fabsf(static_cast<float>(sx)) > ovr || fabsf(static_cast<float>(sy)) > ovr;
+
+  if (!modeActive || blocked != NAVERR_NONE || stickOverride) {
+    if (sEngaged) {
+      sEngaged = false;
+      gNavShadowEngaged.store(false, std::memory_order_relaxed);
+      gNavCmdRollDeg.store(0.0f, std::memory_order_relaxed);
+      gNavCmdPitchDeg.store(0.0f, std::memory_order_relaxed);
+      gPositionCtrl.reset();
+      gVelocityCtrl.reset();
+      sVelSpN = sVelSpE = 0.0f;
+      if (modeActive && blocked != NAVERR_NONE) {
+        // GPS/heading quality dropped WHILE holding: execute the configured
+        // action. Shadow has no authority, so the action is logged intent —
+        // the plumbing point for when the cascade gains authority.
+        static const char* kActions[3] = {"fall back to ALT_HOLD", "LAND", "FAILSAFE"};
+        const uint8_t act = gNavCfg.gpsLossAction.load(std::memory_order_relaxed);
+        fcu_log::logf(fcu_log::Level::Warn,
+                      "[NAV] POSHOLD quality lost (err=%u) -> %s (shadow: logged only)\n",
+                      blocked, kActions[(act < 3) ? act : 0]);
+      } else {
+        fcu_log::logf(fcu_log::Level::Info, "[NAV] POSHOLD shadow disengaged (%s)\n",
+                      stickOverride ? "stick override" : "switch off");
+      }
+    }
+    gNavErrorCode.store(
+        modeActive ? (blocked != NAVERR_NONE ? blocked
+                                             : (stickOverride ? NAVERR_STICK_OVERRIDE
+                                                              : NAVERR_NONE))
+                   : NAVERR_NONE,
+        std::memory_order_relaxed);
+    return;
+  }
+
+  int32_t lat = 0, lon = 0;
+  float gpsVn = 0.0f, gpsVe = 0.0f;
+  bool gpsVelValid = false;
+  portENTER_CRITICAL(&gSensorMux);
+  lat = gState.gps.latE7;
+  lon = gState.gps.lonE7;
+  gpsVn = gState.gps.velNorthMs;
+  gpsVe = gState.gps.velEastMs;
+  gpsVelValid = gState.gps.velocityValid;
+  portEXIT_CRITICAL(&gSensorMux);
+
+  if (!sEngaged) {
+    // Engage: hold the CURRENT position; refresh limits from config so the
+    // page's values are exactly what the cascade uses.
+    PositionController::Config pc = gPositionCtrl.config();
+    pc.maxCruiseSpeedMs = gNavCfg.maxVelMs.load(std::memory_order_relaxed);
+    gPositionCtrl.configure(pc);
+    VelocityController::Config vc = gVelocityCtrl.config();
+    vc.maxAngleDeg = constrain(gNavCfg.maxTiltDeg.load(std::memory_order_relaxed),
+                               5.0f, 45.0f);
+    gVelocityCtrl.configure(vc);
+    gPositionCtrl.reset();
+    gVelocityCtrl.reset();
+    PositionController::LatLonE7 t;
+    t.latE7 = lat;
+    t.lonE7 = lon;
+    t.valid = true;
+    gPositionCtrl.setTarget(t);
+    sVelSpN = sVelSpE = 0.0f;
+    sEngaged = true;
+    gNavShadowEngaged.store(true, std::memory_order_relaxed);
+    fcu_log::logf(fcu_log::Level::Info,
+                  "[NAV] POSHOLD SHADOW engaged at %.7f/%.7f (no motor authority)\n",
+                  static_cast<double>(lat) * 1e-7, static_cast<double>(lon) * 1e-7);
+  }
+
+  // ---- Cascade: position error -> velocity sp -> (slew = accel limit) ->
+  // ---- velocity error -> tilt command. Measured velocity prefers the EKF.
+  const PositionController::Output po = gPositionCtrl.update(lat, lon, dt);
+  const float maxDv = gNavCfg.maxAccelMs2.load(std::memory_order_relaxed) * dt;
+  sVelSpN += constrain(po.targetNorthMs - sVelSpN, -maxDv, maxDv);
+  sVelSpE += constrain(po.targetEastMs - sVelSpE, -maxDv, maxDv);
+
+  float vn = gpsVelValid ? gpsVn : 0.0f;
+  float ve = gpsVelValid ? gpsVe : 0.0f;
+#if ENABLE_EXPERIMENTAL_EKF
+  if (gEkfDiag.velValid) {  // flight-task-owned snapshot
+    vn = gEkfDiag.velNed[0];
+    ve = gEkfDiag.velNed[1];
+  }
+#endif
+  const float yawDeg = gState.attitude.yawDeg;
+  const auto spBody = PositionController::nedToBodyVelocity(yawDeg, sVelSpN, sVelSpE);
+  const auto measBody = PositionController::nedToBodyVelocity(yawDeg, vn, ve);
+  // Vertical stays with the existing altitude-hold path; the cascade slot is
+  // structured (targetVz/vzMeas) but fed zeros until alt authority merges.
+  const VelocityController::Output vo = gVelocityCtrl.update(
+      spBody.vxMs, spBody.vyMs, 0.0f, measBody.vxMs, measBody.vyMs, 0.0f, dt);
+
+  gNavCmdRollDeg.store(vo.targetRollDeg, std::memory_order_relaxed);
+  gNavCmdPitchDeg.store(vo.targetPitchDeg, std::memory_order_relaxed);
+  gNavVelSpNMs.store(sVelSpN, std::memory_order_relaxed);
+  gNavVelSpEMs.store(sVelSpE, std::memory_order_relaxed);
+  gNavDistToTargetM.store(po.distanceToTargetM, std::memory_order_relaxed);
+  gNavErrorCode.store(NAVERR_NONE, std::memory_order_relaxed);
+}
+
 void flightTask(void* /*arg*/) {
   subscribeCurrentTaskToWatchdog("flight");
   TickType_t lastWake = xTaskGetTickCount();
@@ -13241,6 +13473,7 @@ void flightTask(void* /*arg*/) {
 #endif
     applyFailsafeIfNeeded(nowMs);
     updateControlLoop(nowMs);
+    serviceNavShadow(nowMs); // POSHOLD cascade in shadow (50 Hz when engaged)
     serviceBlackbox(nowMs);  // decimated flight-log record (no-op when idle)
     emitFlightStateLine(nowMs);
 #if ENABLE_PID_WEBSERVER
@@ -13330,6 +13563,7 @@ void sensorTask(void* /*arg*/) {
     emitPiTelemetry(nowMs);   // FCU -> Pi: GPS + FCU_STATE @ ~5 Hz, self-throttled
     pollBattery(nowMs);
     updateAltitudeArbiter(nowMs);     // unified altitude (ToF > baro > GPS)
+    updateNavGates(nowMs);            // POSHOLD/RTH availability + block codes
     updateFlightStateMachine(nowMs);  // observer-mode FSM, ~50 Hz
     updateArmingDisableFlags(nowMs);  // central "why can't I arm" bitmask
     // [LED] Pick the desired continuous pattern then advance the blinker.
@@ -13656,6 +13890,7 @@ void setup() {
   gTofMedianEnable.store(fcuCfgReadByName("tof_median_filter", 1.0f) > 0.5f,
                          std::memory_order_relaxed);
   refreshBlackboxConfigCache();
+  refreshNavConfigCache();
   initNrfStatusLeds();
 
   // ---- Nav status LED (4 blinks on first GPS fix and on origin lock) ------

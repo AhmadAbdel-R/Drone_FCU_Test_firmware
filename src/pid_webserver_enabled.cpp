@@ -574,6 +574,10 @@ int formatDashJson(char* out, size_t cap, const DashTelemetry& d,
       jf(d.ekfMagInnovDeg), (unsigned long)d.ekfGpsAccept, (unsigned long)d.ekfGpsReject,
       (unsigned long)d.ekfMagAccept, (unsigned long)d.ekfMagReject,
       (unsigned long)d.ekfMeasDropped);
+  j.f(",\"nav\":{\"ph\":%u,\"rth\":%u,\"err\":%u,\"eng\":%d,"
+      "\"cr\":%.2f,\"cp\":%.2f,\"dist\":%.1f}",
+      d.navPosHoldBlocked, d.navRthBlocked, d.navErr, d.navShadowEngaged ? 1 : 0,
+      jf(d.navCmdRollDeg), jf(d.navCmdPitchDeg), jf(d.navDistM));
   j.f(",\"pi\":{\"comp\":%d,\"alive\":%d,\"hb\":%lu},"
       "\"srv\":{\"att\":%d,\"pan\":%u,\"tilt\":%u,\"pant\":%u,\"tiltt\":%u}}",
       d.piCompiled ? 1 : 0, d.piLinkAlive ? 1 : 0, (unsigned long)d.piHeartbeatAgeMs,

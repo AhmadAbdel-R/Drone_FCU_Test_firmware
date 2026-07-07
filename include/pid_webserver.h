@@ -263,6 +263,15 @@ struct DashTelemetry {
   uint32_t ekfMagAccept = 0, ekfMagReject = 0;
   uint32_t ekfMeasDropped = 0;
 
+  // ---- Nav scaffold (shadow POSHOLD) ----
+  uint8_t navPosHoldBlocked = 1;  // NAVERR_* (0 = available)
+  uint8_t navRthBlocked = 1;
+  uint8_t navErr = 0;             // live error code (blackbox mirrors it)
+  bool navShadowEngaged = false;
+  float navCmdRollDeg = 0.0f;     // cascade tilt command (no authority)
+  float navCmdPitchDeg = 0.0f;
+  float navDistM = 0.0f;          // distance to held position
+
   // ---- Companion (Pi) link ----
   bool piCompiled = false, piLinkAlive = false;
   uint32_t piHeartbeatAgeMs = 0xFFFFFFFF;

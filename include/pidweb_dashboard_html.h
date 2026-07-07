@@ -329,6 +329,23 @@ canvas{display:block;width:100%;background:#0a0d12;border-radius:8px;border:1px 
      <button class="btn" onclick="gpApply()">Apply to receiver now</button>
     </div>
    </div>
+   <div class="card span2"><h3>Navigation scaffold <span class="tag" id="nv_tag">--</span></h3>
+    <div class="note">The POSHOLD cascade (position error &rarr; velocity setpoint &rarr; tilt command) runs in
+     <b>SHADOW</b>: with the POS_HOLD mode switch active and all gates green it holds the engage position and
+     computes the tilt it <i>would</i> command — with <b>no motor authority</b>. Validate the shadow output on
+     the bench/in flight before authority is wired in. Limits below apply live. Nav PID gains are on the Config tab
+     (nav_pos_p, nav_vel_*).</div>
+    <div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:8px">
+     <div style="flex:1;min-width:200px" id="nv_status"></div>
+     <div style="flex:1;min-width:200px" id="nv_shadow"></div>
+    </div>
+    <div class="row" style="margin-top:6px"><label>Max nav tilt (°)</label><input type="number" id="nv_tilt" min="5" max="45" step="1" style="max-width:90px"></div>
+    <div class="row"><label>Max velocity (m/s)</label><input type="number" id="nv_vel" min="0.5" max="15" step="0.5" style="max-width:90px"></div>
+    <div class="row"><label>Max acceleration (m/s²)</label><input type="number" id="nv_acc" min="0.5" max="10" step="0.5" style="max-width:90px"></div>
+    <div class="row"><label>Stick override (%)</label><input type="number" id="nv_ovr" min="5" max="80" step="5" style="max-width:90px"></div>
+    <div class="row"><label>On GPS-quality loss</label><select id="nv_loss" style="max-width:220px"><option value="0">Fall back to ALT HOLD</option><option value="1">Land</option><option value="2">Failsafe</option></select></div>
+    <div class="btns"><button class="btn pri" onclick="nvSave()">Save nav limits</button></div>
+   </div>
    <div class="card span2"><h3>Nav / arming quality gates</h3>
     <div class="note">POSHOLD/RTH selection while these are unmet blocks arming (NAV_MODE_UNSAFE) and gates Set-home. Arming-time GPS requirements live under <b>arm_require_gps</b> on the Config tab.</div>
     <div class="row"><label>Nav min satellites</label><input type="number" id="gp_navsat" min="5" max="20" step="1" style="max-width:90px"></div>
@@ -1703,9 +1720,16 @@ function renderFilterCard(m){
 // Status rides the WS frame; config loads once from /api/config and saves via
 // /api/gps/save; "Apply to receiver" schedules the disarmed-only UBX push.
 let GP_LOADED=false;
+const NAVERR=['','no GPS fix','too few satellites','HDOP too high','no heading source',
+ 'compass not calibrated','home not set','no ToF/baro altitude source','stick override'];
 async function gpLoad(){
  try{const r=await fetch('/api/config');if(!r.ok)return;const j=await r.json();
   const map={};(j.params||[]).forEach(p=>map[p.n]=p.v);
+  document.getElementById('nv_tilt').value=map.nav_max_tilt_deg??20;
+  document.getElementById('nv_vel').value=map.nav_max_vel_ms??5;
+  document.getElementById('nv_acc').value=map.nav_max_accel_ms2??2.5;
+  document.getElementById('nv_ovr').value=map.nav_stick_override_pct??20;
+  document.getElementById('nv_loss').value=map.nav_gps_loss_action??0;
   document.getElementById('gp_prov').value=map.gps_provider??1;
   document.getElementById('gp_baud').value=map.gps_baud??0;
   document.getElementById('gp_rate').value=map.gps_rate_hz??5;
@@ -1757,6 +1781,26 @@ function renderGps(m){
   :'<div class="dim small">Waiting for the origin debouncer (stable fix, ≥6 sats, 10 s) or a manual capture.</div>';
  const ct=document.getElementById('gp_cfgtag');
  if(GP_LOADED){ct.className='tag ok';ct.textContent='loaded';}
+ // nav scaffold card
+ const nv=m.nav||{ph:1,rth:1,err:0,eng:0};
+ const nt=document.getElementById('nv_tag');
+ nt.textContent=nv.eng?'SHADOW ENGAGED':(nv.ph===0?'POSHOLD available':'blocked');
+ nt.className='tag '+(nv.eng?'warn':(nv.ph===0?'ok':''));
+ document.getElementById('nv_status').innerHTML=
+  kv('POS HOLD',nv.ph===0?'<span class="tag ok">available</span>':'<span class="tag warn">'+(NAVERR[nv.ph]||nv.ph)+'</span>')
+ +kv('RTH',nv.rth===0?'<span class="tag ok">available</span>':'<span class="tag warn">'+(NAVERR[nv.rth]||nv.rth)+'</span>')
+ +kv('Live error',nv.err?NAVERR[nv.err]||nv.err:'none');
+ document.getElementById('nv_shadow').innerHTML=
+  kv('Shadow state',nv.eng?'holding position':'idle')
+ +kv('Cmd roll / pitch',f(nv.cr,1)+'° / '+f(nv.cp,1)+'°')
+ +kv('Distance to hold point',f(nv.dist,1)+' m');
+}
+function nvSave(){
+ act('/api/gps/save','Nav limits saved',{nav_max_tilt_deg:+document.getElementById('nv_tilt').value||20,
+  nav_max_vel_ms:+document.getElementById('nv_vel').value||5,
+  nav_max_accel_ms2:+document.getElementById('nv_acc').value||2.5,
+  nav_stick_override_pct:+document.getElementById('nv_ovr').value||20,
+  nav_gps_loss_action:+document.getElementById('nv_loss').value});
 }
 STAGE.gps=()=>{if(!GP_LOADED)gpLoad();};
 // ===== Modes tab (aux-range assignment) ======================================
