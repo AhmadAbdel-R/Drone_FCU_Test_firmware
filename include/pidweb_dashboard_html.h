@@ -416,9 +416,10 @@ canvas{display:block;width:100%;background:#0a0d12;border-radius:8px;border:1px 
 
  <!-- ===== PID TUNING ===== -->
  <section class="tab" id="t_pid">
+  <div class="warnbox ok" style="margin-bottom:12px">&#128190; All tuning on this page (PID gains, yaw/heading settings, mixer bias, motor trims, failsafe bypass) <b>auto-saves to flash 3&nbsp;s after your last edit</b> — what you tune is what boots. The Save buttons force it immediately; Revert reloads what is in flash.</div>
   <div class="card span2" id="yawcard" style="margin-bottom:12px">
    <h3>Yaw &amp; Heading stability <span class="tag" id="yh_status">--</span></h3>
-   <div class="note">Everything that locks your heading, in one place. Heading-hold engages only when all four gates are green <b>and</b> the yaw stick is centered. Edits apply live while disarmed; press Save to persist to NVS.</div>
+   <div class="note">Everything that locks your heading, in one place. Heading-hold engages only when all four gates are green <b>and</b> the yaw stick is centered. Edits apply live while disarmed and auto-save to flash 3&nbsp;s after the last change.</div>
    <div class="statgrid" id="yh_gates" style="margin:8px 0"></div>
    <div id="yawknobs"></div>
    <div class="btns" style="margin-top:8px">
@@ -542,8 +543,11 @@ canvas{display:block;width:100%;background:#0a0d12;border-radius:8px;border:1px 
  <!-- ===== RADIO & LINKS ===== -->
  <section class="tab" id="t_radio">
   <div class="grid wide">
+   <div class="card span2"><h3>Channel map <span class="small dim">live µs &middot; 900–2100 &middot; tick = 1500 center</span></h3>
+    <div id="rc_chans"></div>
+    <div class="note">Function labels come from the fixed stick map (CH1–4), the gimbal channels, and your Modes-page assignments (shown with their range; the bar segment lights green while the mode is active). Assign or change ranges on the <a href="#" onclick="showTab('modes');return false">Modes</a> tab.</div>
+   </div>
    <div class="card"><h3>Control receiver (CRSF/ELRS)</h3><div id="rc_info"></div></div>
-   <div class="card"><h3>Channels</h3><div id="rc_chans"></div></div>
    <div class="card"><h3>Web / WiFi telemetry</h3><div id="rc_web"></div></div>
    <div class="card"><h3>Companion (Pi)</h3><div id="rc_pi"></div></div>
   </div>
@@ -1270,6 +1274,49 @@ function renderSensors(m){
  document.getElementById('sens_tbody').innerHTML=h;
 }
 // ---------- radio tab ----------
+// ---- Channel map (INAV receiver-tab style) ---------------------------------
+// Fixed roles for CH1-4 (CRSF bridge) + gimbal channels, overlaid with the
+// live Modes-page slot assignments (function name + range, fetched once from
+// /api/config and refreshed when the Modes tab saves).
+let RC_SLOTS=null;
+async function rcLoadSlots(){
+ try{const r=await fetch('/api/config');if(!r.ok)return;const j=await r.json();
+  const map={};(j.params||[]).forEach(p=>map[p.n]=p.v);
+  RC_SLOTS=[];
+  for(let n=1;n<=8;n++){const f=+map['mode'+n+'_func']||0,c=+map['mode'+n+'_channel']||0;
+   if(f&&c)RC_SLOTS.push({f:f,c:c,l:+map['mode'+n+'_min_us']||1300,h:+map['mode'+n+'_max_us']||1700});}
+ }catch(e){}
+}
+function rcChannelRows(rc){
+ const base={1:'Roll',2:'Pitch',3:'Throttle',4:'Yaw',6:'Pan',7:'Tilt'};
+ let h='';
+ for(let i=0;i<16;i++){
+  const ch=i+1,us=rc.ch[i]||0;
+  const pct=us?Math.max(0,Math.min(100,(us-900)/12)):0;   // 900..2100 span
+  const slots=(RC_SLOTS||[]).filter(s=>s.c===ch);
+  let label=base[ch]||'';
+  let seg='';
+  slots.forEach(s=>{
+   const active=us>0&&us>=s.l&&us<=s.h;
+   const l=Math.max(0,Math.min(100,(s.l-900)/12)),w=Math.max(1,Math.min(100,(s.h-900)/12)-l);
+   seg+='<div style="position:absolute;top:0;bottom:0;left:'+l+'%;width:'+w+'%;border-radius:4px;'
+    +'background:'+(active?'#33d17a55':'#5d667833')+';border:1px solid '+(active?'#33d17a':'#5d667855')+'"></div>';
+   label+=(label?' · ':'')+MD_FUNCS[s.f]+' '+s.l+'–'+s.h+(active?' ●':'');
+  });
+  h+='<div class="row" style="margin:3px 0">'
+   +'<label style="flex:0 0 44px">CH'+ch+'</label>'
+   +'<div style="flex:1;background:#0d1118;border:1px solid #28303f;border-radius:5px;height:15px;position:relative">'
+   +seg
+   +'<div style="position:absolute;left:50%;top:0;bottom:0;width:1px;background:#5d667888"></div>'
+   +(us?'<div style="position:absolute;left:0;top:0;bottom:0;width:'+pct+'%;background:#3fa9ff44;border-radius:4px"></div>'
+       +'<div style="position:absolute;top:-1px;bottom:-1px;left:calc('+pct+'% - 1px);width:3px;background:#3fa9ff;border-radius:2px"></div>':'')
+   +'</div>'
+   +'<div class="v" style="flex:0 0 46px">'+(us||'--')+'</div>'
+   +'<span class="dim small" style="flex:0 0 210px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+(label||'—')+'</span>'
+   +'</div>';
+ }
+ return h;
+}
 function renderRadio(m){
  const rc=m.rc;
  document.getElementById('rc_info').innerHTML=rc.comp?(
@@ -1278,10 +1325,7 @@ function renderRadio(m){
   +kv('Link quality',rc.lq+' %')+kv('RSSI',rc.rssi+' dBm')+kv('Frame rate',rc.fr+' Hz')
   +kv('Last packet',ageTxt(rc.age))+kv('Loss',rc.loss+' %')+kv('Accepted/s',rc.pps)
  ):'<div class="dim">No CRSF control compiled in this build.</div>';
- const names=['Roll','Pitch','Throttle','Yaw','Arm','Pan','Tilt','Aux8'];
- let h='';for(let i=0;i<8;i++){const us=rc.ch[i]||0;const p=Math.max(0,Math.min(100,(us-1000)/10));
-  h+='<div class="row" style="margin:4px 0"><label style="flex:0 0 70px">'+names[i]+'</label><div style="flex:1;background:#0d1118;border:1px solid #28303f;border-radius:5px;height:14px;position:relative"><div style="position:absolute;left:0;top:0;bottom:0;width:'+p+'%;background:#3fa9ff44;border-radius:5px"></div></div><div class="v">'+us+'</div></div>';}
- document.getElementById('rc_chans').innerHTML=h;
+ document.getElementById('rc_chans').innerHTML=rcChannelRows(rc);
  document.getElementById('rc_web').innerHTML=kv('WebSocket',document.getElementById('connDot').classList.contains('on')?'<span class="tag ok">connected</span>':'<span class="tag err">down</span>')
   +kv('Push rate',(m.sys.whz||0)+' Hz')+kv('Clients',m.sys.wsc||0)+kv('Free heap',(m.sys.heap/1024|0)+' KB');
  document.getElementById('rc_pi').innerHTML=m.pi.comp?(kv('Link',m.pi.alive?'<span class="tag ok">alive</span>':'<span class="tag warn">no link</span>')+kv('Heartbeat age',ageTxt(m.pi.hb))):'<div class="dim">Autonomy UART not compiled in.</div>';
@@ -1865,7 +1909,9 @@ async function mdSave(){
  s.forEach((x,n)=>{body['mode'+(n+1)+'_func']=x.f;body['mode'+(n+1)+'_channel']=x.c;
   body['mode'+(n+1)+'_min_us']=x.l;body['mode'+(n+1)+'_max_us']=x.h;});
  if(await act('/api/modes','Modes saved & applied',body)){
-  document.getElementById('md_tag').textContent='saved';document.getElementById('md_tag').className='tag ok';}
+  document.getElementById('md_tag').textContent='saved';document.getElementById('md_tag').className='tag ok';
+  rcLoadSlots();  // keep the Radio-tab channel map labels in sync
+ }
 }
 function renderModes(m){
  if(!MD_LOADED)return;
@@ -1907,6 +1953,7 @@ function renderModes(m){
  document.getElementById('md_arm').innerHTML=arm;
 }
 STAGE.modes=()=>{if(!MD_LOADED)mdLoad();};
+(function(){const prev=STAGE.radio;STAGE.radio=()=>{if(prev)prev();if(!RC_SLOTS)rcLoadSlots();};})();
 // ===== Mixer table editor ====================================================
 // Reads/writes the 16 mix_m*_{throttle,roll,pitch,yaw} params through
 // /api/config (validated + persisted firmware-side; staged atomically into

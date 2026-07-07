@@ -7228,6 +7228,24 @@ void fcuConfigGroupChanged(uint8_t group) {
 }
 
 #if ENABLE_PID_WEBSERVER
+// =============================================================================
+// [PID FLASH AUTOSAVE] Every successful web APPLY of a tuning value (PID
+// gains, mixer bias, motor trims, mag trim, mag yaw gain, failsafe bypass)
+// arms this debounced deadline; loop() persists the WHOLE tuning set to NVS
+// 3 s after the LAST edit. Guarantees "what you tuned is what boots" without
+// a flash write per slider tick (NVS is wear-leveled, but a write per drag
+// event is still pointless wear). The explicit Save buttons remain for
+// immediate persistence; Revert/Reset cancel the pending autosave so they
+// can't be overwritten by a stale deadline.
+// =============================================================================
+std::atomic<uint32_t> gPidWebAutoSaveAtMs{0};
+inline void schedulePidWebAutoSave() {
+  gPidWebAutoSaveAtMs.store((millis() + 3000U) | 1U, std::memory_order_relaxed);
+}
+inline void cancelPidWebAutoSave() {
+  gPidWebAutoSaveAtMs.store(0, std::memory_order_relaxed);
+}
+
 enum class PendingSystemAction : uint8_t {
   None = 0,
   Reboot,
@@ -7399,6 +7417,7 @@ bool pidWebApplyPid(const int16_t values[pid_webserver::kFieldCount]) {
   configurePidFromPacket(packet);
   resetPidOutputs("pidweb_gain_apply");
   portEXIT_CRITICAL(&gFlightMux);
+  schedulePidWebAutoSave();
   return true;
 }
 
@@ -7426,7 +7445,11 @@ bool pidWebRevertFromNvs() {
   for (uint8_t i = 0; i < pid_webserver::kFieldCount; ++i) {
     values[i] = fcu_nvs::FcuPidNvs::packetField(packet, i);
   }
-  return pidWebApplyPid(values);
+  const bool ok = pidWebApplyPid(values);
+  // Revert restored NVS state into RAM — a pending autosave would be a no-op,
+  // but cancel it so the log doesn't claim an "auto-save" the user didn't make.
+  cancelPidWebAutoSave();
+  return ok;
 }
 
 bool pidWebResetToDefaults() {
@@ -7441,7 +7464,9 @@ bool pidWebResetToDefaults() {
     values[i] = fcu_nvs::FcuPidNvs::packetField(packet, i);
     ok = gPidNvs.saveField(i, values[i]) && ok;
   }
-  return pidWebApplyPid(values) && ok;
+  const bool applied = pidWebApplyPid(values);
+  cancelPidWebAutoSave();  // defaults are already persisted above
+  return applied && ok;
 }
 
 void pidWebGetState(pid_webserver::StateSnapshot& s) {
@@ -7485,6 +7510,7 @@ bool pidWebSetMixBias(float value) {
   gMixPitchFrontBias.store(clamped, std::memory_order_relaxed);
   Serial.printf("[PIDWEB] mix pitch_front_bias -> %.3f (RAM)\n",
                 static_cast<double>(clamped));
+  schedulePidWebAutoSave();
   return true;
 }
 
@@ -7521,6 +7547,7 @@ bool pidWebSetMotorThrustTrims(const float values[4]) {
   Serial.printf("[PIDWEB] motor thrust trims -> %.3f/%.3f/%.3f/%.3f (RAM)\n",
                 static_cast<double>(values[0]), static_cast<double>(values[1]),
                 static_cast<double>(values[2]), static_cast<double>(values[3]));
+  schedulePidWebAutoSave();
   return true;
 }
 
@@ -7547,6 +7574,7 @@ bool pidWebSetMagTrim(float deg) {
   if (!(isfinite(deg) && deg >= -360.0f && deg <= 360.0f)) return false;
   gMagTrimDeg.store(deg, std::memory_order_relaxed);
   Serial.printf("[PIDWEB] mag heading trim -> %.1f deg (RAM)\n", static_cast<double>(deg));
+  schedulePidWebAutoSave();
   return true;
 }
 
@@ -7574,6 +7602,7 @@ bool pidWebSetFailsafeBypass(bool bypass) {
     portEXIT_CRITICAL(&gControlMux);
   }
   Serial.printf("[PIDWEB] failsafe bypass -> %u (RAM)\n", static_cast<unsigned>(bypass));
+  schedulePidWebAutoSave();
   return true;
 }
 
@@ -8432,6 +8461,7 @@ bool pidWebSetMagConfig(bool extEnabled, bool onboardEnabled, bool preferExterna
   gMagOnboardEnabled.store(false, std::memory_order_relaxed);
   gMagPreferExternal.store(true, std::memory_order_relaxed);
   gMagYawCorrGain.store(constrain(yawCorrGain, 0.0f, 1.0f), std::memory_order_relaxed);
+  schedulePidWebAutoSave();
   return true;
 }
 
@@ -8848,6 +8878,28 @@ void publishPidWebSafety() {
   pid_webserver::publishSafety(throttle == 0U,
                                (gFlightStatePublished.load(std::memory_order_relaxed) != flight_state::State::IDLE) ||
                                benchActionBusy);
+}
+
+// [PID FLASH AUTOSAVE] loop()-context service: persists the whole tuning set
+// 3 s after the last web edit (see the block comment at the atomic). Retries
+// in 1 s when the craft is momentarily not bench-idle.
+void servicePidWebAutoSave(uint32_t nowMs) {
+  const uint32_t at = gPidWebAutoSaveAtMs.load(std::memory_order_relaxed);
+  if (at == 0U || static_cast<int32_t>(nowMs - at) < 0) return;
+  if (!pidWebWriteSafe() || !gPidNvs.ready()) {
+    gPidWebAutoSaveAtMs.store((nowMs + 1000U) | 1U, std::memory_order_relaxed);
+    return;
+  }
+  gPidWebAutoSaveAtMs.store(0, std::memory_order_relaxed);
+  bool ok = true;
+  ok &= pidWebSaveAllToNvs();
+  ok &= pidWebSaveMixBiasToNvs();
+  ok &= pidWebSaveMotorThrustTrimsToNvs();
+  ok &= pidWebSaveMagTrimToNvs();
+  ok &= pidWebSaveMagConfigToNvs();
+  ok &= pidWebSaveFailsafeBypassToNvs();
+  fcu_log::logf(ok ? fcu_log::Level::Info : fcu_log::Level::Error,
+                "[PIDWEB] tuning auto-saved to flash%s\n", ok ? "" : " (PARTIAL)");
 }
 
 // Deadman motor-test session (defined with servicePidWebMotorSpin below).
@@ -14361,6 +14413,7 @@ void loop() {
   wifi_mgr::service(nowMs);
 #if ENABLE_PID_WEBSERVER
   pid_webserver::service(nowMs);
+  servicePidWebAutoSave(nowMs);  // debounced tuning->flash persistence
 #endif
   fcu_log::drain(nowMs);
   // FFT for the dashboard notch analysis runs HERE (loop = lowest priority),
