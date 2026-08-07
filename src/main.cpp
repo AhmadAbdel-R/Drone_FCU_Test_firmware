@@ -12290,38 +12290,38 @@ void updateControlLoop(uint32_t nowMs) {
   //    disarmed-but-spinning");
   //  * the mixer reported motor saturation on the PREVIOUS tick: a clipped
   //    motor can't realize additional moment, so further integration only
-  //    overshoots when authority returns. One tick (2 ms) of delay is the
-  //    price of computing the gate before the PIDs run.
-  // P and D remain fully active in both cases, and the PID-internal
-  // conditional integration (output-level anti-windup) still applies on top.
-  const bool allowIntegration =
-      (smoothedThrottle >= PID_ITERM_MIN_THROTTLE_PCT) && !gState.pid.mixerSatPrevTick;
-
-  // ---- Apply persistent level correction + manual trim (EXACTLY ONCE) -------
-  // correctedAttitude = rawEstimate - mountingOffset - manualTrim. This is the
-  // SINGLE point where leveling enters the controller; the raw estimate
-  // (attitudeSnap / gState.attitude) is deliberately left untouched so the
-  // dashboard can show raw-vs-corrected side by side and so the correction can
-  // never be double-applied. The offset is the value "Calibrate Level & Save"
-  // measured while the frame was physically level, so a level frame now yields
-  // ~zero angle error and the mixer stops biasing two motors. Reading the
-  // atomics before the mux keeps the critical section short.
-  const float levelRollOff  = gLevelCorr.rollOffsetDeg.load(std::memory_order_relaxed);
-  const float levelPitchOff = gLevelCorr.pitchOffsetDeg.load(std::memory_order_relaxed);
-  const float rollTrim      = gLevelCorr.rollTrimDeg.load(std::memory_order_relaxed);
-  const float pitchTrim     = gLevelCorr.pitchTrimDeg.load(std::memory_order_relaxed);
-  const float correctedRollDeg  = attitudeSnap.rollDeg  - levelRollOff  - rollTrim;
-  const float correctedPitchDeg = attitudeSnap.pitchDeg - levelPitchOff - pitchTrim;
-
-  FcuPidTerms rollT;
-  FcuPidTerms pitchT;
-  FcuPidTerms yawT;
-  portENTER_CRITICAL(&gFlightMux);
-  // Optional setpoint smoothing (setpoint_lpf_hz; 0 = off = passthrough):
-  // PT1 on the rate commands so stick steps don't kick the rate loop, while
-  // the gyro/disturbance path keeps its full bandwidth.
-  const float rollRateSetpointDps = gSetpointFilter.applyAxis(
-      0,
+  //    overshoots when authority returns. One tick (2 ms) of delay is the1
+  //    price of computing the gate before the PIDs run.1
+  // P and D remain fully active in both cases, and the PID-internal1
+  // conditional integration (output-level anti-windup) still applies on top.1
+  const bool allowIntegration =1
+      (smoothedThrottle >= PID_ITERM_MIN_THROTTLE_PCT) && !gState.pid.mixerSatPrevTick;1
+1
+  // ---- Apply persistent level correction + manual trim (EXACTLY ONCE) -------1
+  // correctedAttitude = rawEstimate - mountingOffset - manualTrim. This is the1
+  // SINGLE point where leveling enters the controller; the raw estimate1
+  // (attitudeSnap / gState.attitude) is deliberately left untouched so the1
+  // dashboard can show raw-vs-corrected side by side and so the correction can1
+  // never be double-applied. The offset is the value "Calibrate Level & Save"1
+  // measured while the frame was physically level, so a level frame now yields1
+  // ~zero angle error and the mixer stops biasing two motors. Reading the1
+  // atomics before the mux keeps the critical section short.1
+  const float levelRollOff  = gLevelCorr.rollOffsetDeg.load(std::memory_order_relaxed);1
+  const float levelPitchOff = gLevelCorr.pitchOffsetDeg.load(std::memory_order_relaxed);1
+  const float rollTrim      = gLevelCorr.rollTrimDeg.load(std::memory_order_relaxed);1
+  const float pitchTrim     = gLevelCorr.pitchTrimDeg.load(std::memory_order_relaxed);1
+  const float correctedRollDeg  = attitudeSnap.rollDeg  - levelRollOff  - rollTrim;1
+  const float correctedPitchDeg = attitudeSnap.pitchDeg - levelPitchOff - pitchTrim;1
+1
+  FcuPidTerms rollT;1
+  FcuPidTerms pitchT;1
+  FcuPidTerms yawT;1
+  portENTER_CRITICAL(&gFlightMux);1
+  // Optional setpoint smoothing (setpoint_lpf_hz; 0 = off = passthrough):1
+  // PT1 on the rate commands so stick steps don't kick the rate loop, while1
+  // the gyro/disturbance path keeps its full bandwidth.1
+  const float rollRateSetpointDps = gSetpointFilter.applyAxis(1
+      0,1
       constrain((rollAngleSetpointDeg - correctedRollDeg) * gState.pid.angleRollGain,
                 -MAX_ANGLE_RATE_SETPOINT_DPS, MAX_ANGLE_RATE_SETPOINT_DPS),
       dtSeconds);

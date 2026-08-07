@@ -122,6 +122,115 @@ canvas{display:block;width:100%;background:#0a0d12;border-radius:8px;border:1px 
 .stat{background:#0e131c;border:1px solid var(--line);border-radius:8px;padding:7px 9px}
 .stat .l{font-size:10px;color:var(--dim);text-transform:uppercase}
 .stat .n{font-family:var(--mono);font-size:16px;margin-top:2px}
+/* ---- mission planner ---- */
+#ms_wrap{display:flex;gap:12px;align-items:stretch}
+@media(max-width:980px){#ms_wrap{flex-direction:column}}
+#ms_mapcard{flex:1;min-width:0;position:relative;border:1px solid var(--line);border-radius:var(--r);overflow:hidden;background:#0a0d12}
+#ms_map{height:min(70vh,660px);min-height:430px;background:#0a0d12;cursor:crosshair;z-index:0}
+#ms_side{flex:0 0 332px;display:flex;flex-direction:column;gap:12px;max-height:min(70vh,660px)}
+@media(max-width:980px){#ms_side{flex:1;max-height:560px}}
+#ms_boot{position:absolute;inset:0;z-index:1200;display:flex;flex-direction:column;gap:14px;align-items:center;justify-content:center;background:#0a0d12;text-align:center;padding:16px}
+.ms-spin{width:34px;height:34px;border-radius:50%;border:3px solid #28303f;border-top-color:var(--accent);animation:msspin 1s linear infinite}
+@keyframes msspin{to{transform:rotate(360deg)}}
+.ms-glass{position:absolute;z-index:1100;display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+ background:#0d121cd9;border:1px solid #ffffff22;border-radius:10px;padding:6px 8px;
+ backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);box-shadow:0 4px 20px #000a}
+#ms_tools{top:10px;left:10px}
+#ms_stats{bottom:24px;left:10px}
+.ms-chip{display:inline-flex;gap:6px;align-items:center;font-size:12px;padding:0 3px}
+.ms-chip .k{color:var(--dim);font-size:10px;letter-spacing:.4px}
+.ms-chip b{font-family:var(--mono);font-weight:600}
+#ms_hint{position:absolute;left:50%;top:58px;transform:translateX(-50%);z-index:1050;background:#0d121cd9;
+ border:1px solid #3fa9ff55;color:#bfe0ff;padding:7px 14px;border-radius:999px;font-size:12px;white-space:nowrap;
+ backdrop-filter:blur(8px);pointer-events:none;box-shadow:0 4px 16px #000a}
+.ms-wp{width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+ color:#fff;font:700 12px system-ui;background:radial-gradient(circle at 32% 30%,#6ec1ff,#1861c9 72%);
+ border:2px solid #ffffffe0;box-shadow:0 0 12px #3fa9ffb0,0 2px 8px #000b;transition:transform .12s;cursor:grab}
+.ms-wp.hold{background:radial-gradient(circle at 32% 30%,#a78dff,#5b2fd6 72%);box-shadow:0 0 12px #7c5cffb0,0 2px 8px #000b}
+.ms-wp.land{background:radial-gradient(circle at 32% 30%,#ffd06e,#cf7a10 72%);box-shadow:0 0 12px #ffb020a8,0 2px 8px #000b;color:#231500}
+.ms-wp.sel{transform:scale(1.25);outline:2px solid #fff;outline-offset:2px}
+.ms-nul{background:none!important;border:none!important}
+.ms-tip{background:#0d121cf0!important;border:1px solid #3fa9ff44!important;color:var(--txt)!important;
+ font-family:var(--mono);font-size:11px;border-radius:7px;box-shadow:0 4px 14px #000a!important}
+.ms-tip:before{border:none!important}
+.ms-route-dash{stroke-dasharray:2 12;stroke-linecap:round;animation:msdash 1s linear infinite}
+@keyframes msdash{to{stroke-dashoffset:-14}}
+.ms-home{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+ background:radial-gradient(circle at 30% 30%,#4de394,#128a4c 75%);border:2px solid #fff;box-shadow:0 0 10px #33d17a90,0 2px 5px #0009}
+.ms-dwrap{position:relative;width:34px;height:34px}
+.ms-pulse{position:absolute;inset:0;border-radius:50%;border:2px solid #25e0ff;animation:mspulse 1.6s ease-out infinite}
+@keyframes mspulse{0%{transform:scale(.4);opacity:.9}100%{transform:scale(1.5);opacity:0}}
+.ms-drone-rot{position:absolute;inset:7px;display:flex;align-items:center;justify-content:center;
+ filter:drop-shadow(0 0 6px #25e0ffc0);transition:transform .25s linear}
+.ms-ghost{width:18px;height:18px;border-radius:50%;background:radial-gradient(circle,#fff,#3fa9ff);box-shadow:0 0 14px #3fa9ff,0 0 30px #3fa9ff80}
+.ms-item{background:var(--card2);border:1px solid var(--line);border-radius:9px;padding:8px 10px;cursor:pointer;flex:0 0 auto;transition:border-color .15s,box-shadow .15s}
+.ms-item:hover{border-color:#34425c}
+.ms-item.sel{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset,0 0 14px #3fa9ff28}
+.ms-item .hd{display:flex;align-items:center;gap:7px}
+.ms-num{flex:0 0 auto;width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+ color:#fff;font:700 11px system-ui;background:radial-gradient(circle at 32% 30%,#6ec1ff,#1861c9 72%)}
+.ms-num.hold{background:radial-gradient(circle at 32% 30%,#a78dff,#5b2fd6 72%)}
+.ms-num.land{background:radial-gradient(circle at 32% 30%,#ffd06e,#cf7a10 72%);color:#231500}
+.ms-act{background:#0d1118;color:var(--txt);border:1px solid var(--line);border-radius:6px;padding:3px 6px;font-size:12px}
+.ms-ib{background:none;border:1px solid transparent;border-radius:6px;color:var(--dim);cursor:pointer;padding:3px 6px;font-size:11px}
+.ms-ib:hover{color:var(--txt);border-color:var(--line);background:#243047}
+.ms-ib.del:hover{color:#ff9c9c;border-color:#5c2626;background:#3a1a1a}
+.ms-coord{color:var(--dim);font-size:11px;margin:5px 0 0 2px}
+.ms-fields{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-top:7px}
+.ms-fields label{display:block;font-size:9px;color:var(--dim);text-transform:uppercase;letter-spacing:.4px;margin-bottom:2px}
+.ms-fields input{padding:4px 6px;font-size:12px}
+.ms-none{border:1px dashed #34425c;border-radius:9px;color:var(--dim);text-align:center;padding:26px 10px;font-size:13px;line-height:1.6}
+#ms_map .leaflet-bar a{background:#12182a;color:#cfd6e4;border-bottom-color:#28303f}
+#ms_map .leaflet-bar a:hover{background:#1d2534;color:#fff}
+#ms_map .leaflet-bar{border:1px solid #ffffff22;box-shadow:0 4px 14px #000a;border-radius:8px;overflow:hidden}
+#ms_map .leaflet-control-attribution{background:#0b0e13b8;color:#5d6678;font-size:10px}
+#ms_map .leaflet-control-attribution a{color:#8a94a6}
+#ms_map .leaflet-control-scale-line{background:#0b0e13b0;color:#aab4c6;border:2px solid #aab4c680;border-top:none}
+/* ---- mission planner: component skin (modern app look) ---- */
+#t_mission .card{background:linear-gradient(180deg,#161d2b,#121826);border:1px solid #ffffff14;border-radius:14px;
+ box-shadow:0 1px 2px #0006,0 10px 30px #00000038;padding:14px 15px}
+.ms-ph{display:flex;align-items:center;justify-content:space-between;margin-bottom:11px}
+.ms-ph span:first-child{font-size:14px;font-weight:650;letter-spacing:.2px}
+.ms-badge{min-width:22px;text-align:center;padding:2px 8px;border-radius:999px;font:600 11px var(--mono);
+ background:linear-gradient(135deg,#3fa9ff33,#7c5cff33);border:1px solid #3fa9ff55;color:#9fd4ff}
+.msb{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:34px;padding:0 14px;
+ border-radius:10px;font:600 13px system-ui;color:var(--txt);background:#1d2536;border:1px solid #ffffff1a;
+ cursor:pointer;transition:transform .13s,box-shadow .13s,background .13s,border-color .13s,filter .13s}
+.msb:hover{background:#242e44;border-color:#ffffff2e;transform:translateY(-1px)}
+.msb:active{transform:translateY(0) scale(.98)}
+.msb.sm{height:28px;padding:0 10px;font-size:12px;border-radius:8px}
+.msb.pri{background:linear-gradient(135deg,#2f8fe0,#6d4de6);border-color:#7c9dff55;color:#fff;
+ box-shadow:0 4px 14px #3f6dff3d}
+.msb.pri:hover{filter:brightness(1.12);box-shadow:0 6px 20px #3f6dff55}
+.msb.danger{color:#ff9c9c}
+.msb.danger:hover{background:#3a1a1a;border-color:#7a2b2b}
+.ms-seg{display:flex;background:#0b0f17e6;border:1px solid #ffffff14;border-radius:10px;padding:3px;gap:2px}
+.ms-seg button{border:none;background:none;color:var(--dim);font:600 12px system-ui;padding:5px 11px;
+ border-radius:7px;cursor:pointer;transition:all .15s}
+.ms-seg button:hover{color:var(--txt)}
+.ms-seg button.active{background:linear-gradient(135deg,#2f8fe0,#6d4de6);color:#fff;box-shadow:0 2px 10px #3f6dff4d}
+.ms-vr{width:1px;height:20px;background:#ffffff1c}
+.ms-opt{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;
+ background:#0d1220;border:1px solid #ffffff10;border-radius:11px}
+.ms-optt{font-size:13px;font-weight:600}
+.ms-sw{position:relative;flex:0 0 40px;width:40px;height:22px;cursor:pointer}
+.ms-sw input{position:absolute;opacity:0;width:100%;height:100%;margin:0;cursor:pointer}
+.ms-sw span{position:absolute;inset:0;border-radius:999px;background:#232c3f;border:1px solid #ffffff1f;transition:.2s;pointer-events:none}
+.ms-sw span:after{content:'';position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;
+ background:#8a94a6;transition:.2s}
+.ms-sw input:checked+span{background:linear-gradient(135deg,#2f8fe0,#6d4de6);border-color:#7c9dff66}
+.ms-sw input:checked+span:after{left:20px;background:#fff;box-shadow:0 1px 4px #0008}
+.ms-actions{display:flex;flex-direction:column;gap:8px;margin-top:10px}
+.ms-actions .pri{width:100%}
+.ms-actrow{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+.ms-actrow .msb{width:100%;padding:0}
+#t_mission .ms-item{border-radius:12px;background:#151c2b;transition:border-color .15s,box-shadow .15s,transform .15s}
+#t_mission .ms-item:hover{transform:translateY(-1px);box-shadow:0 4px 14px #00000040}
+#t_mission input[type=number],#t_mission .ms-act{transition:border-color .15s,box-shadow .15s;border-radius:8px}
+#t_mission input[type=number]:focus,#t_mission .ms-act:focus{outline:none;border-color:#3fa9ff;box-shadow:0 0 0 3px #3fa9ff2b}
+#ms_stats{background:transparent;border:none;box-shadow:none;backdrop-filter:none;-webkit-backdrop-filter:none;padding:0;gap:6px}
+#ms_stats .ms-chip{background:#0d121cd9;border:1px solid #ffffff22;border-radius:10px;padding:6px 10px;
+ backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);box-shadow:0 4px 14px #0009}
 </style></head>
 <body>
 <header id="bar">
@@ -207,9 +316,28 @@ canvas{display:block;width:100%;background:#0a0d12;border-radius:8px;border:1px 
     <canvas id="su_tape" height="44"></canvas>
     <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start;margin-top:10px">
      <canvas id="su_ah" height="330" style="width:330px;max-width:100%;flex:0 0 auto"></canvas>
+     <div style="flex:0 0 auto;display:flex;flex-direction:column;align-items:center;gap:4px;padding-top:22px">
+      <svg width="190" height="190" viewBox="0 0 160 160">
+       <circle id="su_ring" cx="80" cy="80" r="72" fill="none" stroke="#5d6678" stroke-width="6"></circle>
+       <g stroke="#5d667855" stroke-width="2">
+        <line x1="80" y1="10" x2="80" y2="150"></line><line x1="10" y1="80" x2="150" y2="80"></line>
+       </g>
+       <circle cx="80" cy="80" r="58" fill="#0a0d12"></circle>
+       <g fill="#8a94a6" font-size="12" text-anchor="middle">
+        <text x="80" y="20">N</text><text x="80" y="151">S</text><text x="149" y="84">E</text><text x="11" y="84">W</text>
+       </g>
+       <g id="su_needle" style="transform-box:fill-box;transform-origin:center;transition:transform .12s linear">
+        <polygon points="80,26 87,84 80,96 73,84" fill="#ff5252"></polygon>
+        <polygon points="80,134 87,84 80,72 73,84" fill="#8a94a6"></polygon>
+       </g>
+       <circle cx="80" cy="80" r="4" fill="#e7ebf2"></circle>
+      </svg>
+      <div id="su_hdg" class="mono" style="font-size:22px">--&deg;</div>
+      <div id="su_hdgsrc" class="dim small">--</div>
+     </div>
      <div style="flex:1;min-width:210px">
       <div id="su_nums"></div>
-      <div class="note" style="margin-top:8px">The horizon uses the <b>corrected estimator attitude</b> (same signal the angle controller flies), not raw gyro integration. Tilt the craft by hand: the horizon must move opposite the craft, like a real ADI.</div>
+      <div class="note" style="margin-top:8px">The horizon uses the <b>corrected estimator attitude</b> (same signal the angle controller flies), not raw gyro integration. Tilt the craft by hand: the horizon must move opposite the craft, like a real ADI. The compass follows the active heading source (external mag when valid, else gyro).</div>
      </div>
     </div>
    </div>
@@ -352,6 +480,60 @@ canvas{display:block;width:100%;background:#0a0d12;border-radius:8px;border:1px 
     <div class="row"><label>Nav max HDOP</label><input type="number" id="gp_navhdop" min="1" max="5" step="0.1" style="max-width:90px"></div>
     <div class="row"><label>Allow arming into unsafe nav mode</label><input type="checkbox" id="gp_navaau" style="width:18px;height:18px"></div>
     <div class="btns"><button class="btn pri" onclick="gpSaveGates()">Save gates</button></div>
+   </div>
+  </div>
+ </section>
+
+ <!-- ===== MISSION PLANNER ===== -->
+ <section class="tab" id="t_mission">
+  <div id="ms_wrap">
+   <div id="ms_mapcard">
+    <div id="ms_map"></div>
+    <div id="ms_boot"><div class="ms-spin"></div><div class="dim">Preparing map&hellip;</div></div>
+    <div id="ms_tools" class="ms-glass">
+     <div class="ms-seg" id="ms_layers">
+      <button data-l="sat" onclick="msSetLayer('sat')">Satellite</button>
+      <button data-l="dark" onclick="msSetLayer('dark')">Dark</button>
+      <button data-l="osm" onclick="msSetLayer('osm')">Streets</button>
+     </div>
+     <span class="ms-vr"></span>
+     <button class="msb sm" onclick="msFit()" title="Fit mission in view">&#8982; Fit</button>
+     <button class="msb sm" onclick="msUndo()" title="Remove last waypoint">&#8630; Undo</button>
+     <button class="msb sm danger" onclick="msClear()">Clear</button>
+    </div>
+    <div id="ms_stats" class="ms-glass">
+     <span class="ms-chip"><span class="k">WPS</span><b id="ms_s_n">0</b></span>
+     <span class="ms-chip"><span class="k">DIST</span><b id="ms_s_d">--</b></span>
+     <span class="ms-chip"><span class="k">TIME</span><b id="ms_s_t">--</b></span>
+     <span class="ms-chip" id="ms_fix"><span class="k">GPS</span><b>--</b></span>
+     <span class="ms-chip mono small" id="ms_coords">--</span>
+    </div>
+    <div id="ms_hint">Click the map to drop WP1 &mdash; drag markers to adjust</div>
+   </div>
+   <div id="ms_side">
+    <div class="card" style="flex:1;display:flex;flex-direction:column;min-height:0">
+     <div class="ms-ph"><span>Waypoints</span><span class="ms-badge" id="ms_cnt">0</span></div>
+     <div id="ms_list" style="flex:1;overflow:auto;display:flex;flex-direction:column;gap:8px;padding-right:2px"></div>
+    </div>
+    <div class="card">
+     <div class="ms-ph"><span>Mission</span></div>
+     <div class="ms-opt">
+      <div><div class="ms-optt">Return to home</div><div class="dim small">Fly back after the last waypoint</div></div>
+      <label class="ms-sw"><input type="checkbox" id="ms_rth" checked onchange="msRthTgl(this.checked)"><span></span></label>
+     </div>
+     <div class="ms-actions">
+      <button class="msb pri" id="ms_pvbtn" onclick="msPreview()">&#9654;&nbsp; Preview flight</button>
+      <div class="ms-actrow">
+       <button class="msb" onclick="msExport()">Export</button>
+       <button class="msb" onclick="document.getElementById('ms_file').click()">Import</button>
+       <button class="msb" onclick="msUpload()">Upload</button>
+      </div>
+      <input type="file" id="ms_file" accept=".json,application/json" style="display:none" onchange="msImport(this)">
+     </div>
+     <div class="note" style="margin-top:10px">Preview flies the route at 8&times; real time using each waypoint&rsquo;s
+      speed and hold. Missions auto-save in this browser; Export writes an INAV-style JSON you can re-import.
+      Home &amp; live position come from FC telemetry when GPS has a fix.</div>
+    </div>
    </div>
   </div>
  </section>
@@ -798,7 +980,7 @@ async function put(url,okMsg,body){
  }catch(e){toast('Network error',true);return false;}
 }
 // ---------- tabs ----------
-const TABS=[['overview','Overview'],['setup','Setup'],['motors','Motors'],['modes','Modes'],['gps','GPS'],['attitude','Attitude & Level'],['pid','PID Tuning'],
+const TABS=[['overview','Overview'],['setup','Setup'],['motors','Motors'],['modes','Modes'],['gps','GPS'],['mission','Mission'],['attitude','Attitude & Level'],['pid','PID Tuning'],
  ['diag','PID Diagnostics'],['mixer','Motor Mixer'],['sensors','Sensors'],['radio','Radio & Links'],
  ['vibe','Vibration & FFT'],['notch','Filters & Notch'],['servo','Pan/Tilt'],['capture','Capture'],['config','Config']];
 let activeTab='overview';
@@ -1421,8 +1603,9 @@ function buildPid(){const groups={};PIDF.forEach((ff,i)=>{(groups[ff[5]]=groups[
   groups[g].forEach(i=>{const ff=PIDF[i];const r=document.createElement('div');r.className='row';
    r.innerHTML='<label>'+ff[1]+'</label><input type="range" min="'+ff[2]+'" max="'+ff[3]+'" step="'+ff[4]+'" id="pr'+i+'"><input type="number" style="width:74px" min="'+ff[2]+'" max="'+ff[3]+'" step="'+ff[4]+'" id="pn'+i+'"><div class="v" id="pv'+i+'">--</div>';
    c.appendChild(r);
-   document.getElementById('pr'+i).addEventListener('input',e=>editGain(i,+e.target.value));
-   document.getElementById('pn'+i).addEventListener('change',e=>editGain(i,+e.target.value));});
+   // c is not in the document yet - lookups must stay within the row subtree
+   r.querySelector('#pr'+i).addEventListener('input',e=>editGain(i,+e.target.value));
+   r.querySelector('#pn'+i).addEventListener('change',e=>editGain(i,+e.target.value));});
   root.appendChild(c);}}
 function setPidUI(g){gains=g.slice();PIDF.forEach((ff,i)=>gainUI(i));}
 async function loadPid(){try{const r=await fetch('/api/pid');const j=await r.json();if(j.gains&&j.gains.length===12)setPidUI(j.gains);
@@ -2234,14 +2417,22 @@ function drawTape(cv,hdgDeg){
    x.fillStyle=names[deg]?'#3fa9ff':'#8a94a6';x.fillText(names[deg]||deg,xx,H-33);}}
  x.fillStyle='#ffb020';x.beginPath();x.moveTo(W/2,H-2);x.lineTo(W/2-6,H-12);x.lineTo(W/2+6,H-12);x.closePath();x.fill();
 }
+let suMagAcc=0;
 function renderSetup(m){
  const st=m.sys,att=m.att,sen=m.sen;
  const h=headingSource(m);
  drawAH(document.getElementById('su_ah'),+att.cr||0,+att.cp||0);
  drawTape(document.getElementById('su_tape'),h.deg);
+ // compass rose shares the container with the ADI; same heading source as the tape
+ suMagAcc+=((h.deg-suMagAcc)%360+540)%360-180;
+ const snd=document.getElementById('su_needle');if(snd)snd.style.transform='rotate('+suMagAcc+'deg)';
+ const sht=document.getElementById('su_hdg');if(sht)sht.textContent=f(h.deg,0)+'° '+compassPoint(h.deg);
+ const shs=document.getElementById('su_hdgsrc');if(shs)shs.textContent=h.src==='mag'?'external mag':'gyro (mag unavailable)';
+ const srg=document.getElementById('su_ring');
+ if(srg){const mg=sen.mag,mok=mg&&mg.v===1&&mg.src===2;
+  srg.setAttribute('stroke',mok?magColour(+((mg.ext&&mg.ext.f)??mg.f)||0):'#5d6678');}
  document.getElementById('su_nums').innerHTML=
   kv('Roll / Pitch',f(att.cr,1)+'° / '+f(att.cp,1)+'°')
- +kv('Heading',f(h.deg,0)+'° ('+h.src+')')
  +kv('Gyro yaw',f(att.ry,1)+'°')
  +kv('Mag field',sen.mag?f((sen.mag.ext&&sen.mag.ext.f)??sen.mag.f,1)+' µT':'--')
  +kv('Baro altitude',sen.baro.v?f(sen.baro.alt,2)+' m':'<span class="dim">--</span>')
@@ -2316,5 +2507,304 @@ function alignDraw(){
  }).join('');
  document.getElementById('su_altag').textContent=AL.run?('step '+(AL.step+1)+'/'+AL_STEPS.length):document.getElementById('su_altag').textContent;
 }
+// ===== Mission planner tab (proof of concept) ================================
+// INAV-style waypoint planner. Leaflet + tiles are fetched from the internet
+// ONLY when this tab is first opened (SRI-pinned), so the rest of the dashboard
+// stays fully offline on the FCU AP. Planning is client-side: missions persist
+// in localStorage and export/import as JSON. Upload to the FC is NOT wired yet.
+const MS={map:null,wps:[],sel:-1,rth:true,base:null,lbl:null,layer:'sat',leaf:0,
+ route:[],rthLine:null,mkrs:[],home:null,homeLL:null,drone:null,centered:false,pv:null,saveT:0,homeWas:false};
+const MS_DEF={alt:30,spd:8,hold:5};
+const MS_ACT=[['WP','Waypoint'],['HOLD','Hold'],['LAND','Land']];
+const MS_TILES={
+ dark:['https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{maxZoom:20,subdomains:'abcd',attribution:'&copy; OpenStreetMap &copy; CARTO'}],
+ sat:['https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:19,attribution:'Imagery &copy; Esri'}],
+ osm:['https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; OpenStreetMap'}]};
+function msLoadLeaflet(){
+ if(MS.leaf===2)return Promise.resolve(true);
+ if(window._msLoading)return window._msLoading;
+ window._msLoading=new Promise(res=>{
+  const css=document.createElement('link');css.rel='stylesheet';
+  css.href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+  css.integrity='sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=';css.crossOrigin='';
+  document.head.appendChild(css);
+  const s=document.createElement('script');
+  s.src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+  s.integrity='sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=';s.crossOrigin='';
+  s.onload=()=>{MS.leaf=2;res(true);};
+  s.onerror=()=>{window._msLoading=null;res(false);};
+  document.head.appendChild(s);});
+ return window._msLoading;
+}
+STAGE.mission=()=>{
+ if(MS.map){setTimeout(()=>MS.map.invalidateSize(),60);return;}
+ msBoot();
+};
+async function msBoot(){
+ const b=document.getElementById('ms_boot');b.style.display='flex';
+ b.innerHTML='<div class="ms-spin"></div><div class="dim">Loading map engine&hellip;</div>';
+ const ok=await msLoadLeaflet();
+ if(!ok){b.innerHTML='<div style="font-size:30px">&#128246;</div>'
+  +'<div style="max-width:320px"><b>No route to the map CDN.</b><br><span class="dim small">The map library and tiles need the browsing device to be online. Connect this device to the internet (or run the FCU in STA mode on a routed network) and retry.</span></div>'
+  +'<button class="btn pri" onclick="msBoot()">Retry</button>';return;}
+ msInit();
+}
+function msInit(){
+ const saved=msLoadStore();
+ MS.map=L.map('ms_map',{zoomControl:false,worldCopyJump:true});
+ L.control.zoom({position:'topright'}).addTo(MS.map);
+ L.control.scale({imperial:false,position:'bottomright'}).addTo(MS.map);
+ msSetLayer((saved&&saved.layer)||'sat');
+ let c=[42.30453,-83.06233],z=17; // default: U Windsor Ed Lumley CEI; saved view / GPS fix / home override
+ const g=window.LAST&&LAST.sen&&LAST.sen.gps;
+ if(saved&&saved.view&&saved.view.c){c=saved.view.c;z=saved.view.z;MS.centered=true;}
+ else if(g&&g.home&&g.home.set){c=[g.home.lat/1e7,g.home.lon/1e7];z=17;MS.centered=true;}
+ else if(g&&g.fix){c=[g.lat/1e7,g.lon/1e7];z=17;MS.centered=true;}
+ MS.map.setView(c,z);
+ MS.map.on('click',e=>{if(MS.pv)return;msAdd(e.latlng);});
+ MS.map.on('mousemove',e=>{const el=document.getElementById('ms_coords');
+  if(el)el.textContent=e.latlng.lat.toFixed(5)+', '+e.latlng.lng.toFixed(5);});
+ MS.map.on('moveend zoomend',msPersist);
+ if(saved&&Array.isArray(saved.wps))MS.wps=saved.wps;
+ if(saved&&saved.rth!=null)MS.rth=!!saved.rth;
+ document.getElementById('ms_rth').checked=MS.rth;
+ document.getElementById('ms_boot').style.display='none';
+ msRefresh(true);
+ if(window.LAST)msTelem(LAST);
+ setTimeout(()=>MS.map.invalidateSize(),60);
+}
+function msSetLayer(name){
+ MS.layer=name;
+ document.querySelectorAll('#ms_layers button').forEach(b=>b.classList.toggle('active',b.dataset.l===name));
+ if(!MS.map)return;
+ if(MS.base)MS.map.removeLayer(MS.base);
+ if(MS.lbl){MS.map.removeLayer(MS.lbl);MS.lbl=null;}
+ const t=MS_TILES[name]||MS_TILES.sat;
+ MS.base=L.tileLayer(t[0],t[1]).addTo(MS.map);
+ if(name==='sat')MS.lbl=L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}{r}.png',
+  {maxZoom:20,subdomains:'abcd'}).addTo(MS.map);
+ msPersist();
+}
+function msAdd(ll){
+ MS.wps.push({lat:+ll.lat.toFixed(7),lon:+ll.lng.toFixed(7),alt:MS_DEF.alt,spd:MS_DEF.spd,hold:MS_DEF.hold,act:'WP'});
+ MS.sel=MS.wps.length-1;msRefresh(true);
+}
+function msRefresh(struct){
+ if(struct){msRebuildMarkers();msList();}
+ msRoute();msStats();msPersist();
+ const em=document.getElementById('ms_hint');if(em)em.style.display=MS.wps.length?'none':'block';
+}
+function msIcon(i){
+ const w=MS.wps[i];
+ const cls='ms-wp'+(w.act==='HOLD'?' hold':(w.act==='LAND'?' land':''))+(i===MS.sel?' sel':'');
+ return L.divIcon({className:'ms-nul',html:'<div class="'+cls+'">'+(i+1)+'</div>',iconSize:[32,32],iconAnchor:[16,16]});
+}
+function msTipTxt(i){const w=MS.wps[i];return 'WP'+(i+1)+' &middot; '+w.alt+' m &middot; '+w.spd+' m/s';}
+function msRebuildMarkers(){
+ if(!MS.map)return;
+ MS.mkrs.forEach(m=>MS.map.removeLayer(m));MS.mkrs=[];
+ MS.wps.forEach((w,i)=>{
+  const mk=L.marker([w.lat,w.lon],{icon:msIcon(i),draggable:true,keyboard:false});
+  mk.on('click',()=>msSelect(i));
+  mk.on('drag',()=>{const p=mk.getLatLng();w.lat=+p.lat.toFixed(7);w.lon=+p.lng.toFixed(7);msRoute();msStats();});
+  mk.on('dragend',()=>{msList();msPersist();});
+  mk.bindTooltip(msTipTxt(i),{direction:'top',offset:[0,-16],className:'ms-tip'});
+  mk.addTo(MS.map);MS.mkrs.push(mk);});
+}
+function msSelect(i){
+ MS.sel=i;MS.mkrs.forEach((m,j)=>m.setIcon(msIcon(j)));msList();
+ const el=document.querySelector('.ms-item[data-i="'+i+'"]');
+ if(el)el.scrollIntoView({block:'nearest',behavior:'smooth'});
+}
+function msPan(i){const w=MS.wps[i];if(w&&MS.map)MS.map.panTo([w.lat,w.lon]);}
+function msRoute(){
+ if(!MS.map)return;
+ MS.route.forEach(l=>MS.map.removeLayer(l));MS.route=[];
+ if(MS.rthLine){MS.map.removeLayer(MS.rthLine);MS.rthLine=null;}
+ const pts=MS.wps.map(w=>[w.lat,w.lon]);
+ if(MS.homeLL&&pts.length)
+  MS.route.push(L.polyline([MS.homeLL,pts[0]],{color:'#33d17a',weight:2,opacity:.6,dashArray:'2 8',interactive:false}).addTo(MS.map));
+ if(pts.length>1){
+  MS.route.push(L.polyline(pts,{color:'#3fa9ff',weight:10,opacity:.16,lineCap:'round',interactive:false}).addTo(MS.map));
+  MS.route.push(L.polyline(pts,{color:'#3fa9ff',weight:3,opacity:.95,interactive:false}).addTo(MS.map));
+  MS.route.push(L.polyline(pts,{color:'#e8f4ff',weight:2,opacity:.9,className:'ms-route-dash',interactive:false}).addTo(MS.map));
+ }
+ if(MS.rth&&MS.homeLL&&pts.length)
+  MS.rthLine=L.polyline([pts[pts.length-1],MS.homeLL],{color:'#ffb020',weight:2.5,opacity:.85,dashArray:'7 9',interactive:false}).addTo(MS.map);
+}
+function msHav(a,b){
+ const R=6371000,dr=Math.PI/180;
+ const dLa=(b[0]-a[0])*dr,dLo=(b[1]-a[1])*dr,la1=a[0]*dr,la2=b[0]*dr;
+ const h=Math.sin(dLa/2)**2+Math.cos(la1)*Math.cos(la2)*Math.sin(dLo/2)**2;
+ return 2*R*Math.asin(Math.sqrt(h));
+}
+function msStats(){
+ let d=0,t=0;const w=MS.wps;
+ for(let i=1;i<w.length;i++){const leg=msHav([w[i-1].lat,w[i-1].lon],[w[i].lat,w[i].lon]);d+=leg;t+=leg/Math.max(1,w[i].spd);}
+ w.forEach(x=>{if(x.act==='HOLD')t+=x.hold;});
+ if(MS.homeLL&&w.length){
+  const e=msHav(MS.homeLL,[w[0].lat,w[0].lon]);d+=e;t+=e/Math.max(1,w[0].spd);
+  if(MS.rth){const r=msHav([w[w.length-1].lat,w[w.length-1].lon],MS.homeLL);d+=r;t+=r/MS_DEF.spd;}
+ }
+ document.getElementById('ms_s_n').textContent=w.length;
+ document.getElementById('ms_cnt').textContent=w.length;
+ document.getElementById('ms_s_d').textContent=w.length?(d>=1000?(d/1000).toFixed(2)+' km':d.toFixed(0)+' m'):'--';
+ document.getElementById('ms_s_t').textContent=w.length?(Math.floor(t/60)+':'+String(Math.round(t%60)).padStart(2,'0')):'--';
+}
+function msList(){
+ const el=document.getElementById('ms_list');if(!el)return;
+ if(!MS.wps.length){el.innerHTML='<div class="ms-none">No waypoints yet.<br><span class="dim small">Click the map to drop WP1.</span></div>';return;}
+ el.innerHTML=MS.wps.map((w,i)=>{
+  return '<div class="ms-item'+(i===MS.sel?' sel':'')+'" data-i="'+i+'" onclick="msSelect('+i+');msPan('+i+')">'
+  +'<div class="hd"><span class="ms-num '+w.act.toLowerCase()+'">'+(i+1)+'</span>'
+  +'<select class="ms-act" onclick="event.stopPropagation()" onchange="msField('+i+',&quot;act&quot;,this.value)">'
+   +MS_ACT.map(a=>'<option value="'+a[0]+'"'+(w.act===a[0]?' selected':'')+'>'+a[1]+'</option>').join('')
+  +'</select><span class="spacer"></span>'
+  +'<button class="ms-ib" title="Move up" onclick="event.stopPropagation();msMove('+i+',-1)">&#9650;</button>'
+  +'<button class="ms-ib" title="Move down" onclick="event.stopPropagation();msMove('+i+',1)">&#9660;</button>'
+  +'<button class="ms-ib del" title="Delete" onclick="event.stopPropagation();msDel('+i+')">&#10005;</button></div>'
+  +'<div class="ms-coord mono">'+(+w.lat).toFixed(6)+', '+(+w.lon).toFixed(6)+'</div>'
+  +'<div class="ms-fields">'
+   +'<div><label>Alt m</label><input type="number" value="'+w.alt+'" min="1" max="500" step="1" onclick="event.stopPropagation()" onchange="msField('+i+',&quot;alt&quot;,+this.value)"></div>'
+   +'<div><label>Spd m/s</label><input type="number" value="'+w.spd+'" min="1" max="25" step="0.5" onclick="event.stopPropagation()" onchange="msField('+i+',&quot;spd&quot;,+this.value)"></div>'
+   +(w.act==='HOLD'?'<div><label>Hold s</label><input type="number" value="'+w.hold+'" min="1" max="600" step="1" onclick="event.stopPropagation()" onchange="msField('+i+',&quot;hold&quot;,+this.value)"></div>':'')
+  +'</div></div>';}).join('');
+}
+function msField(i,k,v){
+ const w=MS.wps[i];if(!w)return;
+ if(k==='act'){w.act=v;msRefresh(true);return;}
+ if(k==='alt')w.alt=Math.max(1,Math.min(500,v||MS_DEF.alt));
+ if(k==='spd')w.spd=Math.max(1,Math.min(25,v||MS_DEF.spd));
+ if(k==='hold')w.hold=Math.max(1,Math.min(600,v||MS_DEF.hold));
+ if(MS.mkrs[i])MS.mkrs[i].setTooltipContent(msTipTxt(i));
+ msStats();msPersist();
+}
+function msMove(i,d){
+ const j=i+d;if(j<0||j>=MS.wps.length)return;
+ const t=MS.wps[i];MS.wps[i]=MS.wps[j];MS.wps[j]=t;
+ if(MS.sel===i)MS.sel=j;else if(MS.sel===j)MS.sel=i;
+ msRefresh(true);
+}
+function msDel(i){
+ MS.wps.splice(i,1);
+ if(MS.sel===i)MS.sel=-1;else if(MS.sel>i)MS.sel--;
+ msRefresh(true);
+}
+function msUndo(){if(!MS.wps.length)return;MS.wps.pop();if(MS.sel>=MS.wps.length)MS.sel=-1;msRefresh(true);}
+function msClear(){
+ if(!MS.wps.length)return;
+ if(!confirm('Delete all '+MS.wps.length+' waypoints?'))return;
+ MS.wps=[];MS.sel=-1;msRefresh(true);
+}
+function msRthTgl(v){MS.rth=!!v;msRoute();msStats();msPersist();}
+function msFit(){
+ if(!MS.map)return;
+ const pts=MS.wps.map(w=>[w.lat,w.lon]);
+ if(MS.homeLL)pts.push(MS.homeLL);
+ if(MS.drone){const p=MS.drone.getLatLng();pts.push([p.lat,p.lng]);}
+ if(!pts.length){toast('Nothing to fit yet',true);return;}
+ if(pts.length===1){MS.map.setView(pts[0],16);return;}
+ MS.map.fitBounds(L.latLngBounds(pts),{padding:[46,46]});
+}
+function msPersist(){
+ clearTimeout(MS.saveT);
+ MS.saveT=setTimeout(()=>{try{
+  const v=MS.map?{c:[MS.map.getCenter().lat,MS.map.getCenter().lng],z:MS.map.getZoom()}:null;
+  localStorage.setItem('fcu_mission',JSON.stringify({wps:MS.wps,rth:MS.rth,layer:MS.layer,view:v}));
+ }catch(e){}},400);
+}
+function msLoadStore(){try{return JSON.parse(localStorage.getItem('fcu_mission')||'null');}catch(e){return null;}}
+function msExport(){
+ if(!MS.wps.length){toast('No waypoints to export',true);return;}
+ const wp=MS.wps.map((w,i)=>({no:i+1,action:w.act==='HOLD'?'POSHOLD_TIME':(w.act==='LAND'?'LAND':'WAYPOINT'),
+  lat:w.lat,lon:w.lon,alt_m:w.alt,speed_ms:w.spd,hold_s:w.act==='HOLD'?w.hold:0}));
+ const blob=new Blob([JSON.stringify({fcu_mission:1,rth:MS.rth,wp:wp},null,1)],{type:'application/json'});
+ const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='mission.json';a.click();
+ setTimeout(()=>URL.revokeObjectURL(a.href),3000);toast('Mission exported');
+}
+function msImport(inp){
+ const f=inp.files&&inp.files[0];if(!f)return;
+ const r=new FileReader();
+ r.onload=()=>{try{
+  const j=JSON.parse(r.result);const src=j.wp||j.wps||[];
+  MS.wps=src.map(w=>({lat:+w.lat,lon:+(w.lon!=null?w.lon:w.lng),
+   alt:+(w.alt_m!=null?w.alt_m:(w.alt!=null?w.alt:MS_DEF.alt)),
+   spd:+(w.speed_ms!=null?w.speed_ms:(w.spd!=null?w.spd:MS_DEF.spd)),
+   hold:(+(w.hold_s!=null?w.hold_s:(w.hold!=null?w.hold:MS_DEF.hold)))||MS_DEF.hold,
+   act:(w.action==='POSHOLD_TIME'||w.act==='HOLD')?'HOLD':((w.action==='LAND'||w.act==='LAND')?'LAND':'WP')}))
+   .filter(w=>isFinite(w.lat)&&isFinite(w.lon)&&Math.abs(w.lat)<=90&&Math.abs(w.lon)<=180);
+  if(j.rth!=null)MS.rth=!!j.rth;
+  document.getElementById('ms_rth').checked=MS.rth;
+  MS.sel=-1;msRefresh(true);msFit();
+  toast('Mission imported: '+MS.wps.length+' waypoints');
+ }catch(e){toast('Import failed: not a valid mission file',true);}};
+ r.readAsText(f);inp.value='';
+}
+function msUpload(){toast('Mission upload endpoint is not wired up yet',true);}
+function msPreview(){
+ if(MS.pv){msPvStop();return;}
+ if(!MS.map)return;
+ const pts=[];
+ if(MS.homeLL&&MS.wps.length)pts.push({p:MS.homeLL,spd:MS.wps[0].spd,hold:0});
+ MS.wps.forEach(w=>pts.push({p:[w.lat,w.lon],spd:w.spd,hold:w.act==='HOLD'?w.hold:0}));
+ if(MS.rth&&MS.homeLL&&MS.wps.length)pts.push({p:MS.homeLL,spd:MS_DEF.spd,hold:0});
+ if(pts.length<2){toast('Need at least 2 waypoints (or home + 1 WP)',true);return;}
+ const mk=L.marker(pts[0].p,{icon:L.divIcon({className:'ms-nul',html:'<div class="ms-ghost"></div>',iconSize:[18,18],iconAnchor:[9,9]}),
+  interactive:false,zIndexOffset:900}).addTo(MS.map);
+ MS.pv={mk:mk,seg:1,t0:performance.now(),legT:0,holdT:0,raf:0};
+ document.getElementById('ms_pvbtn').innerHTML='&#9632;&nbsp; Stop preview';
+ const step=now=>{
+  const pv=MS.pv;if(!pv)return;
+  let dt=(now-pv.t0)/1000*8;pv.t0=now; // 8x real time
+  while(dt>0&&pv.seg<pts.length){
+   const a=pts[pv.seg-1],b=pts[pv.seg];
+   const legDur=msHav(a.p,b.p)/Math.max(1,b.spd);
+   if(pv.legT<legDur){
+    const adv=Math.min(dt,legDur-pv.legT);pv.legT+=adv;dt-=adv;
+    const f=legDur>0?pv.legT/legDur:1;
+    mk.setLatLng([a.p[0]+(b.p[0]-a.p[0])*f,a.p[1]+(b.p[1]-a.p[1])*f]);
+   }else if(pv.holdT<b.hold){const adv=Math.min(dt,b.hold-pv.holdT);pv.holdT+=adv;dt-=adv;}
+   else{pv.seg++;pv.legT=0;pv.holdT=0;}
+  }
+  if(pv.seg>=pts.length){msPvStop();return;}
+  pv.raf=requestAnimationFrame(step);};
+ MS.pv.raf=requestAnimationFrame(step);
+}
+function msPvStop(){
+ if(!MS.pv)return;
+ cancelAnimationFrame(MS.pv.raf);
+ if(MS.map)MS.map.removeLayer(MS.pv.mk);
+ MS.pv=null;
+ const b=document.getElementById('ms_pvbtn');if(b)b.innerHTML='&#9654;&nbsp; Preview flight';
+}
+function msHomeIcon(){return L.divIcon({className:'ms-nul',iconSize:[28,28],iconAnchor:[14,14],
+ html:'<div class="ms-home"><svg viewBox="0 0 24 24" width="13" height="13" fill="#fff"><path d="M12 3l9 8h-3v9h-4v-6h-4v6H6v-9H3z"/></svg></div>'});}
+function msDroneIcon(){return L.divIcon({className:'ms-nul',iconSize:[34,34],iconAnchor:[17,17],
+ html:'<div class="ms-dwrap"><div class="ms-pulse"></div><div class="ms-drone-rot"><svg viewBox="0 0 24 24" width="20" height="20"><path d="M12 2L19 20L12 15L5 20Z" fill="#25e0ff" stroke="#062a33" stroke-width="1"/></svg></div></div>'});}
+function msTelem(m){
+ const g=m.sen&&m.sen.gps;if(!g)return;
+ const fx=document.getElementById('ms_fix');
+ if(fx){const b=fx.querySelector('b');
+  if(!g.comp){b.textContent='n/a';b.style.color='var(--dim2)';}
+  else if(g.fix){b.textContent=g.sats+' sats';b.style.color='var(--ok)';}
+  else{b.textContent='no fix';b.style.color='var(--warn)';}}
+ const h=g.home||{};
+ if(h.set)MS.homeLL=[h.lat/1e7,h.lon/1e7];
+ if(!MS.map)return;
+ if(h.set){
+  if(!MS.home)MS.home=L.marker(MS.homeLL,{icon:msHomeIcon(),interactive:false,zIndexOffset:500}).addTo(MS.map);
+  else MS.home.setLatLng(MS.homeLL);
+  if(!MS.homeWas){MS.homeWas=true;msRoute();msStats();}
+ }
+ if(g.fix){
+  const ll=[g.lat/1e7,g.lon/1e7];
+  if(!MS.drone)MS.drone=L.marker(ll,{icon:msDroneIcon(),interactive:false,zIndexOffset:1000}).addTo(MS.map);
+  else MS.drone.setLatLng(ll);
+  const rot=MS.drone._icon&&MS.drone._icon.querySelector('.ms-drone-rot');
+  if(rot)rot.style.transform='rotate('+headingSource(m).deg.toFixed(0)+'deg)';
+  if(!MS.centered){MS.centered=true;MS.map.setView(ll,16);}
+ }
+}
+(function(){const prev=window.onRender;window.onRender=m=>{if(prev)prev(m);if(activeTab==='mission')msTelem(m);};})();
 </script>
 </body></html>)DASH";
